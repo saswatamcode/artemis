@@ -55,9 +55,9 @@ func createArtemis(env e2e.Environment) e2e.Runnable {
 	dataDir := filepath.Join(cwd, "e2e-data")
 
 	// // Clean up old data from previous runs
-	// if err := os.RemoveAll(dataDir); err != nil && !os.IsNotExist(err) {
-	// 	return e2e.NewFailedRunnable("artemis", fmt.Errorf("failed to clean old data dir: %w", err))
-	// }
+	if err := os.RemoveAll(dataDir); err != nil && !os.IsNotExist(err) {
+		return e2e.NewFailedRunnable("artemis", fmt.Errorf("failed to clean old data dir: %w", err))
+	}
 
 	if err := os.MkdirAll(dataDir, 0755); err != nil {
 		return e2e.NewFailedRunnable("artemis", fmt.Errorf("failed to create data dir: %w", err))
