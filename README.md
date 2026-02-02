@@ -61,6 +61,11 @@ Blocks are automatically compacted as they age, similar to LSM-tree databases.
 export OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317
 ```
 
+### Use Telemetrygen
+```bash
+telemetrygen traces --otlp-endpoint localhost:4317 --otlp-insecure --traces 10 --service "my-test-service" --child-spans 5
+```
+
 ### Jaeger API
 ```bash
 # Search traces
