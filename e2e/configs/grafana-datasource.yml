@@ -1,0 +1,42 @@
+apiVersion: 1
+
+datasources:
+  # Artemis tracing datasource (Jaeger-compatible)
+  - name: Artemis (Jaeger)
+    type: jaeger
+    access: proxy
+    url: http://artemis:16686
+    isDefault: true
+    editable: true
+    jsonData:
+      timeInterval: 5s
+    version: 1
+
+  # Artemis Tempo datasource
+  - name: Artemis (Tempo)
+    type: tempo
+    access: proxy
+    url: http://artemis:3200
+    isDefault: false
+    editable: true
+    jsonData:
+      timeInterval: 5s
+      nodeGraph:
+        enabled: true
+      tracesToLogs:
+        datasourceUid: prometheus
+      serviceMap:
+        datasourceUid: prometheus
+    version: 1
+
+  # Prometheus metrics datasource
+  - name: Prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: false
+    editable: true
+    jsonData:
+      timeInterval: 5s
+      httpMethod: POST
+    version: 1
