@@ -49,41 +49,35 @@ func (e *SQLExecutor) Execute(sqlQuery string) (arrow.Record, error) {
 	// Get querier
 	querier := e.db.GetQuerier()
 
-	// Execute query with or without time range
-	var spans []*span.Span
+	// Execute query and get Arrow records directly (no Span conversion!)
+	var record arrow.Record
 
 	if query.TimeRange != nil {
-		selectResult, err := querier.SelectWithTimeRange(query.TimeRange, query.Matchers...)
+		record, err = querier.SelectAsArrowWithTimeRange(query.TimeRange, query.Matchers...)
 		if err != nil {
 			return nil, fmt.Errorf("failed to execute query with time range: %w", err)
 		}
-		spans = selectResult.Spans
 	} else {
-		selectResult, err := querier.Select(query.Matchers...)
+		record, err = querier.SelectAsArrow(query.Matchers...)
 		if err != nil {
 			return nil, fmt.Errorf("failed to execute query: %w", err)
 		}
-		spans = selectResult.Spans
 	}
 
-	// Apply ORDER BY
-	if len(query.OrderBy) > 0 {
-		e.applyOrderBy(spans, query.OrderBy)
+	// TODO: Apply ORDER BY on Arrow record (not implemented yet)
+	// For now, ORDER BY is skipped when using Arrow path
+
+	// Apply LIMIT on Arrow record
+	if query.Limit > 0 && record.NumRows() > int64(query.Limit) {
+		record = sliceRecord(record, 0, query.Limit)
 	}
 
-	// Apply LIMIT
-	if query.Limit > 0 && query.Limit < len(spans) {
-		spans = spans[:query.Limit]
+	// Apply column projection if not SELECT *
+	if len(query.Columns) > 0 && query.Columns[0] != "*" {
+		record = projectColumns(record, query.Columns)
 	}
 
-	e.logger.Debug("query executed", "spans_returned", len(spans))
-
-	// Convert spans to Arrow record
-	record, err := ConvertSpansToArrowRecord(spans, query.Columns)
-	if err != nil {
-		return nil, fmt.Errorf("failed to convert spans to Arrow: %w", err)
-	}
-
+	e.logger.Debug("query executed", "rows_returned", record.NumRows())
 	return record, nil
 }
 
@@ -134,6 +128,80 @@ func (e *SQLExecutor) applyOrderBy(spans []*span.Span, orderBy []OrderByClause) 
 
 		return false
 	})
+}
+
+// projectColumns filters an Arrow record to only include specified columns
+func projectColumns(record arrow.Record, columns []string) arrow.Record {
+	schema := record.Schema()
+
+	// Find indices and build new schema
+	var indices []int
+	var fields []arrow.Field
+
+	for _, colName := range columns {
+		idx := schema.FieldIndices(colName)
+		if len(idx) > 0 {
+			indices = append(indices, idx[0])
+			fields = append(fields, schema.Field(idx[0]))
+		}
+	}
+
+	if len(indices) == 0 {
+		// No valid columns, return empty record
+		return createEmptyProjectedRecord(columns)
+	}
+
+	// Extract columns
+	projectedArrays := make([]arrow.Array, len(indices))
+	for i, idx := range indices {
+		projectedArrays[i] = record.Column(idx)
+	}
+
+	newSchema := arrow.NewSchema(fields, nil)
+	return array.NewRecord(newSchema, projectedArrays, record.NumRows())
+}
+
+// createEmptyProjectedRecord creates an empty record with the requested column names
+func createEmptyProjectedRecord(columns []string) arrow.Record {
+	mem := memory.NewGoAllocator()
+
+	// Create fields with string type (default)
+	fields := make([]arrow.Field, len(columns))
+	emptyArrays := make([]arrow.Array, len(columns))
+
+	for i, colName := range columns {
+		fields[i] = arrow.Field{Name: colName, Type: arrow.BinaryTypes.String, Nullable: true}
+		builder := array.NewStringBuilder(mem)
+		emptyArrays[i] = builder.NewStringArray()
+		builder.Release()
+	}
+
+	schema := arrow.NewSchema(fields, nil)
+	return array.NewRecord(schema, emptyArrays, 0)
+}
+
+// sliceRecord returns a subset of an Arrow record
+func sliceRecord(record arrow.Record, offset, length int) arrow.Record {
+	if offset >= int(record.NumRows()) {
+		// Return empty record
+		emptyArrays := make([]arrow.Array, record.NumCols())
+		for i := range emptyArrays {
+			emptyArrays[i] = array.NewSlice(record.Column(i), 0, 0)
+		}
+		return array.NewRecord(record.Schema(), emptyArrays, 0)
+	}
+
+	end := offset + length
+	if end > int(record.NumRows()) {
+		end = int(record.NumRows())
+	}
+
+	slicedArrays := make([]arrow.Array, record.NumCols())
+	for i := 0; i < int(record.NumCols()); i++ {
+		slicedArrays[i] = array.NewSlice(record.Column(i), int64(offset), int64(end))
+	}
+
+	return array.NewRecord(record.Schema(), slicedArrays, int64(end-offset))
 }
 
 // ConvertSpansToArrowRecord converts spans to an Arrow record

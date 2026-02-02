@@ -88,7 +88,8 @@ func (s *FlightSQLService) DoGetStatement(ctx context.Context, cmd flightsql.Sta
 	}
 	close(ch)
 
-	return GetSpansSchema(), ch, nil
+	// Return the actual schema from the record (may be projected)
+	return record.Schema(), ch, nil
 }
 
 // GetSchemaStatement returns the schema for a SQL query
