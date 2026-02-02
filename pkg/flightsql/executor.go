@@ -64,12 +64,21 @@ func (e *SQLExecutor) Execute(sqlQuery string) (arrow.Record, error) {
 		}
 	}
 
-	// TODO: Apply ORDER BY on Arrow record (not implemented yet)
-	// For now, ORDER BY is skipped when using Arrow path
+	// Apply ORDER BY using Arrow-based sorting
+	if len(query.OrderBy) > 0 {
+		record, err = sortRecord(record, query.OrderBy)
+		if err != nil {
+			e.logger.Warn("failed to sort record, returning unsorted", "error", err)
+		}
+	}
 
-	// Apply LIMIT on Arrow record
-	if query.Limit > 0 && record.NumRows() > int64(query.Limit) {
-		record = sliceRecord(record, 0, query.Limit)
+	// Apply LIMIT and OFFSET on Arrow record
+	if query.Limit > 0 || query.Offset > 0 {
+		limit := query.Limit
+		if limit < 0 {
+			limit = int(record.NumRows()) // No limit means all rows
+		}
+		record = sliceRecord(record, query.Offset, limit)
 	}
 
 	// Apply column projection if not SELECT *
@@ -79,55 +88,6 @@ func (e *SQLExecutor) Execute(sqlQuery string) (arrow.Record, error) {
 
 	e.logger.Debug("query executed", "rows_returned", record.NumRows())
 	return record, nil
-}
-
-// applyOrderBy sorts spans based on ORDER BY clauses
-func (e *SQLExecutor) applyOrderBy(spans []*span.Span, orderBy []OrderByClause) {
-	if len(orderBy) == 0 {
-		return
-	}
-
-	// For now, support only first ORDER BY clause
-	clause := orderBy[0]
-
-	sort.Slice(spans, func(i, j int) bool {
-		var vi, vj any
-
-		switch clause.Column {
-		case "trace_id":
-			vi, vj = spans[i].TraceID, spans[j].TraceID
-		case "span_id":
-			vi, vj = spans[i].SpanID, spans[j].SpanID
-		case "name":
-			vi, vj = spans[i].Name, spans[j].Name
-		case "service_name":
-			vi, vj = spans[i].ServiceName, spans[j].ServiceName
-		case "start_time":
-			vi, vj = spans[i].StartTime.UnixNano(), spans[j].StartTime.UnixNano()
-		case "end_time":
-			vi, vj = spans[i].EndTime.UnixNano(), spans[j].EndTime.UnixNano()
-		case "duration":
-			vi, vj = spans[i].GetDuration(), spans[j].GetDuration()
-		default:
-			return false
-		}
-
-		// Compare based on type
-		switch v := vi.(type) {
-		case string:
-			if clause.Descending {
-				return v > vj.(string)
-			}
-			return v < vj.(string)
-		case int64:
-			if clause.Descending {
-				return v > vj.(int64)
-			}
-			return v < vj.(int64)
-		}
-
-		return false
-	})
 }
 
 // projectColumns filters an Arrow record to only include specified columns
@@ -178,6 +138,149 @@ func createEmptyProjectedRecord(columns []string) arrow.Record {
 
 	schema := arrow.NewSchema(fields, nil)
 	return array.NewRecord(schema, emptyArrays, 0)
+}
+
+// sortRecord sorts an Arrow record based on ORDER BY clauses
+// Uses Go's sort package with Arrow array accessors
+func sortRecord(record arrow.Record, orderBy []OrderByClause) (arrow.Record, error) {
+	if len(orderBy) == 0 || record.NumRows() == 0 {
+		return record, nil
+	}
+
+	// For MVP, support only the first ORDER BY clause
+	clause := orderBy[0]
+	schema := record.Schema()
+	colIdx := schema.FieldIndices(clause.Column)
+	if len(colIdx) == 0 {
+		return record, fmt.Errorf("column %s not found in schema", clause.Column)
+	}
+
+	// Get the column array
+	column := record.Column(colIdx[0])
+	numRows := int(record.NumRows())
+
+	// Create indices array
+	indices := make([]int, numRows)
+	for i := range indices {
+		indices[i] = i
+	}
+
+	// Sort indices based on column values and type
+	switch arr := column.(type) {
+	case *array.String:
+		sort.Slice(indices, func(i, j int) bool {
+			vi, vj := arr.Value(indices[i]), arr.Value(indices[j])
+			if clause.Descending {
+				return vi > vj
+			}
+			return vi < vj
+		})
+	case *array.Int64:
+		sort.Slice(indices, func(i, j int) bool {
+			vi, vj := arr.Value(indices[i]), arr.Value(indices[j])
+			if clause.Descending {
+				return vi > vj
+			}
+			return vi < vj
+		})
+	default:
+		return record, fmt.Errorf("unsupported column type for sorting: %T", arr)
+	}
+
+	// Use Take to reorder all columns based on sorted indices
+	return takeRecord(record, indices)
+}
+
+// takeRecord reorders an Arrow record based on an array of indices
+func takeRecord(record arrow.Record, indices []int) (arrow.Record, error) {
+	mem := memory.NewGoAllocator()
+	numCols := int(record.NumCols())
+	reorderedArrays := make([]arrow.Array, numCols)
+
+	// Build index array for Arrow Take operation
+	indexBuilder := array.NewInt64Builder(mem)
+	defer indexBuilder.Release()
+
+	for _, idx := range indices {
+		indexBuilder.Append(int64(idx))
+	}
+	indexArray := indexBuilder.NewInt64Array()
+	defer indexArray.Release()
+
+	// Reorder each column
+	for i := 0; i < numCols; i++ {
+		column := record.Column(i)
+
+		// Manually reorder based on indices (Arrow compute Take may not be available)
+		reordered, err := reorderArray(column, indices, mem)
+		if err != nil {
+			return nil, fmt.Errorf("failed to reorder column %d: %w", i, err)
+		}
+		reorderedArrays[i] = reordered
+	}
+
+	return array.NewRecord(record.Schema(), reorderedArrays, int64(len(indices))), nil
+}
+
+// reorderArray reorders an Arrow array based on indices
+func reorderArray(arr arrow.Array, indices []int, mem memory.Allocator) (arrow.Array, error) {
+	switch typed := arr.(type) {
+	case *array.String:
+		builder := array.NewStringBuilder(mem)
+		defer builder.Release()
+		for _, idx := range indices {
+			if typed.IsNull(idx) {
+				builder.AppendNull()
+			} else {
+				builder.Append(typed.Value(idx))
+			}
+		}
+		return builder.NewStringArray(), nil
+
+	case *array.Int64:
+		builder := array.NewInt64Builder(mem)
+		defer builder.Release()
+		for _, idx := range indices {
+			if typed.IsNull(idx) {
+				builder.AppendNull()
+			} else {
+				builder.Append(typed.Value(idx))
+			}
+		}
+		return builder.NewInt64Array(), nil
+
+	case *array.Map:
+		// For map arrays (tags), we need special handling
+		builder := array.NewMapBuilder(mem, arrow.BinaryTypes.String, arrow.BinaryTypes.String, false)
+		defer builder.Release()
+
+		for _, idx := range indices {
+			if typed.IsNull(idx) {
+				builder.AppendNull()
+			} else {
+				// Get the map value at this index
+				start, end := typed.ValueOffsets(idx)
+				builder.Append(true)
+
+				// Get the keys and values arrays
+				keys := typed.Keys().(*array.String)
+				values := typed.Items().(*array.String)
+
+				keyBuilder := builder.KeyBuilder().(*array.StringBuilder)
+				valueBuilder := builder.ItemBuilder().(*array.StringBuilder)
+
+				// Copy all key-value pairs for this map entry
+				for j := int(start); j < int(end); j++ {
+					keyBuilder.Append(keys.Value(j))
+					valueBuilder.Append(values.Value(j))
+				}
+			}
+		}
+		return builder.NewMapArray(), nil
+
+	default:
+		return nil, fmt.Errorf("unsupported array type for reordering: %T", typed)
+	}
 }
 
 // sliceRecord returns a subset of an Arrow record

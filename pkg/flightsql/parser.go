@@ -12,17 +12,26 @@ import (
 
 // SQLQuery represents a parsed SQL query
 type SQLQuery struct {
-	Columns   []string
-	Matchers  []*query.Matcher
-	TimeRange *query.TimeRange
-	OrderBy   []OrderByClause
-	Limit     int
+	Columns      []string
+	Matchers     []*query.Matcher
+	TimeRange    *query.TimeRange
+	WhereFilters []WhereFilter // Additional filters for Arrow compute
+	OrderBy      []OrderByClause
+	Limit        int
+	Offset       int
 }
 
 // OrderByClause represents an ORDER BY clause
 type OrderByClause struct {
 	Column     string
 	Descending bool
+}
+
+// WhereFilter represents a WHERE condition for Arrow compute
+type WhereFilter struct {
+	Column   string
+	Operator string // ">", "<", ">=", "<=", "=", "!="
+	Value    string
 }
 
 // ParseSQL parses a simple SQL SELECT statement
@@ -51,6 +60,7 @@ func ParseSQL(sql string) (*SQLQuery, error) {
 	result := &SQLQuery{
 		Columns: columns,
 		Limit:   -1, // No limit by default
+		Offset:  0,  // No offset by default
 	}
 
 	// Extract WHERE clause
@@ -75,8 +85,8 @@ func ParseSQL(sql string) (*SQLQuery, error) {
 		result.OrderBy = []OrderByClause{{Column: column, Descending: descending}}
 	}
 
-	// Extract LIMIT
-	limitRe := regexp.MustCompile(`(?i)LIMIT\s+(\d+)`)
+	// Extract LIMIT and OFFSET
+	limitRe := regexp.MustCompile(`(?i)LIMIT\s+(\d+)(?:\s+OFFSET\s+(\d+))?`)
 	limitMatch := limitRe.FindStringSubmatch(sql)
 	if limitMatch != nil {
 		limit, err := strconv.Atoi(limitMatch[1])
@@ -84,6 +94,15 @@ func ParseSQL(sql string) (*SQLQuery, error) {
 			return nil, fmt.Errorf("invalid LIMIT value: %w", err)
 		}
 		result.Limit = limit
+
+		// Parse OFFSET if present
+		if len(limitMatch) > 2 && limitMatch[2] != "" {
+			offset, err := strconv.Atoi(limitMatch[2])
+			if err != nil {
+				return nil, fmt.Errorf("invalid OFFSET value: %w", err)
+			}
+			result.Offset = offset
+		}
 	}
 
 	return result, nil
@@ -100,7 +119,7 @@ func parseWhereClause(where string) ([]*query.Matcher, *query.TimeRange, error) 
 	for _, cond := range conditions {
 		cond = strings.TrimSpace(cond)
 
-		// Parse different operators
+		// Parse different operators in order of precedence (longest first to avoid partial matches)
 		if strings.Contains(cond, "!=") {
 			parts := strings.SplitN(cond, "!=", 2)
 			name := strings.TrimSpace(parts[0])
@@ -131,6 +150,7 @@ func parseWhereClause(where string) ([]*query.Matcher, *query.TimeRange, error) 
 			name := strings.TrimSpace(parts[0])
 			valueStr := strings.Trim(strings.TrimSpace(parts[1]), "'\"")
 
+			// Handle time range filtering separately for optimization
 			if name == "start_time" || name == "end_time" {
 				value, err := strconv.ParseInt(valueStr, 10, 64)
 				if err != nil {
@@ -140,11 +160,13 @@ func parseWhereClause(where string) ([]*query.Matcher, *query.TimeRange, error) 
 					startTime = &value
 				}
 			}
+			// Note: >= for other fields would need Arrow compute filtering (not implemented in MVP)
 		} else if strings.Contains(cond, "<=") {
 			parts := strings.SplitN(cond, "<=", 2)
 			name := strings.TrimSpace(parts[0])
 			valueStr := strings.Trim(strings.TrimSpace(parts[1]), "'\"")
 
+			// Handle time range filtering separately for optimization
 			if name == "start_time" || name == "end_time" {
 				value, err := strconv.ParseInt(valueStr, 10, 64)
 				if err != nil {
@@ -154,7 +176,14 @@ func parseWhereClause(where string) ([]*query.Matcher, *query.TimeRange, error) 
 					endTime = &value
 				}
 			}
-		} else if strings.Contains(cond, "=") {
+			// Note: <= for other fields would need Arrow compute filtering (not implemented in MVP)
+		} else if strings.Contains(cond, ">") && !strings.Contains(cond, ">=") {
+			// Note: > operator for non-time fields would need Arrow compute filtering (not implemented in MVP)
+			// Skip for now
+		} else if strings.Contains(cond, "<") && !strings.Contains(cond, "<=") {
+			// Note: < operator for non-time fields would need Arrow compute filtering (not implemented in MVP)
+			// Skip for now
+		} else if strings.Contains(cond, "=") && !strings.Contains(cond, "!=") && !strings.Contains(cond, ">=") && !strings.Contains(cond, "<=") {
 			parts := strings.SplitN(cond, "=", 2)
 			name := strings.TrimSpace(parts[0])
 			value := strings.Trim(strings.TrimSpace(parts[1]), "'\"")

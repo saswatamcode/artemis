@@ -9,29 +9,40 @@ import (
 
 func TestParseSQLBasic(t *testing.T) {
 	tests := []struct {
-		name      string
-		sql       string
-		wantCols  []string
-		wantLimit int
-		wantErr   bool
+		name       string
+		sql        string
+		wantCols   []string
+		wantLimit  int
+		wantOffset int
+		wantErr    bool
 	}{
 		{
-			name:      "select all",
-			sql:       "SELECT * FROM spans",
-			wantCols:  []string{"*"},
-			wantLimit: -1,
+			name:       "select all",
+			sql:        "SELECT * FROM spans",
+			wantCols:   []string{"*"},
+			wantLimit:  -1,
+			wantOffset: 0,
 		},
 		{
-			name:      "select specific columns",
-			sql:       "SELECT trace_id, service_name FROM spans",
-			wantCols:  []string{"trace_id", "service_name"},
-			wantLimit: -1,
+			name:       "select specific columns",
+			sql:        "SELECT trace_id, service_name FROM spans",
+			wantCols:   []string{"trace_id", "service_name"},
+			wantLimit:  -1,
+			wantOffset: 0,
 		},
 		{
-			name:      "with limit",
-			sql:       "SELECT * FROM spans LIMIT 10",
-			wantCols:  []string{"*"},
-			wantLimit: 10,
+			name:       "with limit",
+			sql:        "SELECT * FROM spans LIMIT 10",
+			wantCols:   []string{"*"},
+			wantLimit:  10,
+			wantOffset: 0,
+		},
+		{
+			name:       "with limit and offset",
+			sql:        "SELECT * FROM spans LIMIT 10 OFFSET 5",
+			wantCols:   []string{"*"},
+			wantLimit:  10,
+			wantOffset: 5,
 		},
 		{
 			name:    "invalid sql",
@@ -57,6 +68,10 @@ func TestParseSQLBasic(t *testing.T) {
 
 			if q.Limit != tt.wantLimit {
 				t.Errorf("ParseSQL() limit = %v, want %v", q.Limit, tt.wantLimit)
+			}
+
+			if q.Offset != tt.wantOffset {
+				t.Errorf("ParseSQL() offset = %v, want %v", q.Offset, tt.wantOffset)
 			}
 		})
 	}
