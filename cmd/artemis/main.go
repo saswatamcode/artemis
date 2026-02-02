@@ -18,6 +18,7 @@ import (
 	"github.com/saswatamcode/artemis/pkg/api"
 	"github.com/saswatamcode/artemis/pkg/block"
 	"github.com/saswatamcode/artemis/pkg/compactor"
+	"github.com/saswatamcode/artemis/pkg/flightsql"
 	"github.com/saswatamcode/artemis/pkg/otlp"
 	"github.com/saswatamcode/artemis/pkg/tempo"
 	"github.com/saswatamcode/artemis/pkg/tracedb"
@@ -50,6 +51,7 @@ func main() {
 	otlpAddr := flag.String("otlp-addr", ":4317", "OTLP gRPC receiver address")
 	apiAddr := flag.String("api-addr", ":16686", "HTTP API (Jaeger) address")
 	tempoAddr := flag.String("tempo-addr", ":3200", "Tempo API address")
+	flightAddr := flag.String("flight-addr", ":8815", "Flight SQL address")
 
 	// Logging flags
 	logLevelStr := flag.String("log.level", "info", psflag.LevelFlagHelp)
@@ -164,12 +166,18 @@ func main() {
 		log.Fatalf("Failed to create OTLP server: %v", err)
 	}
 
+	flightServer, err := flightsql.NewServer(db, *flightAddr, logger)
+	if err != nil {
+		log.Fatalf("Failed to create Flight SQL server: %v", err)
+	}
+
 	apiServer := api.NewServer(db, logger)
 	tempoServer := tempo.NewServer(db, logger)
 
 	// Print server info
 	logger.Info("artemis server starting",
 		"otlp_addr", *otlpAddr,
+		"flight_addr", *flightAddr,
 		"jaeger_api", "http://localhost"+*apiAddr,
 		"tempo_api", "http://localhost"+*tempoAddr,
 	)
@@ -203,6 +211,15 @@ func main() {
 	}, func(error) {
 		logger.Info("stopping otlp receiver")
 		otlpServer.Stop()
+	})
+
+	// Flight SQL server actor
+	g.Add(func() error {
+		logger.Info("starting flight sql server", "addr", *flightAddr)
+		return flightServer.Start()
+	}, func(error) {
+		logger.Info("stopping flight sql server")
+		flightServer.Stop()
 	})
 
 	// API server actor

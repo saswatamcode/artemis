@@ -5,7 +5,7 @@ CONTAINER_TOOL ?= docker
 IMG ?= artemis:latest
 
 .PHONY: build
-build: 
+build:
 	@VERSION=$$(cat VERSION) && \
 	REVISION=$$(git rev-parse HEAD) && \
 	BRANCH=$$(git rev-parse --abbrev-ref HEAD) && \
@@ -18,7 +18,8 @@ build:
 		-X github.com/prometheus/common/version.Branch=$$BRANCH \
 		-X github.com/prometheus/common/version.BuildUser=$$BUILDUSER \
 		-X github.com/prometheus/common/version.BuildDate=$$BUILDDATE" \
-		cmd/artemis/main.go
+		cmd/artemis/main.go && \
+	go build -o bin/artemis-query cmd/artemis-query/main.go
 
 .PHONY: docker-build
 docker-build:
