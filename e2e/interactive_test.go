@@ -17,13 +17,13 @@ import (
 )
 
 // TestArtemisTracingStack is an interactive e2e test that demonstrates the complete tracing pipeline:
-// Prometheus (with tracing) -> OTEL Collector -> Artemis -> Grafana
+// Telemetrygen + Prometheus (with tracing) -> OTEL Collector -> Artemis -> Grafana
 //
 // Run with: go test -v ./e2e -run TestArtemisTracingStack -timeout 99m
 //
 // The test will:
-// 1. Build and start all services
-// 2. Wait for traces to be generated
+// 1. Build and start all services (Artemis, OTEL Collector, Prometheus, Telemetrygen, Grafana)
+// 2. Generate traces continuously from both telemetrygen and Prometheus queries
 // 3. Validate the pipeline is working
 // 4. Open Grafana in your browser
 // 5. Keep running until you hit the endpoint or press Ctrl+C
@@ -53,6 +53,11 @@ func TestArtemisTracingStack(t *testing.T) {
 	prometheus := createPrometheus(env)
 	testutil.Ok(t, e2e.StartAndWaitReady(prometheus))
 	fmt.Printf("✓ Prometheus ready at %s\n", prometheus.Endpoint("http"))
+
+	fmt.Println("=== Starting telemetrygen for continuous trace generation...")
+	telemetrygen := createTelemetryGen(env)
+	testutil.Ok(t, telemetrygen.Start())
+	fmt.Println("✓ Telemetrygen running - generating traces continuously (5 traces/sec)")
 
 	fmt.Println("=== Starting Grafana with Artemis datasource...")
 	grafana := createGrafana(env)
@@ -167,15 +172,16 @@ func TestArtemisTracingStack(t *testing.T) {
 	fmt.Printf("  • View WAL segments:     ls -lh %s/wal/\n", dataDir)
 	fmt.Printf("  • View persisted blocks: ls -lh %s/blocks/\n", dataDir)
 	fmt.Printf("  • Watch logs:            docker logs -f artemis\n")
-	fmt.Println("\nQuery Generator:")
-	fmt.Println("  • Running complex PromQL range queries every 2s")
-	fmt.Println("  • Queries include: rate(), histogram_quantile(), topk(), subqueries")
-	fmt.Println("  • Generating traces from Prometheus's query engine")
+	fmt.Println("\nTrace Generators:")
+	fmt.Println("  • Telemetrygen: 5 traces/sec with 5 child spans each")
+	fmt.Println("  • Prometheus Query Generator: Complex PromQL range queries every 2s")
+	fmt.Println("    - Queries include: rate(), histogram_quantile(), topk(), subqueries")
+	fmt.Println("    - Generating traces from Prometheus's query engine")
 	fmt.Println("\nIn Grafana:")
 	fmt.Println("  1. Navigate to Explore")
 	fmt.Println("  2. Select 'Artemis (Jaeger)' or 'Artemis (Tempo)' datasource")
-	fmt.Println("  3. Search for traces from 'prometheus' service")
-	fmt.Println("  4. Observe query execution traces with different complexities")
+	fmt.Println("  3. Search for traces from 'prometheus' or 'telemetrygen-test-service' services")
+	fmt.Println("  4. Observe query execution traces (Prometheus) vs synthetic traces (telemetrygen)")
 	fmt.Println("  5. Compare Jaeger vs Tempo UI/UX")
 	fmt.Println()
 
@@ -399,5 +405,29 @@ func createGrafana(env e2e.Environment) e2e.Runnable {
 			200,
 			200,
 		),
+	})
+}
+
+// createTelemetryGen creates a telemetrygen runnable for continuous trace generation
+func createTelemetryGen(env e2e.Environment) e2e.Runnable {
+	f := env.Runnable("telemetrygen").Future()
+
+	// telemetrygen will generate traces continuously with varying patterns
+	// Using --rate to control traces per second and --duration for how long to run
+	return f.Init(e2e.StartOptions{
+		Image: "ghcr.io/open-telemetry/opentelemetry-collector-contrib/telemetrygen:latest",
+		Command: e2e.NewCommand(
+			"traces",
+			"--otlp-endpoint=otel-collector:4317",
+			"--otlp-insecure",
+			"--rate=5",       // Generate 5 traces per second
+			"--duration=inf", // Run indefinitely (0 means forever)
+			"--service=telemetrygen-test-service",
+			"--child-spans=5",
+			"--status-code=2",
+			"--span-duration=123ms",
+		),
+		// No readiness probe needed since this is a trace generator
+		// It doesn't expose any ports, it just sends traces
 	})
 }
