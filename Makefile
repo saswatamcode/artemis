@@ -18,8 +18,7 @@ build:
 		-X github.com/prometheus/common/version.Branch=$$BRANCH \
 		-X github.com/prometheus/common/version.BuildUser=$$BUILDUSER \
 		-X github.com/prometheus/common/version.BuildDate=$$BUILDDATE" \
-		cmd/artemis/main.go && \
-	go build -o bin/artemis-query cmd/artemis-query/main.go
+		cmd/artemis/main.go
 
 .PHONY: docker-build
 docker-build:

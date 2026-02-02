@@ -79,9 +79,9 @@ func TestParseSQLBasic(t *testing.T) {
 
 func TestParseSQLWithWhere(t *testing.T) {
 	tests := []struct {
-		name         string
-		sql          string
-		wantMatchers int
+		name          string
+		sql           string
+		wantMatchers  int
 		wantTimeRange bool
 	}{
 		{

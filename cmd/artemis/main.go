@@ -10,10 +10,15 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/apache/arrow-go/v18/arrow"
+	"github.com/apache/arrow-go/v18/arrow/array"
+	arrowflightsql "github.com/apache/arrow-go/v18/arrow/flight/flightsql"
 	"github.com/oklog/run"
 	"github.com/prometheus/common/promslog"
 	psflag "github.com/prometheus/common/promslog/flag"
 	"github.com/prometheus/common/version"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
 
 	"github.com/saswatamcode/artemis/pkg/api"
 	"github.com/saswatamcode/artemis/pkg/block"
@@ -25,52 +30,255 @@ import (
 )
 
 func main() {
+	// Check for subcommand
+	if len(os.Args) > 1 {
+		switch os.Args[1] {
+		case "query":
+			runQuery(os.Args[2:])
+			return
+		case "server":
+			runServer(os.Args[2:])
+			return
+		case "-h", "--help", "help":
+			printUsage()
+			return
+		case "-version", "--version":
+			printVersion()
+			return
+		}
+	}
+
+	// Default to server if no subcommand
+	runServer(os.Args[1:])
+}
+
+func printUsage() {
+	fmt.Println("Artemis - Distributed Tracing Database")
+	fmt.Println()
+	fmt.Println("Usage:")
+	fmt.Println("  artemis [command] [flags]")
+	fmt.Println()
+	fmt.Println("Commands:")
+	fmt.Println("  server    Start the Artemis server (default)")
+	fmt.Println("  query     Execute a SQL query against Flight SQL")
+	fmt.Println()
+	fmt.Println("Examples:")
+	fmt.Println("  # Start server")
+	fmt.Println("  artemis server --flight-addr=:8815")
+	fmt.Println()
+	fmt.Println("  # Query spans")
+	fmt.Println("  artemis query \"SELECT * FROM spans LIMIT 10\"")
+	fmt.Println()
+	fmt.Println("Use 'artemis [command] -h' for more information about a command.")
+}
+
+func printVersion() {
+	fmt.Printf("Artemis Trace Server\n")
+	fmt.Printf("Version:    %s\n", version.Version)
+	fmt.Printf("Revision:   %s\n", version.Revision)
+	fmt.Printf("Branch:     %s\n", version.Branch)
+	fmt.Printf("Build Date: %s\n", version.BuildDate)
+	fmt.Printf("Build User: %s\n", version.BuildUser)
+	fmt.Printf("Go Version: %s\n", version.GoVersion)
+}
+
+func runQuery(args []string) {
+	fs := flag.NewFlagSet("query", flag.ExitOnError)
+	addr := fs.String("addr", "localhost:8815", "Flight SQL server address")
+	displayLimit := fs.Int("limit", 100, "Maximum rows to display")
+
+	fs.Usage = func() {
+		fmt.Println("Usage: artemis query [flags] <SQL>")
+		fmt.Println()
+		fmt.Println("Execute a SQL query against Artemis Flight SQL server")
+		fmt.Println()
+		fmt.Println("Flags:")
+		fs.PrintDefaults()
+		fmt.Println()
+		fmt.Println("Examples:")
+		fmt.Println("  artemis query \"SELECT * FROM spans\"")
+		fmt.Println("  artemis query \"SELECT * FROM spans WHERE service_name = 'api' LIMIT 10\"")
+		fmt.Println("  artemis query \"SELECT trace_id, duration FROM spans ORDER BY duration DESC LIMIT 5\"")
+	}
+
+	fs.Parse(args)
+
+	if fs.NArg() == 0 {
+		fmt.Println("Error: SQL query required")
+		fmt.Println()
+		fs.Usage()
+		os.Exit(1)
+	}
+
+	query := fs.Arg(0)
+
+	// Connect to Flight SQL with insecure credentials
+	client, err := arrowflightsql.NewClient(*addr, nil, nil, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		log.Fatalf("Failed to connect to %s: %v", *addr, err)
+	}
+	defer client.Close()
+
+	fmt.Printf("Connected to %s\n", *addr)
+	fmt.Printf("Executing: %s\n\n", query)
+
+	ctx := context.Background()
+
+	// Execute query
+	info, err := client.Execute(ctx, query)
+	if err != nil {
+		log.Fatalf("Failed to execute query: %v", err)
+	}
+
+	if len(info.Endpoint) == 0 {
+		fmt.Println("No results returned")
+		return
+	}
+
+	// Read results
+	reader, err := client.DoGet(ctx, info.Endpoint[0].Ticket)
+	if err != nil {
+		log.Fatalf("Failed to get results: %v", err)
+	}
+	defer reader.Release()
+
+	totalRows := 0
+	rowsDisplayed := 0
+
+	// Process records
+	for reader.Next() {
+		record := reader.Record()
+		numRows := int(record.NumRows())
+		totalRows += numRows
+
+		// Print header on first record
+		if rowsDisplayed == 0 {
+			printHeader(record.Schema())
+		}
+
+		// Print rows
+		for i := 0; i < numRows && rowsDisplayed < *displayLimit; i++ {
+			printRow(record, i)
+			rowsDisplayed++
+		}
+
+		if rowsDisplayed >= *displayLimit {
+			break
+		}
+	}
+
+	if err := reader.Err(); err != nil {
+		log.Fatalf("Reader error: %v", err)
+	}
+
+	fmt.Printf("\n---\n")
+	fmt.Printf("Total rows: %d", totalRows)
+	if rowsDisplayed < totalRows {
+		fmt.Printf(" (showing first %d)", rowsDisplayed)
+	}
+	fmt.Println()
+}
+
+func printHeader(schema *arrow.Schema) {
+	fmt.Print("| ")
+	for _, field := range schema.Fields() {
+		fmt.Printf("%-20s | ", field.Name)
+	}
+	fmt.Println()
+
+	fmt.Print("|-")
+	for range schema.Fields() {
+		fmt.Print("---------------------|-")
+	}
+	fmt.Println()
+}
+
+func printRow(record arrow.Record, rowIdx int) {
+	fmt.Print("| ")
+	for colIdx := 0; colIdx < int(record.NumCols()); colIdx++ {
+		col := record.Column(colIdx)
+		value := formatValue(col, rowIdx)
+		fmt.Printf("%-20s | ", truncate(value, 20))
+	}
+	fmt.Println()
+}
+
+func formatValue(arr arrow.Array, idx int) string {
+	if arr.IsNull(idx) {
+		return "<null>"
+	}
+
+	switch arr := arr.(type) {
+	case *array.String:
+		return arr.Value(idx)
+	case *array.Int64:
+		val := arr.Value(idx)
+		// Convert duration to milliseconds for readability
+		if val > 1000000 {
+			return fmt.Sprintf("%d (%.2fms)", val, float64(val)/1e6)
+		}
+		return fmt.Sprintf("%d", val)
+	case *array.Map:
+		// For map columns (tags), just indicate presence
+		if arr.IsNull(idx) {
+			return "<no tags>"
+		}
+		return "<tags>"
+	default:
+		return fmt.Sprintf("%v", arr)
+	}
+}
+
+func truncate(s string, maxLen int) string {
+	if len(s) <= maxLen {
+		return s
+	}
+	return s[:maxLen-3] + "..."
+}
+
+func runServer(args []string) {
+	fs := flag.NewFlagSet("server", flag.ExitOnError)
+
 	// Database flags
-	walDir := flag.String("wal-dir", "./data/wal", "Directory for WAL segments")
-	walSegmentSize := flag.Int64("wal-segment-size", 128*1024*1024, "WAL segment size in bytes (default 128MB)")
-	blocksDir := flag.String("blocks-dir", "./data/blocks", "Directory for persisted blocks")
-	compactInterval := flag.Duration("compact-interval", 10*time.Second, "How often to flush pending data to Arrow batches")
-	checkpointInterval := flag.Duration("checkpoint-interval", 60*time.Second, "How often to create WAL checkpoints")
-	checkpointThreshold := flag.Int("checkpoint-threshold", 5, "Create checkpoint after N segments")
-	blockCompactionInterval := flag.Duration("block-compaction-interval", 5*time.Minute, "How often to run block compaction")
-	retentionPeriod := flag.Duration("retention-period", 0, "Delete blocks older than this (0 = no retention)")
-	enableCompaction := flag.Bool("enable-compaction", true, "Enable automatic block compaction")
-	enableRetention := flag.Bool("enable-retention", false, "Enable automatic retention cleanup")
+	walDir := fs.String("wal-dir", "./data/wal", "Directory for WAL segments")
+	walSegmentSize := fs.Int64("wal-segment-size", 128*1024*1024, "WAL segment size in bytes (default 128MB)")
+	blocksDir := fs.String("blocks-dir", "./data/blocks", "Directory for persisted blocks")
+	compactInterval := fs.Duration("compact-interval", 10*time.Second, "How often to flush pending data to Arrow batches")
+	checkpointInterval := fs.Duration("checkpoint-interval", 60*time.Second, "How often to create WAL checkpoints")
+	checkpointThreshold := fs.Int("checkpoint-threshold", 5, "Create checkpoint after N segments")
+	blockCompactionInterval := fs.Duration("block-compaction-interval", 5*time.Minute, "How often to run block compaction")
+	retentionPeriod := fs.Duration("retention-period", 0, "Delete blocks older than this (0 = no retention)")
+	enableCompaction := fs.Bool("enable-compaction", true, "Enable automatic block compaction")
+	enableRetention := fs.Bool("enable-retention", false, "Enable automatic retention cleanup")
 
 	// Block configuration flags
-	maxBlockDuration := flag.Duration("max-block-duration", 2*time.Hour, "Maximum time range per block")
-	maxBlockSpans := flag.Int64("max-block-spans", 1000000, "Maximum spans per block")
+	maxBlockDuration := fs.Duration("max-block-duration", 2*time.Hour, "Maximum time range per block")
+	maxBlockSpans := fs.Int64("max-block-spans", 1000000, "Maximum spans per block")
 
 	// Compaction level configuration (for aggressive demo/testing)
-	minBlockAge0 := flag.Duration("min-block-age-l0", 10*time.Minute, "Minimum age before compacting L0 blocks")
-	minBlocks0 := flag.Int("min-blocks-l0", 2, "Minimum L0 blocks to trigger compaction")
-	minBlockAge1 := flag.Duration("min-block-age-l1", 2*time.Hour, "Minimum age before compacting L1 blocks")
-	minBlocks1 := flag.Int("min-blocks-l1", 2, "Minimum L1 blocks to trigger compaction")
+	minBlockAge0 := fs.Duration("min-block-age-l0", 10*time.Minute, "Minimum age before compacting L0 blocks")
+	minBlocks0 := fs.Int("min-blocks-l0", 2, "Minimum L0 blocks to trigger compaction")
+	minBlockAge1 := fs.Duration("min-block-age-l1", 2*time.Hour, "Minimum age before compacting L1 blocks")
+	minBlocks1 := fs.Int("min-blocks-l1", 2, "Minimum L1 blocks to trigger compaction")
 
 	// Server address flags
-	otlpAddr := flag.String("otlp-addr", ":4317", "OTLP gRPC receiver address")
-	apiAddr := flag.String("api-addr", ":16686", "HTTP API (Jaeger) address")
-	tempoAddr := flag.String("tempo-addr", ":3200", "Tempo API address")
-	flightAddr := flag.String("flight-addr", ":8815", "Flight SQL address")
+	otlpAddr := fs.String("otlp-addr", ":4317", "OTLP gRPC receiver address")
+	apiAddr := fs.String("api-addr", ":16686", "HTTP API (Jaeger) address")
+	tempoAddr := fs.String("tempo-addr", ":3200", "Tempo API address")
+	flightAddr := fs.String("flight-addr", ":8815", "Flight SQL address")
 
 	// Logging flags
-	logLevelStr := flag.String("log.level", "info", psflag.LevelFlagHelp)
-	logFormatStr := flag.String("log.format", "logfmt", psflag.FormatFlagHelp)
+	logLevelStr := fs.String("log.level", "info", psflag.LevelFlagHelp)
+	logFormatStr := fs.String("log.format", "logfmt", psflag.FormatFlagHelp)
 
 	// Version flag
-	showVersion := flag.Bool("version", false, "Show version information and exit")
+	showVersion := fs.Bool("version", false, "Show version information and exit")
 
-	flag.Parse()
+	fs.Parse(args)
 
 	// Handle version flag
 	if *showVersion {
-		fmt.Printf("Artemis Trace Server\n")
-		fmt.Printf("Version:    %s\n", version.Version)
-		fmt.Printf("Revision:   %s\n", version.Revision)
-		fmt.Printf("Branch:     %s\n", version.Branch)
-		fmt.Printf("Build Date: %s\n", version.BuildDate)
-		fmt.Printf("Build User: %s\n", version.BuildUser)
-		fmt.Printf("Go Version: %s\n", version.GoVersion)
+		printVersion()
 		os.Exit(0)
 	}
 
