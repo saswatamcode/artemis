@@ -1,6 +1,8 @@
 package query
 
 import (
+	"github.com/apache/arrow-go/v18/arrow"
+
 	"github.com/saswatamcode/artemis/pkg/block"
 	"github.com/saswatamcode/artemis/pkg/storage"
 )
@@ -15,6 +17,14 @@ type Querier interface {
 	// SelectWithTimeRange queries spans using matchers within a time range
 	// Time range filtering provides significant performance benefits by skipping irrelevant blocks
 	SelectWithTimeRange(timeRange *TimeRange, matchers ...*Matcher) (*SelectResult, error)
+
+	// SelectAsArrow queries and returns Arrow records directly without Span conversion
+	// This avoids the double conversion: Arrow→Span→Arrow
+	// More efficient for Arrow-based consumers like FlightSQL
+	SelectAsArrow(matchers ...*Matcher) (arrow.Record, error)
+
+	// SelectAsArrowWithTimeRange queries Arrow records within a time range
+	SelectAsArrowWithTimeRange(timeRange *TimeRange, matchers ...*Matcher) (arrow.Record, error)
 }
 
 // BlockQuerier queries spans across both head block (Arrow) and persisted blocks (Arrow L0 and Parquet L1+)
@@ -46,4 +56,16 @@ func (q *BlockQuerier) Select(matchers ...*Matcher) (*SelectResult, error) {
 // Time range filtering provides significant performance benefits by skipping irrelevant blocks
 func (q *BlockQuerier) SelectWithTimeRange(timeRange *TimeRange, matchers ...*Matcher) (*SelectResult, error) {
 	return SelectFromBlocksWithTimeRange(q.head, q.blocks, timeRange, matchers...)
+}
+
+// SelectAsArrow queries and returns Arrow records directly without Span conversion
+// This avoids the double conversion: Arrow→Span→Arrow
+// More efficient for Arrow-based consumers like FlightSQL
+func (q *BlockQuerier) SelectAsArrow(matchers ...*Matcher) (arrow.Record, error) {
+	return SelectAsArrow(q.head, matchers...)
+}
+
+// SelectAsArrowWithTimeRange queries Arrow records within a time range
+func (q *BlockQuerier) SelectAsArrowWithTimeRange(timeRange *TimeRange, matchers ...*Matcher) (arrow.Record, error) {
+	return SelectAsArrowWithTimeRange(q.head, q.blocks, timeRange, matchers...)
 }

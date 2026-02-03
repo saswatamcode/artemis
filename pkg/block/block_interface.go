@@ -34,6 +34,11 @@ type Block interface {
 
 	// Schema returns the Arrow schema (only for Arrow blocks, nil for Parquet)
 	Schema() *arrow.Schema
+
+	// AsArrowRecords returns Arrow records directly without Span conversion
+	// For Arrow blocks: returns existing records
+	// For Parquet blocks: reads Parquet and converts to Arrow natively using pqarrow
+	AsArrowRecords() ([]arrow.Record, error)
 }
 
 // LoadBlock loads a block from disk, automatically detecting whether it's

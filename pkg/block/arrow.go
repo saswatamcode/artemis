@@ -148,6 +148,11 @@ func (ab *ArrowBlock) Dir() string {
 	return ab.dir
 }
 
+// AsArrowRecords returns Arrow records directly (no conversion needed for Arrow blocks)
+func (ab *ArrowBlock) AsArrowRecords() ([]arrow.Record, error) {
+	return ab.records, nil
+}
+
 // Close releases resources held by this block
 func (ab *ArrowBlock) Close() error {
 	for _, rec := range ab.records {

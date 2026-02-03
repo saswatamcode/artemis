@@ -5,7 +5,7 @@ CONTAINER_TOOL ?= docker
 IMG ?= artemis:latest
 
 .PHONY: build
-build: 
+build:
 	@VERSION=$$(cat VERSION) && \
 	REVISION=$$(git rev-parse HEAD) && \
 	BRANCH=$$(git rev-parse --abbrev-ref HEAD) && \
