@@ -1,6 +1,7 @@
 package e2e
 
 import (
+	"bytes"
 	"context"
 	"encoding/hex"
 	"encoding/json"
@@ -166,6 +167,11 @@ func TestArtemisE2E(t *testing.T) {
 	// Test Case 5: Query by service and tags
 	t.Run("QueryByServiceAndTags", func(t *testing.T) {
 		testQueryByServiceAndTags(t, artemis)
+	})
+
+	// Test Case 6: SQL queries
+	t.Run("SQLQueries", func(t *testing.T) {
+		testSQLQueries(t, artemis)
 	})
 
 	fmt.Println("\n=== ✅ All E2E tests passed! ===")
@@ -628,6 +634,186 @@ func testQueryByServiceAndTags(t *testing.T, artemis e2e.Runnable) {
 	fmt.Println("  ✅ Query by service test passed!")
 }
 
+// testSQLQueries tests SQL query functionality using DuckDB
+func testSQLQueries(t *testing.T, artemis e2e.Runnable) {
+	fmt.Println("\n--- Test: SQL Queries ---")
+
+	// Send test traces with varied characteristics for SQL testing
+	// Note: SQL querier only queries persisted blocks, not the in-memory head
+	// We need to send enough spans to trigger a block flush or wait for compaction
+	fmt.Println("  Sending test traces for SQL queries...")
+
+	traces := []struct {
+		service  string
+		spanName string
+		duration time.Duration
+		count    int
+	}{
+		{"sql-test-api", "GET /users", 100 * time.Millisecond, 15},
+		{"sql-test-api", "POST /users", 200 * time.Millisecond, 15},
+		{"sql-test-db", "SELECT users", 50 * time.Millisecond, 15},
+		{"sql-test-cache", "GET cache", 10 * time.Millisecond, 15},
+	}
+
+	totalSpans := 0
+	for _, tc := range traces {
+		for i := 0; i < tc.count; i++ {
+			traceID := generateTraceID()
+			now := time.Now()
+			trace := &collectortracev1.ExportTraceServiceRequest{
+				ResourceSpans: []*tracev1.ResourceSpans{
+					{
+						Resource: &resourcev1.Resource{
+							Attributes: []*commonv1.KeyValue{
+								{Key: "service.name", Value: stringValue(tc.service)},
+							},
+						},
+						ScopeSpans: []*tracev1.ScopeSpans{
+							{
+								Spans: []*tracev1.Span{
+									{
+										TraceId:           traceID,
+										SpanId:            generateSpanID(),
+										Name:              tc.spanName,
+										Kind:              tracev1.Span_SPAN_KIND_SERVER,
+										StartTimeUnixNano: uint64(now.UnixNano()),
+										EndTimeUnixNano:   uint64(now.Add(tc.duration).UnixNano()),
+										Attributes: []*commonv1.KeyValue{
+											{Key: "test.group", Value: stringValue("sql-test")},
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			}
+			testutil.Ok(t, sendOTLPTrace(artemis.Endpoint("otlp"), trace))
+			totalSpans++
+		}
+	}
+
+	fmt.Printf("  ✓ Sent %d spans across %d services\n", totalSpans, len(traces))
+
+	// Wait longer for spans to be flushed to L0 blocks (compaction happens periodically)
+	// Default settings: compact-interval=1m, max-block-spans=10000, max-block-duration=1h
+	// We need to wait for at least one compaction cycle
+	fmt.Println("  Waiting for spans to be persisted to blocks...")
+	time.Sleep(65 * time.Second)
+
+	httpClient := &http.Client{Timeout: 10 * time.Second}
+
+	// Test Case 1: COUNT all spans
+	fmt.Println("  Testing COUNT query...")
+	countResult := executeSQLQuery(t, artemis, httpClient, "SELECT COUNT(*) as total FROM spans")
+	testutil.Assert(t, countResult.Success, "count query should succeed")
+	testutil.Assert(t, len(countResult.Rows) > 0, "count query should return rows")
+	testutil.Assert(t, countResult.RowCount > 0, "should have row count")
+	fmt.Println("  ✓ COUNT query passed")
+
+	// Test Case 2: GROUP BY service_name
+	fmt.Println("  Testing GROUP BY service_name...")
+	groupResult := executeSQLQuery(t, artemis, httpClient,
+		"SELECT service_name, COUNT(*) as span_count FROM spans WHERE service_name LIKE 'sql-test-%' GROUP BY service_name ORDER BY service_name")
+	testutil.Assert(t, groupResult.Success, "group by query should succeed")
+	testutil.Assert(t, len(groupResult.Rows) >= 3, "should have at least 3 service groups")
+	testutil.Assert(t, groupResult.Columns != nil, "should have column info")
+	testutil.Assert(t, contains(groupResult.Columns, "service_name"), "should have service_name column")
+	testutil.Assert(t, contains(groupResult.Columns, "span_count"), "should have span_count column")
+	fmt.Println("  ✓ GROUP BY query passed")
+
+	// Test Case 3: Average duration calculation
+	fmt.Println("  Testing AVG duration query...")
+	avgResult := executeSQLQuery(t, artemis, httpClient,
+		"SELECT service_name, AVG(duration) as avg_duration FROM spans WHERE service_name LIKE 'sql-test-%' GROUP BY service_name")
+	testutil.Assert(t, avgResult.Success, "avg duration query should succeed")
+	testutil.Assert(t, len(avgResult.Rows) >= 3, "should have service averages")
+	fmt.Println("  ✓ AVG duration query passed")
+
+	// Test Case 4: Full span selection (should return traces)
+	fmt.Println("  Testing full span SELECT...")
+	spanResult := executeSQLQuery(t, artemis, httpClient,
+		"SELECT * FROM spans WHERE service_name = 'sql-test-cache' LIMIT 5")
+	testutil.Assert(t, spanResult.Success, "span select should succeed")
+	testutil.Assert(t, len(spanResult.Traces) > 0, "should return traces for full span query")
+	testutil.Assert(t, spanResult.RowCount > 0, "should have spans")
+	testutil.Assert(t, spanResult.RowCount <= 5, "should respect LIMIT")
+
+	// Validate trace structure
+	for _, trace := range spanResult.Traces {
+		testutil.Assert(t, trace.TraceID != "", "trace should have trace ID")
+		testutil.Assert(t, trace.SpanID != "", "trace should have span ID")
+		testutil.Assert(t, trace.Name != "", "trace should have name")
+		testutil.Assert(t, trace.ServiceName == "sql-test-cache", "should match service filter")
+	}
+	fmt.Println("  ✓ Full span SELECT passed")
+
+	// Test Case 5: Time-based filtering with span projection
+	fmt.Println("  Testing time-based filtering...")
+	timeResult := executeSQLQuery(t, artemis, httpClient,
+		"SELECT service_name, name, duration FROM spans WHERE service_name = 'sql-test-api' AND duration > 100000000")
+	testutil.Assert(t, timeResult.Success, "time filter query should succeed")
+	testutil.Assert(t, len(timeResult.Rows) > 0, "should find spans with duration > 100ms")
+	fmt.Println("  ✓ Time-based filtering passed")
+
+	// Test Case 6: Complex analytical query
+	fmt.Println("  Testing complex analytical query...")
+	analyticsResult := executeSQLQuery(t, artemis, httpClient, `
+		SELECT
+			service_name,
+			COUNT(*) as total_spans,
+			MIN(duration) as min_duration,
+			MAX(duration) as max_duration,
+			AVG(duration) as avg_duration
+		FROM spans
+		WHERE service_name LIKE 'sql-test-%'
+		GROUP BY service_name
+		ORDER BY total_spans DESC
+	`)
+	testutil.Assert(t, analyticsResult.Success, "analytics query should succeed")
+	testutil.Assert(t, len(analyticsResult.Rows) >= 3, "should have analytics for services")
+	testutil.Assert(t, len(analyticsResult.Columns) == 5, "should have 5 columns")
+	fmt.Println("  ✓ Complex analytical query passed")
+
+	fmt.Println("  ✅ All SQL query tests passed!")
+}
+
+// executeSQLQuery executes a SQL query against the Artemis API and returns the result
+func executeSQLQuery(t *testing.T, artemis e2e.Runnable, httpClient *http.Client, query string) *SQLQueryResponse {
+	t.Helper()
+
+	url := fmt.Sprintf("http://%s/api/query/sql", artemis.Endpoint("http"))
+
+	requestBody := map[string]string{
+		"query": query,
+	}
+	requestJSON, err := json.Marshal(requestBody)
+	testutil.Ok(t, err)
+
+	// Make the POST request with the JSON body
+	resp, err := httpClient.Post(url, "application/json", bytes.NewReader(requestJSON))
+	testutil.Ok(t, err)
+	defer resp.Body.Close()
+
+	// Read response body
+	bodyBytes, err := io.ReadAll(resp.Body)
+	testutil.Ok(t, err)
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("SQL query API returned status %d: %s\nQuery: %s", resp.StatusCode, string(bodyBytes), query)
+	}
+
+	var result SQLQueryResponse
+	testutil.Ok(t, json.Unmarshal(bodyBytes, &result))
+
+	// Debug output
+	if !result.Success && result.Error != "" {
+		t.Logf("SQL query failed: %s\nQuery: %s", result.Error, query)
+	}
+
+	return &result
+}
+
 // Helper functions
 
 func sendOTLPTrace(endpoint string, trace *collectortracev1.ExportTraceServiceRequest) error {
@@ -795,4 +981,27 @@ type Tag struct {
 type Process struct {
 	ServiceName string `json:"serviceName"`
 	Tags        []Tag  `json:"tags"`
+}
+
+// SQLQueryResponse represents the response from the SQL query API
+type SQLQueryResponse struct {
+	Success  bool                     `json:"success"`
+	Columns  []string                 `json:"columns"`
+	RowCount int                      `json:"row_count"`
+	Traces   []SQLTrace               `json:"traces,omitempty"`
+	Rows     []map[string]interface{} `json:"rows,omitempty"`
+	Error    string                   `json:"error,omitempty"`
+}
+
+// SQLTrace represents a trace/span returned from SQL queries
+type SQLTrace struct {
+	TraceID      string            `json:"trace_id"`
+	SpanID       string            `json:"span_id"`
+	ParentSpanID string            `json:"parent_span_id,omitempty"`
+	Name         string            `json:"name"`
+	StartTime    int64             `json:"start_time"`
+	EndTime      int64             `json:"end_time"`
+	Duration     int64             `json:"duration"`
+	ServiceName  string            `json:"service_name"`
+	Tags         map[string]string `json:"tags,omitempty"`
 }

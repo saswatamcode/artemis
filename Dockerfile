@@ -1,4 +1,4 @@
-FROM golang:1.25-alpine AS builder
+FROM golang:1.25-bookworm AS builder
 
 ARG TARGETOS
 ARG TARGETARCH
@@ -12,6 +12,12 @@ ARG BUILDDATE
 
 WORKDIR /build
 
+# Install build dependencies for CGO (gcc, g++, etc.)
+# DuckDB requires glibc, which is available in Debian-based images
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    && rm -rf /var/lib/apt/lists/*
+
 # Copy go mod files
 COPY go.mod go.sum ./
 RUN go mod download
@@ -19,7 +25,7 @@ RUN go mod download
 # Copy source code
 COPY . .
 
-RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} \
+RUN CGO_ENABLED=1 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} \
   go build -a -o artemis \
   -ldflags="-s -w \
   -X github.com/prometheus/common/version.Version=${VERSION} \
@@ -29,9 +35,13 @@ RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} \
   -X github.com/prometheus/common/version.BuildDate=${BUILDDATE}" \
   cmd/artemis/main.go
 
-FROM alpine:latest
+FROM debian:bookworm-slim
 
-RUN apk --no-cache add ca-certificates
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    libc6 \
+    libstdc++6 \
+    && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 

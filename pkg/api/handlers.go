@@ -44,6 +44,7 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("/api/traces", s.handleTraces) // Handle exact match too
 	s.mux.HandleFunc("/api/services/", s.handleServices)
 	s.mux.HandleFunc("/api/services", s.handleServices) // Handle exact match too
+	s.mux.HandleFunc("/api/query/sql", s.handleSQLQuery)
 	s.mux.HandleFunc("/health", s.handleHealth)
 }
 
@@ -313,6 +314,93 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(health)
+}
+
+// handleSQLQuery executes a SQL query against the trace database
+// POST /api/query/sql
+// Body: {"query": "SELECT * FROM spans WHERE service_name = 'my-service' LIMIT 10"}
+func (s *Server) handleSQLQuery(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req SQLQueryRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid request body: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	if req.Query == "" {
+		http.Error(w, "query is required", http.StatusBadRequest)
+		return
+	}
+
+	s.logger.Debug("Received SQL query", slog.String("query", req.Query))
+
+	// Create SQL querier
+	sqlQuerier, err := query.NewSQLQuerier()
+	if err != nil {
+		s.logger.Error("Failed to create SQL querier", slog.String("error", err.Error()))
+		http.Error(w, "failed to create SQL querier: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	defer sqlQuerier.Close()
+
+	// Load blocks from database
+	// Get blocks and head storage for querying
+	blocks := s.db.GetBlocksForQuery()
+
+	// For now, we only query persisted blocks (not the head block)
+	// TODO: Add support for querying the head block as well
+	if err := sqlQuerier.LoadBlocks(nil, blocks); err != nil {
+		s.logger.Error("Failed to load blocks", slog.String("error", err.Error()))
+		http.Error(w, "failed to load blocks: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	// Execute SQL query
+	result, err := sqlQuerier.SelectSQL(req.Query)
+	if err != nil {
+		s.logger.Error("SQL query failed", slog.String("error", err.Error()))
+		http.Error(w, "query failed: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	s.logger.Debug("SQL query completed",
+		slog.Int("row_count", result.RowCount()),
+		slog.Bool("is_span_result", result.IsSpanResult()))
+
+	// Build response
+	response := SQLQueryResponse{
+		Columns: result.Columns,
+		Success: true,
+	}
+
+	if result.IsSpanResult() {
+		// Convert spans to Jaeger format for compatibility
+		traceMap := make(map[string][]*span.Span)
+		for _, sp := range result.Spans {
+			traceMap[sp.TraceID] = append(traceMap[sp.TraceID], sp)
+		}
+
+		traces := make([]Trace, 0, len(traceMap))
+		for _, spans := range traceMap {
+			if jaegerTrace := ConvertTraceToJaeger(spans); jaegerTrace != nil {
+				traces = append(traces, *jaegerTrace)
+			}
+		}
+
+		response.Traces = traces
+		response.RowCount = len(result.Spans)
+	} else {
+		// Return generic rows
+		response.Rows = result.Rows
+		response.RowCount = len(result.Rows)
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(response)
 }
 
 // parseTraceQueryParams parses query parameters for trace search

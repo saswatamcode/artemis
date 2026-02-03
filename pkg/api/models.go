@@ -232,3 +232,18 @@ type TraceQueryParams struct {
 	Limit        int
 	LookbackDays int
 }
+
+// SQLQueryRequest represents a SQL query request
+type SQLQueryRequest struct {
+	Query string `json:"query"`
+}
+
+// SQLQueryResponse represents a SQL query response
+type SQLQueryResponse struct {
+	Success  bool                     `json:"success"`
+	Columns  []string                 `json:"columns"`
+	RowCount int                      `json:"row_count"`
+	Traces   []Trace                  `json:"traces,omitempty"`   // If query returns full spans
+	Rows     []map[string]interface{} `json:"rows,omitempty"`     // If query returns aggregations/projections
+	Error    string                   `json:"error,omitempty"`
+}
