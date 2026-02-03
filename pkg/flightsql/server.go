@@ -59,8 +59,3 @@ func (s *Server) Start() error {
 func (s *Server) Stop() {
 	s.grpcServer.GracefulStop()
 }
-
-// Addr returns the server's listen address
-func (s *Server) Addr() string {
-	return s.listener.Addr().String()
-}

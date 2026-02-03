@@ -107,21 +107,6 @@ func (m *Matcher) Matches(s *span.Span) bool {
 	return false
 }
 
-// String returns a string representation of the matcher
-func (m *Matcher) String() string {
-	switch m.Type {
-	case MatchEqual:
-		return fmt.Sprintf("%s=%q", m.Name, m.Value)
-	case MatchNotEqual:
-		return fmt.Sprintf("%s!=%q", m.Name, m.Value)
-	case MatchRegexp:
-		return fmt.Sprintf("%s=~%q", m.Name, m.Value)
-	case MatchNotRegexp:
-		return fmt.Sprintf("%s!~%q", m.Name, m.Value)
-	}
-	return ""
-}
-
 // Matchers is a list of matchers
 type Matchers []*Matcher
 
@@ -133,18 +118,4 @@ func (ms Matchers) Matches(s *span.Span) bool {
 		}
 	}
 	return true
-}
-
-// String returns a string representation of the matchers
-func (ms Matchers) String() string {
-	var s strings.Builder
-	s.WriteString("{")
-	for i, m := range ms {
-		if i > 0 {
-			s.WriteString(", ")
-		}
-		s.WriteString(m.String())
-	}
-	s.WriteString("}")
-	return s.String()
 }

@@ -9,8 +9,6 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/array"
 	"github.com/apache/arrow-go/v18/arrow/memory"
 
-	"github.com/saswatamcode/artemis/pkg/span"
-	"github.com/saswatamcode/artemis/pkg/storage"
 	"github.com/saswatamcode/artemis/pkg/tracedb"
 )
 
@@ -307,59 +305,4 @@ func sliceRecord(record arrow.Record, offset, length int) arrow.Record {
 	}
 
 	return array.NewRecord(record.Schema(), slicedArrays, int64(end-offset))
-}
-
-// ConvertSpansToArrowRecord converts spans to an Arrow record
-// Reuses SpanRecordBuilder from pkg/storage/arrow.go
-func ConvertSpansToArrowRecord(spans []*span.Span, columns []string) (arrow.Record, error) {
-	if len(spans) == 0 {
-		// Return empty record with schema
-		mem := memory.NewGoAllocator()
-		schema := GetSpansSchema()
-		builder := storage.NewSpanRecordBuilder(mem, schema)
-		defer builder.Release()
-
-		// Build empty record
-		record := builder.NewRecord()
-		if record == nil {
-			// Create truly empty record
-			emptyArrays := make([]arrow.Array, len(schema.Fields()))
-			for i, field := range schema.Fields() {
-				switch field.Type {
-				case arrow.BinaryTypes.String:
-					b := array.NewStringBuilder(mem)
-					emptyArrays[i] = b.NewStringArray()
-					b.Release()
-				case arrow.PrimitiveTypes.Int64:
-					b := array.NewInt64Builder(mem)
-					emptyArrays[i] = b.NewInt64Array()
-					b.Release()
-				default:
-					if field.Name == "tags" {
-						b := array.NewMapBuilder(mem, arrow.BinaryTypes.String, arrow.BinaryTypes.String, false)
-						emptyArrays[i] = b.NewMapArray()
-						b.Release()
-					}
-				}
-			}
-			record = array.NewRecord(schema, emptyArrays, 0)
-		}
-		return record, nil
-	}
-
-	mem := memory.NewGoAllocator()
-	schema := GetSpansSchema()
-	builder := storage.NewSpanRecordBuilder(mem, schema)
-	defer builder.Release()
-
-	for _, sp := range spans {
-		builder.Append(sp)
-	}
-
-	record := builder.NewRecord()
-	if record == nil {
-		return nil, fmt.Errorf("failed to build Arrow record")
-	}
-
-	return record, nil
 }
