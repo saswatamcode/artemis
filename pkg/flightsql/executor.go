@@ -50,6 +50,8 @@ func (e *SQLExecutor) Execute(sqlQuery string) (arrow.Record, error) {
 	querier := e.db.GetQuerier()
 
 	// Execute query and get Arrow records directly (no Span conversion!)
+	// Arrow L0 blocks: returns existing Arrow records
+	// Parquet L1+ blocks: uses pqarrow for native Parquet→Arrow conversion
 	var record arrow.Record
 
 	if query.TimeRange != nil {

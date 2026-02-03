@@ -44,7 +44,7 @@ func SelectAsArrowWithTimeRange(storage *storage.ArrowStorage, blocks []block.Bl
 		allRecords = append(allRecords, records...)
 	}
 
-	// Get records from blocks (Arrow L0 blocks only for now)
+	// Get records from blocks (both Arrow L0 and Parquet L1+ blocks)
 	for _, blk := range blocks {
 		// Skip blocks outside time range
 		meta := blk.Meta()
@@ -52,12 +52,14 @@ func SelectAsArrowWithTimeRange(storage *storage.ArrowStorage, blocks []block.Bl
 			continue
 		}
 
-		// Arrow blocks can return records directly
-		if records := blk.Records(); records != nil {
+		// Use AsArrowRecords() for native Arrow conversion (works for both Arrow and Parquet blocks)
+		records, err := blk.AsArrowRecords()
+		if err != nil {
+			return nil, fmt.Errorf("failed to get arrow records from block %s: %w", blk.Dir(), err)
+		}
+		if records != nil {
 			allRecords = append(allRecords, records...)
 		}
-		// TODO: For Parquet blocks, we'd need to read them as Arrow
-		// For now, they're excluded from Arrow queries
 	}
 
 	if len(allRecords) == 0 {

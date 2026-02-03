@@ -1,6 +1,7 @@
 package block
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -12,6 +13,10 @@ import (
 	"time"
 
 	"github.com/apache/arrow-go/v18/arrow"
+	"github.com/apache/arrow-go/v18/arrow/array"
+	"github.com/apache/arrow-go/v18/arrow/memory"
+	"github.com/apache/arrow-go/v18/parquet/file"
+	"github.com/apache/arrow-go/v18/parquet/pqarrow"
 	"github.com/parquet-go/parquet-go"
 	"github.com/parquet-go/parquet-go/compress/snappy"
 
@@ -165,6 +170,56 @@ func (pb *ParquetBlock) Schema() *arrow.Schema {
 // Implements Block interface
 func (pb *ParquetBlock) Records() []arrow.Record {
 	return nil
+}
+
+// AsArrowRecords reads Parquet file and converts to Arrow records natively
+// Uses Apache Arrow's pqarrow package to avoid double conversion (Parquet → Span → Arrow)
+// This is the efficient path for FlightSQL queries on Parquet blocks
+func (pb *ParquetBlock) AsArrowRecords() ([]arrow.Record, error) {
+	dataPath := filepath.Join(pb.dir, parquetDataFilename)
+
+	// Open Parquet file using Apache Arrow's reader
+	rdr, err := file.OpenParquetFile(dataPath, false)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open parquet file with arrow: %w", err)
+	}
+	defer rdr.Close()
+
+	// Create Arrow file reader using pqarrow
+	mem := memory.NewGoAllocator()
+	arrowReader, err := pqarrow.NewFileReader(rdr, pqarrow.ArrowReadProperties{}, mem)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create arrow reader: %w", err)
+	}
+
+	// Read entire table
+	table, err := arrowReader.ReadTable(context.Background())
+	if err != nil {
+		return nil, fmt.Errorf("failed to read parquet as arrow table: %w", err)
+	}
+	defer table.Release()
+
+	// Convert table to records
+	// A table is a collection of chunked arrays, we need to convert to records
+	tr := array.NewTableReader(table, -1) // -1 means read all rows at once
+	defer tr.Release()
+
+	var records []arrow.Record
+	for tr.Next() {
+		rec := tr.Record()
+		rec.Retain() // Retain so it's not freed when reader is released
+		records = append(records, rec)
+	}
+
+	if err := tr.Err(); err != nil {
+		// Release any records we've collected
+		for _, rec := range records {
+			rec.Release()
+		}
+		return nil, fmt.Errorf("error reading table records: %w", err)
+	}
+
+	return records, nil
 }
 
 // Index returns the block's index (may be nil if not loaded)
