@@ -1,4 +1,17 @@
-FROM golang:1.25-bookworm AS builder
+# Default Dockerfile - lightweight Alpine build without CGO
+# This produces a smaller binary (~31MB) and container image
+#
+# Build with: docker build -t artemis:latest .
+#
+# Features:
+# - Full OTLP trace ingestion
+# - Jaeger and Tempo query APIs
+# - Arrow IPC and Parquet storage
+# - Block compaction and WAL
+#
+# SQL querying is NOT available (returns "not supported" error)
+
+FROM golang:1.25-alpine AS builder
 
 ARG TARGETOS
 ARG TARGETARCH
@@ -12,12 +25,6 @@ ARG BUILDDATE
 
 WORKDIR /build
 
-# Install build dependencies for CGO (gcc, g++, etc.)
-# DuckDB requires glibc, which is available in Debian-based images
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential \
-    && rm -rf /var/lib/apt/lists/*
-
 # Copy go mod files
 COPY go.mod go.sum ./
 RUN go mod download
@@ -25,7 +32,9 @@ RUN go mod download
 # Copy source code
 COPY . .
 
-RUN CGO_ENABLED=1 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} \
+# Build without CGO (no DuckDB support)
+# This produces a smaller binary and doesn't require glibc
+RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} \
   go build -a -o artemis \
   -ldflags="-s -w \
   -X github.com/prometheus/common/version.Version=${VERSION} \
@@ -35,13 +44,9 @@ RUN CGO_ENABLED=1 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} \
   -X github.com/prometheus/common/version.BuildDate=${BUILDDATE}" \
   cmd/artemis/main.go
 
-FROM debian:bookworm-slim
+FROM alpine:latest
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates \
-    libc6 \
-    libstdc++6 \
-    && rm -rf /var/lib/apt/lists/*
+RUN apk --no-cache add ca-certificates
 
 WORKDIR /app
 
@@ -55,7 +60,8 @@ RUN mkdir -p /data/wal /data/blocks
 # 4317 - OTLP gRPC
 # 16686 - HTTP API (Jaeger-compatible)
 # 3200 - Tempo API
-EXPOSE 4317 16686 3200
+# 5433 - DuckDB SQL API (not available)
+EXPOSE 4317 16686 3200 5433
 
 # Run server
 # Pass flags as arguments to docker run, e.g.:

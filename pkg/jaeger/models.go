@@ -1,4 +1,4 @@
-package api
+package jaeger
 
 import (
 	"strconv"
@@ -243,7 +243,7 @@ type SQLQueryResponse struct {
 	Success  bool                     `json:"success"`
 	Columns  []string                 `json:"columns"`
 	RowCount int                      `json:"row_count"`
-	Traces   []Trace                  `json:"traces,omitempty"`   // If query returns full spans
-	Rows     []map[string]interface{} `json:"rows,omitempty"`     // If query returns aggregations/projections
+	Traces   []Trace                  `json:"traces,omitempty"` // If query returns full spans
+	Rows     []map[string]interface{} `json:"rows,omitempty"`   // If query returns aggregations/projections
 	Error    string                   `json:"error,omitempty"`
 }

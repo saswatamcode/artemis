@@ -1,3 +1,5 @@
+//go:build duckdb
+
 package query
 
 import (
@@ -12,12 +14,10 @@ func TestSQLQuerier_Basic(t *testing.T) {
 	}
 	defer sq.Close()
 
-	// Verify the querier was created successfully
-	if sq.db == nil {
-		t.Fatal("database connection is nil")
-	}
-	if sq.conn == nil {
-		t.Fatal("connection is nil")
+	// Verify the querier was created successfully by loading empty blocks
+	err = sq.LoadBlocks(nil, nil)
+	if err != nil {
+		t.Fatalf("failed to load empty blocks: %v", err)
 	}
 }
 
@@ -42,25 +42,25 @@ func TestSQLQuerier_BasicSQL(t *testing.T) {
 	}
 	defer sq.Close()
 
-	// Test a simple SQL query (without loading any blocks)
+	// Load empty blocks to create the spans table
+	err = sq.LoadBlocks(nil, nil)
+	if err != nil {
+		t.Fatalf("failed to load empty blocks: %v", err)
+	}
+
+	// Test a simple SQL query
 	// This tests that DuckDB is working
-	rows, err := sq.conn.QueryContext(sq.ctx, "SELECT 1 as test")
+	result, err := sq.SelectSQL("SELECT COUNT(*) as count FROM spans")
 	if err != nil {
 		t.Fatalf("failed to execute simple query: %v", err)
 	}
-	defer rows.Close()
 
-	if !rows.Next() {
-		t.Fatal("expected at least one row")
+	if result.RowCount() != 1 {
+		t.Fatalf("expected 1 row, got %d", result.RowCount())
 	}
 
-	var result int
-	if err := rows.Scan(&result); err != nil {
-		t.Fatalf("failed to scan result: %v", err)
-	}
-
-	if result != 1 {
-		t.Fatalf("expected 1, got %d", result)
+	if len(result.Rows) != 1 {
+		t.Fatalf("expected 1 row in result, got %d", len(result.Rows))
 	}
 }
 

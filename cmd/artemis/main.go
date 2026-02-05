@@ -15,10 +15,11 @@ import (
 	"github.com/prometheus/common/version"
 	"github.com/spf13/cobra"
 
-	"github.com/saswatamcode/artemis/pkg/api"
 	"github.com/saswatamcode/artemis/pkg/block"
 	"github.com/saswatamcode/artemis/pkg/compactor"
+	"github.com/saswatamcode/artemis/pkg/jaeger"
 	"github.com/saswatamcode/artemis/pkg/otlp"
+	"github.com/saswatamcode/artemis/pkg/sqlapi"
 	"github.com/saswatamcode/artemis/pkg/tempo"
 	"github.com/saswatamcode/artemis/pkg/tracedb"
 )
@@ -47,9 +48,10 @@ var (
 	minBlocks1   int
 
 	// Server address flags
-	otlpAddr  string
-	apiAddr   string
-	tempoAddr string
+	otlpAddr   string
+	jaegerAddr string
+	tempoAddr  string
+	sqlAPIAddr string
 
 	// Logging flags
 	logLevelStr  string
@@ -107,8 +109,9 @@ func init() {
 
 	// Server address flags
 	rootCmd.Flags().StringVar(&otlpAddr, "otlp-addr", ":4317", "OTLP gRPC receiver address")
-	rootCmd.Flags().StringVar(&apiAddr, "api-addr", ":16686", "HTTP API (Jaeger) address")
+	rootCmd.Flags().StringVar(&jaegerAddr, "jaeger-addr", ":16686", "HTTP API (Jaeger) address")
 	rootCmd.Flags().StringVar(&tempoAddr, "tempo-addr", ":3200", "Tempo API address")
+	rootCmd.Flags().StringVar(&sqlAPIAddr, "sqlapi-addr", ":5433", "SQL API address")
 
 	// Logging flags
 	rootCmd.Flags().StringVar(&logLevelStr, "log.level", "info", psflag.LevelFlagHelp)
@@ -208,32 +211,36 @@ func runServer(cmd *cobra.Command, args []string) error {
 		log.Fatalf("Failed to create OTLP server: %v", err)
 	}
 
-	apiServer := api.NewServer(db, logger)
+	jaegerServer := jaeger.NewServer(db, logger)
 	tempoServer := tempo.NewServer(db, logger)
+	sqlAPIServer := sqlapi.NewServer(db, logger)
 
 	// Print server info
 	logger.Info("artemis server starting",
 		"otlp_addr", otlpAddr,
-		"jaeger_api", "http://localhost"+apiAddr,
+		"jaeger_api", "http://localhost"+jaegerAddr,
 		"tempo_api", "http://localhost"+tempoAddr,
+		"sqlapi", "http://localhost"+sqlAPIAddr,
 	)
 	logger.Info("grafana configuration",
 		"jaeger_type", "Jaeger",
-		"jaeger_url", "http://localhost"+apiAddr,
+		"jaeger_url", "http://localhost"+jaegerAddr,
 		"tempo_type", "Tempo",
 		"tempo_url", "http://localhost"+tempoAddr,
 	)
 	logger.Info("available endpoints",
-		"jaeger_trace", apiAddr+"/api/traces/{traceID}",
-		"jaeger_search", apiAddr+"/api/traces?service=...",
-		"jaeger_services", apiAddr+"/api/services",
-		"jaeger_health", apiAddr+"/health",
+		"jaeger_trace", jaegerAddr+"/api/traces/{traceID}",
+		"jaeger_search", jaegerAddr+"/api/traces?service=...",
+		"jaeger_services", jaegerAddr+"/api/services",
+		"jaeger_health", jaegerAddr+"/health",
 		"tempo_search_v1", tempoAddr+"/api/search",
 		"tempo_search_v2", tempoAddr+"/api/v2/search",
 		"tempo_trace", tempoAddr+"/api/traces/{traceID}",
 		"tempo_tags_v2", tempoAddr+"/api/v2/search/tags",
 		"tempo_tag_values_v2", tempoAddr+"/api/v2/search/tag/{tag}/values",
 		"tempo_buildinfo", tempoAddr+"/api/status/buildinfo",
+		"sqlapi_query", sqlAPIAddr+"/api/query",
+		"sqlapi_health", sqlAPIAddr+"/health",
 	)
 	logger.Info("press ctrl+c to shutdown")
 
@@ -249,12 +256,12 @@ func runServer(cmd *cobra.Command, args []string) error {
 		otlpServer.Stop()
 	})
 
-	// API server actor
+	// Jaeger API server actor
 	g.Add(func() error {
-		logger.Info("starting http api (jaeger)", "addr", apiAddr)
-		return apiServer.Start(apiAddr)
+		logger.Info("starting http api (jaeger)", "addr", jaegerAddr)
+		return jaegerServer.Start(jaegerAddr)
 	}, func(error) {
-		if err := apiServer.Shutdown(); err != nil {
+		if err := jaegerServer.Shutdown(); err != nil {
 			logger.Error("failed to shutdown api server", "error", err)
 		}
 	})
@@ -266,6 +273,16 @@ func runServer(cmd *cobra.Command, args []string) error {
 	}, func(error) {
 		if err := tempoServer.Shutdown(); err != nil {
 			logger.Error("failed to shutdown tempo server", "error", err)
+		}
+	})
+
+	// SQL API server actor
+	g.Add(func() error {
+		logger.Info("starting sql api", "addr", sqlAPIAddr)
+		return sqlAPIServer.Start(sqlAPIAddr)
+	}, func(error) {
+		if err := sqlAPIServer.Shutdown(); err != nil {
+			logger.Error("failed to shutdown sql api server", "error", err)
 		}
 	})
 

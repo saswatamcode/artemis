@@ -1,3 +1,5 @@
+//go:build duckdb
+
 package query
 
 import (
@@ -14,9 +16,10 @@ import (
 	"github.com/saswatamcode/artemis/pkg/storage"
 )
 
-// SQLQuerier provides SQL-based querying using DuckDB
+// duckDBQuerier provides SQL-based querying using DuckDB
 // It can query Arrow IPC files and Parquet files directly from disk
-type SQLQuerier struct {
+// This implementation is only available when built with the 'duckdb' build tag
+type duckDBQuerier struct {
 	db     *sql.DB
 	conn   *sql.Conn
 	ctx    context.Context
@@ -24,8 +27,9 @@ type SQLQuerier struct {
 }
 
 // NewSQLQuerier creates a new SQL querier with DuckDB backend
-func NewSQLQuerier() (*SQLQuerier, error) {
-	// Create in-memory DuckDB database
+// This implementation is only available when built with the 'duckdb' build tag
+// Creates an in-mem duckdb database.
+func NewSQLQuerier() (SQLQuerier, error) {
 	db, err := sql.Open("duckdb", "")
 	if err != nil {
 		return nil, fmt.Errorf("failed to open duckdb: %w", err)
@@ -39,7 +43,15 @@ func NewSQLQuerier() (*SQLQuerier, error) {
 		return nil, fmt.Errorf("failed to get connection: %w", err)
 	}
 
-	sq := &SQLQuerier{
+	// Install and load the arrow extension for reading Arrow IPC files
+	if _, err := conn.ExecContext(ctx, "INSTALL arrow FROM community; LOAD arrow;"); err != nil {
+		cancel()
+		conn.Close()
+		db.Close()
+		return nil, fmt.Errorf("failed to load arrow extension: %w", err)
+	}
+
+	sq := &duckDBQuerier{
 		db:     db,
 		conn:   conn,
 		ctx:    ctx,
@@ -50,7 +62,7 @@ func NewSQLQuerier() (*SQLQuerier, error) {
 }
 
 // Close releases resources held by the SQL querier
-func (sq *SQLQuerier) Close() error {
+func (sq *duckDBQuerier) Close() error {
 	sq.cancel()
 	if sq.conn != nil {
 		sq.conn.Close()
@@ -63,8 +75,7 @@ func (sq *SQLQuerier) Close() error {
 
 // LoadBlocks loads blocks into DuckDB for querying
 // Creates a unified "spans" table from all blocks (Arrow IPC and Parquet)
-func (sq *SQLQuerier) LoadBlocks(head *storage.ArrowStorage, blocks []block.Block) error {
-	// Create a view that unions all data sources
+func (sq *duckDBQuerier) LoadBlocks(head *storage.ArrowStorage, blocks []block.Block) error {
 	var sources []string
 
 	// Load persisted blocks (Arrow L0 and Parquet L1+)
@@ -75,7 +86,7 @@ func (sq *SQLQuerier) LoadBlocks(head *storage.ArrowStorage, blocks []block.Bloc
 		if meta.Level() == 0 {
 			// L0 blocks are Arrow IPC files
 			arrowPath := filepath.Join(blockDir, "spans.arrow")
-			sources = append(sources, fmt.Sprintf("SELECT * FROM read_ipc('%s')", arrowPath))
+			sources = append(sources, fmt.Sprintf("SELECT * FROM read_arrow('%s')", arrowPath))
 		} else {
 			// L1+ blocks are Parquet files
 			parquetPath := filepath.Join(blockDir, "spans.parquet")
@@ -130,14 +141,13 @@ func (sq *SQLQuerier) LoadBlocks(head *storage.ArrowStorage, blocks []block.Bloc
 //   - SELECT * FROM spans WHERE service_name = 'my-service' LIMIT 100
 //   - SELECT * FROM spans WHERE start_time >= 1234567890 AND start_time <= 1234567900
 //   - SELECT trace_id, COUNT(*) FROM spans GROUP BY trace_id
-func (sq *SQLQuerier) SelectSQL(query string) (*SQLResult, error) {
+func (sq *duckDBQuerier) SelectSQL(query string) (*SQLResult, error) {
 	rows, err := sq.conn.QueryContext(sq.ctx, query)
 	if err != nil {
 		return nil, fmt.Errorf("failed to execute query: %w", err)
 	}
 	defer rows.Close()
 
-	// Get column information
 	columns, err := rows.Columns()
 	if err != nil {
 		return nil, fmt.Errorf("failed to get columns: %w", err)
@@ -151,14 +161,12 @@ func (sq *SQLQuerier) SelectSQL(query string) (*SQLResult, error) {
 	}
 
 	if isSpanQuery {
-		// Parse results as spans
 		spans, err := sq.parseSpans(rows)
 		if err != nil {
 			return nil, fmt.Errorf("failed to parse spans: %w", err)
 		}
 		result.Spans = spans
 	} else {
-		// Parse results as generic rows
 		genericRows, err := sq.parseGenericRows(rows, columns)
 		if err != nil {
 			return nil, fmt.Errorf("failed to parse rows: %w", err)
@@ -170,7 +178,7 @@ func (sq *SQLQuerier) SelectSQL(query string) (*SQLResult, error) {
 }
 
 // isSpanQuery checks if the query result has all span columns
-func (sq *SQLQuerier) isSpanQuery(columns []string) bool {
+func (sq *duckDBQuerier) isSpanQuery(columns []string) bool {
 	requiredColumns := map[string]bool{
 		"trace_id":       false,
 		"span_id":        false,
@@ -189,7 +197,6 @@ func (sq *SQLQuerier) isSpanQuery(columns []string) bool {
 		}
 	}
 
-	// Check if all required columns are present
 	for _, found := range requiredColumns {
 		if !found {
 			return false
@@ -200,7 +207,7 @@ func (sq *SQLQuerier) isSpanQuery(columns []string) bool {
 }
 
 // parseSpans parses SQL result rows into span objects
-func (sq *SQLQuerier) parseSpans(rows *sql.Rows) ([]*span.Span, error) {
+func (sq *duckDBQuerier) parseSpans(rows *sql.Rows) ([]*span.Span, error) {
 	var spans []*span.Span
 
 	for rows.Next() {
@@ -213,7 +220,7 @@ func (sq *SQLQuerier) parseSpans(rows *sql.Rows) ([]*span.Span, error) {
 			endTime      int64
 			duration     int64
 			serviceName  string
-			tags         map[string]string // DuckDB MAP type
+			tagsRaw      interface{} // Scan as interface{} first, then convert
 		)
 
 		err := rows.Scan(
@@ -225,10 +232,22 @@ func (sq *SQLQuerier) parseSpans(rows *sql.Rows) ([]*span.Span, error) {
 			&endTime,
 			&duration,
 			&serviceName,
-			&tags,
+			&tagsRaw,
 		)
 		if err != nil {
 			return nil, fmt.Errorf("failed to scan row: %w", err)
+		}
+
+		// Convert DuckDB MAP to Go map[string]string
+		tags := make(map[string]string)
+		if tagsRaw != nil {
+			if tagsMap, ok := tagsRaw.(map[string]interface{}); ok {
+				for k, v := range tagsMap {
+					if vStr, ok := v.(string); ok {
+						tags[k] = vStr
+					}
+				}
+			}
 		}
 
 		sp := &span.Span{
@@ -257,10 +276,9 @@ func (sq *SQLQuerier) parseSpans(rows *sql.Rows) ([]*span.Span, error) {
 }
 
 // parseGenericRows parses SQL result rows into generic row maps
-func (sq *SQLQuerier) parseGenericRows(rows *sql.Rows, columns []string) ([]map[string]interface{}, error) {
+func (sq *duckDBQuerier) parseGenericRows(rows *sql.Rows, columns []string) ([]map[string]interface{}, error) {
 	var result []map[string]interface{}
 
-	// Create slice of interface{} for scanning
 	columnCount := len(columns)
 	values := make([]interface{}, columnCount)
 	valuePtrs := make([]interface{}, columnCount)
@@ -286,40 +304,4 @@ func (sq *SQLQuerier) parseGenericRows(rows *sql.Rows, columns []string) ([]map[
 	}
 
 	return result, nil
-}
-
-// SQLResult represents the result of a SQL query
-type SQLResult struct {
-	Columns []string                 // Column names
-	Spans   []*span.Span             // Parsed spans (if query returns full span records)
-	Rows    []map[string]interface{} // Generic rows (for aggregations, projections, etc.)
-}
-
-// IsSpanResult returns true if the result contains full span records
-func (r *SQLResult) IsSpanResult() bool {
-	return len(r.Spans) > 0
-}
-
-// RowCount returns the number of rows in the result
-func (r *SQLResult) RowCount() int {
-	if r.IsSpanResult() {
-		return len(r.Spans)
-	}
-	return len(r.Rows)
-}
-
-// SelectSQLFromBlocks is a convenience function that creates a SQL querier,
-// loads blocks, executes a query, and returns results
-func SelectSQLFromBlocks(head *storage.ArrowStorage, blocks []block.Block, query string) (*SQLResult, error) {
-	sq, err := NewSQLQuerier()
-	if err != nil {
-		return nil, fmt.Errorf("failed to create SQL querier: %w", err)
-	}
-	defer sq.Close()
-
-	if err := sq.LoadBlocks(head, blocks); err != nil {
-		return nil, fmt.Errorf("failed to load blocks: %w", err)
-	}
-
-	return sq.SelectSQL(query)
 }

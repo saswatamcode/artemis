@@ -3,15 +3,16 @@
 CONTAINER_TOOL ?= docker
 
 IMG ?= artemis:latest
+IMG_DUCKDB ?= artemis-duckdb:latest
 
 .PHONY: build
-build: 
+build: ## Build lightweight binary without DuckDB support (no CGO required)
 	@VERSION=$$(cat VERSION) && \
 	REVISION=$$(git rev-parse HEAD) && \
 	BRANCH=$$(git rev-parse --abbrev-ref HEAD) && \
 	BUILDUSER=$$(whoami)@$$HOSTNAME && \
 	BUILDDATE=$$(date +%Y%m%d-%H:%M:%S) && \
-	go build -o bin/artemis \
+	CGO_ENABLED=0 go build -o bin/artemis \
 		-ldflags="-s -w \
 		-X github.com/prometheus/common/version.Version=$$VERSION \
 		-X github.com/prometheus/common/version.Revision=$$REVISION \
@@ -20,8 +21,30 @@ build:
 		-X github.com/prometheus/common/version.BuildDate=$$BUILDDATE" \
 		cmd/artemis/main.go
 
+.PHONY: build-duckdb
+build-duckdb: ## Build binary with DuckDB SQL support (requires CGO)
+	@VERSION=$$(cat VERSION) && \
+	REVISION=$$(git rev-parse HEAD) && \
+	BRANCH=$$(git rev-parse --abbrev-ref HEAD) && \
+	BUILDUSER=$$(whoami)@$$HOSTNAME && \
+	BUILDDATE=$$(date +%Y%m%d-%H:%M:%S) && \
+	CGO_ENABLED=1 go build -tags "duckdb duckdb_arrow" -o bin/artemis-duckdb \
+		-ldflags="-s -w \
+		-X github.com/prometheus/common/version.Version=$$VERSION \
+		-X github.com/prometheus/common/version.Revision=$$REVISION \
+		-X github.com/prometheus/common/version.Branch=$$BRANCH \
+		-X github.com/prometheus/common/version.BuildUser=$$BUILDUSER \
+		-X github.com/prometheus/common/version.BuildDate=$$BUILDDATE" \
+		cmd/artemis/main.go
+
+.PHONY: build-tool
+build-tool: ## Build artemistool CLI for querying Artemis
+	@CGO_ENABLED=0 go build -o bin/artemistool \
+		-ldflags="-s -w" \
+		cmd/artemistool/main.go
+
 .PHONY: docker-build
-docker-build:
+docker-build: ## Build lightweight Docker image without DuckDB support
 	@VERSION=$$(cat VERSION) && \
 	REVISION=$$(git rev-parse HEAD) && \
 	BRANCH=$$(git rev-parse --abbrev-ref HEAD) && \
@@ -34,6 +57,21 @@ docker-build:
 		--build-arg BUILDUSER=$$BUILDUSER \
 		--build-arg BUILDDATE=$$BUILDDATE \
 		-t ${IMG} .
+
+.PHONY: docker-build-duckdb
+docker-build-duckdb: ## Build Docker image with DuckDB SQL support (requires CGO)
+	@VERSION=$$(cat VERSION) && \
+	REVISION=$$(git rev-parse HEAD) && \
+	BRANCH=$$(git rev-parse --abbrev-ref HEAD) && \
+	BUILDUSER=$$(whoami)@$$HOSTNAME && \
+	BUILDDATE=$$(date +%Y%m%d-%H:%M:%S) && \
+	$(CONTAINER_TOOL) build --load -f Dockerfile.duckdb \
+		--build-arg VERSION=$$VERSION \
+		--build-arg REVISION=$$REVISION \
+		--build-arg BRANCH=$$BRANCH \
+		--build-arg BUILDUSER=$$BUILDUSER \
+		--build-arg BUILDDATE=$$BUILDDATE \
+		-t ${IMG_DUCKDB} .
 
 .PHONY: deps
 deps: ## Ensures fresh go.mod and go.sum.
