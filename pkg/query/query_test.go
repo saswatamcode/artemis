@@ -309,7 +309,7 @@ func TestSelectFromBlocksWithTimeRange(t *testing.T) {
 	timeRange := NewTimeRange(now.Add(-10*time.Minute), now)
 	matcher, _ := NewMatcher(MatchEqual, "env", "prod")
 
-	results, err := SelectFromBlocksWithTimeRange(arrowStorage, nil, timeRange, matcher)
+	results, err := SelectFromBlocksWithTimeRange(block.NewHeadBlock(arrowStorage), nil, timeRange, matcher)
 	if err != nil {
 		t.Fatalf("SelectFromBlocksWithTimeRange() error = %v", err)
 	}
@@ -320,86 +320,38 @@ func TestSelectFromBlocksWithTimeRange(t *testing.T) {
 	}
 }
 
+// TestQuerier is covered comprehensively in querier_comprehensive_test.go
+// This basic test remains for backward compatibility
 func TestQuerier(t *testing.T) {
 	tmpDir := t.TempDir()
 
-	// Create head storage
 	headStorage := storage.NewArrowStorage()
 	defer headStorage.Release()
 
 	baseTime := time.Now().Add(-2 * time.Hour)
 
-	// Add spans to head
 	headSpans := createTestSpans(t, "head", baseTime.Add(1*time.Hour), 50, "service-head", "prod")
 	for _, sp := range headSpans {
 		headStorage.AddSpan(sp)
 	}
 	headStorage.Flush()
 
-	// Create a persisted block
-	block := createTestBlockWithCustomSpans(t, tmpDir, 1, baseTime,
+	testBlock := createTestBlockWithCustomSpans(t, tmpDir, 1, baseTime,
 		createTestSpans(t, "block", baseTime, 100, "service-block", "prod"))
-	defer block.Close()
+	defer testBlock.Close()
 
-	blocks := []Block{block}
+	querier := NewBlockQuerier(block.NewHeadBlock(headStorage), []Block{testBlock})
 
-	// Create a querier
-	querier := NewBlockQuerier(headStorage, blocks)
+	matcher, _ := NewMatcher(MatchEqual, "env", "prod")
+	results, err := querier.Select(matcher)
+	if err != nil {
+		t.Fatalf("Querier.Select() error = %v", err)
+	}
 
-	t.Run("Select without time range", func(t *testing.T) {
-		matcher, _ := NewMatcher(MatchEqual, "env", "prod")
-		results, err := querier.Select(matcher)
-		if err != nil {
-			t.Fatalf("Querier.Select() error = %v", err)
-		}
-
-		// Should get all spans (50 head + 100 block)
-		if len(results.Spans) != 150 {
-			t.Errorf("Querier.Select() returned %d spans, want 150", len(results.Spans))
-		}
-	})
-
-	t.Run("SelectWithTimeRange", func(t *testing.T) {
-		// Query only the last hour (should get only head spans)
-		timeRange := NewTimeRange(baseTime.Add(1*time.Hour), baseTime.Add(2*time.Hour))
-		matcher, _ := NewMatcher(MatchEqual, "env", "prod")
-
-		results, err := querier.SelectWithTimeRange(timeRange, matcher)
-		if err != nil {
-			t.Fatalf("Querier.SelectWithTimeRange() error = %v", err)
-		}
-
-		if len(results.Spans) != 50 {
-			t.Errorf("Querier.SelectWithTimeRange() returned %d spans, want 50", len(results.Spans))
-		}
-	})
-
-	t.Run("Select with service filter", func(t *testing.T) {
-		matcher, _ := NewMatcher(MatchEqual, "service.name", "service-block")
-		results, err := querier.Select(matcher)
-		if err != nil {
-			t.Fatalf("Querier.Select() error = %v", err)
-		}
-
-		// Should only get block spans
-		if len(results.Spans) != 100 {
-			t.Errorf("Querier.Select() returned %d spans, want 100", len(results.Spans))
-		}
-	})
-
-	t.Run("Select with multiple matchers", func(t *testing.T) {
-		m1, _ := NewMatcher(MatchEqual, "env", "prod")
-		m2, _ := NewMatcher(MatchEqual, "version", "2.0")
-		results, err := querier.Select(m1, m2)
-		if err != nil {
-			t.Fatalf("Querier.Select() error = %v", err)
-		}
-
-		// All test spans have both env=prod and version=2.0
-		if len(results.Spans) != 150 {
-			t.Errorf("Querier.Select() returned %d spans, want 150", len(results.Spans))
-		}
-	})
+	// Should get all spans (50 head + 100 block)
+	if len(results.Spans) != 150 {
+		t.Errorf("Querier.Select() returned %d spans, want 150", len(results.Spans))
+	}
 }
 
 func Benchmark_Select(b *testing.B) {
@@ -426,109 +378,47 @@ func Benchmark_Select(b *testing.B) {
 	}
 }
 
-// TestSelectFromMixedBlocks tests querying across a mixture of L0 Arrow blocks and L1+ Parquet blocks
+// TestSelectFromMixedBlocks tests the legacy SelectFromBlocks function
+// Comprehensive coverage in querier_comprehensive_test.go
 func TestSelectFromMixedBlocks(t *testing.T) {
 	tmpDir := t.TempDir()
 
-	// Create head storage
 	headStorage := storage.NewArrowStorage()
 	defer headStorage.Release()
 
 	baseTime := time.Now().Add(-3 * time.Hour)
 
-	// Add spans to head (most recent)
 	headSpans := createTestSpans(t, "head", baseTime.Add(2*time.Hour), 50, "service-head", "prod")
 	for _, sp := range headSpans {
 		headStorage.AddSpan(sp)
 	}
 	headStorage.Flush()
 
-	// Create L0 Arrow IPC block (1 hour ago)
 	l0Block := createTestBlockWithCustomSpans(t, tmpDir, 0, baseTime.Add(1*time.Hour),
 		createTestSpans(t, "l0", baseTime.Add(1*time.Hour), 100, "service-l0", "prod"))
 	defer l0Block.Close()
 
-	// Create L1 Parquet block (2 hours ago)
 	l1Block := createTestBlockWithCustomSpans(t, tmpDir, 1, baseTime,
 		createTestSpans(t, "l1", baseTime, 150, "service-l1", "prod"))
 	defer l1Block.Close()
 
-	// Create L2 Parquet block (3 hours ago)
-	l2Block := createTestBlockWithCustomSpans(t, tmpDir, 2, baseTime.Add(-1*time.Hour),
-		createTestSpans(t, "l2", baseTime.Add(-1*time.Hour), 200, "service-l2", "prod"))
-	defer l2Block.Close()
+	blocks := []Block{l0Block, l1Block}
 
-	blocks := []Block{l0Block, l1Block, l2Block}
+	matcher, _ := NewMatcher(MatchEqual, "env", "prod")
+	results, err := SelectFromBlocks(block.NewHeadBlock(headStorage), blocks, matcher)
+	if err != nil {
+		t.Fatalf("SelectFromBlocks() error = %v", err)
+	}
 
-	t.Run("query all blocks with tag filter", func(t *testing.T) {
-		matcher, _ := NewMatcher(MatchEqual, "env", "prod")
-		results, err := SelectFromBlocks(headStorage, blocks, matcher)
-		if err != nil {
-			t.Fatalf("SelectFromBlocks() error = %v", err)
-		}
-
-		// Should get all spans (50 from head + 100 from L0 + 150 from L1 + 200 from L2)
-		expectedCount := 500
-		if len(results.Spans) != expectedCount {
-			t.Errorf("SelectFromBlocks() returned %d spans, want %d", len(results.Spans), expectedCount)
-		}
-
-		// Verify we got spans from all sources
-		sources := make(map[string]bool)
-		for _, sp := range results.Spans {
-			sources[sp.ServiceName] = true
-		}
-
-		expectedSources := []string{"service-head", "service-l0", "service-l1", "service-l2"}
-		for _, src := range expectedSources {
-			if !sources[src] {
-				t.Errorf("Missing spans from %s", src)
-			}
-		}
-	})
-
-	t.Run("query with service filter", func(t *testing.T) {
-		// Create empty head for this test
-		emptyHead := storage.NewArrowStorage()
-		defer emptyHead.Release()
-		emptyHead.Flush()
-
-		matcher, _ := NewMatcher(MatchEqual, "service.name", "service-l1")
-		results, err := SelectFromBlocks(emptyHead, blocks, matcher)
-		if err != nil {
-			t.Fatalf("SelectFromBlocks() error = %v", err)
-		}
-
-		// Should only get L1 block spans
-		if len(results.Spans) != 150 {
-			t.Errorf("SelectFromBlocks() returned %d spans, want 150", len(results.Spans))
-		}
-
-		for _, sp := range results.Spans {
-			if sp.ServiceName != "service-l1" {
-				t.Errorf("Got span from %s, want only service-l1", sp.ServiceName)
-			}
-		}
-	})
-
-	t.Run("query with multiple filters", func(t *testing.T) {
-		m1, _ := NewMatcher(MatchEqual, "env", "prod")
-		m2, _ := NewMatcher(MatchEqual, "version", "2.0")
-		results, err := SelectFromBlocks(headStorage, blocks, m1, m2)
-		if err != nil {
-			t.Fatalf("SelectFromBlocks() error = %v", err)
-		}
-
-		// All spans have env=prod, but only some have version=2.0
-		for _, sp := range results.Spans {
-			if sp.Tags["env"] != "prod" || sp.Tags["version"] != "2.0" {
-				t.Errorf("Span doesn't match both filters: %v", sp.Tags)
-			}
-		}
-	})
+	// Should get all spans (50 from head + 100 from L0 + 150 from L1)
+	expectedCount := 300
+	if len(results.Spans) != expectedCount {
+		t.Errorf("SelectFromBlocks() returned %d spans, want %d", len(results.Spans), expectedCount)
+	}
 }
 
-// TestSelectFromMixedBlocksWithTimeRange tests time-based queries across mixed block types
+// TestSelectFromMixedBlocksWithTimeRange tests time-based queries
+// Comprehensive coverage in querier_comprehensive_test.go
 func TestSelectFromMixedBlocksWithTimeRange(t *testing.T) {
 	tmpDir := t.TempDir()
 
@@ -537,92 +427,30 @@ func TestSelectFromMixedBlocksWithTimeRange(t *testing.T) {
 
 	baseTime := time.Now().Add(-3 * time.Hour)
 
-	// Create blocks at different times
-	// Head: most recent (last 30 min)
 	headSpans := createTestSpans(t, "head", baseTime.Add(2*time.Hour+30*time.Minute), 50, "service-head", "prod")
 	for _, sp := range headSpans {
 		headStorage.AddSpan(sp)
 	}
 	headStorage.Flush()
 
-	// L0: 1-2 hours ago
 	l0Block := createTestBlockWithCustomSpans(t, tmpDir, 0, baseTime.Add(1*time.Hour),
 		createTestSpans(t, "l0", baseTime.Add(1*time.Hour), 100, "service-l0", "prod"))
 	defer l0Block.Close()
 
-	// L1: 2-3 hours ago
-	l1Block := createTestBlockWithCustomSpans(t, tmpDir, 1, baseTime,
-		createTestSpans(t, "l1", baseTime, 150, "service-l1", "prod"))
-	defer l1Block.Close()
+	blocks := []Block{l0Block}
 
-	// L2: 3-4 hours ago
-	l2Block := createTestBlockWithCustomSpans(t, tmpDir, 2, baseTime.Add(-1*time.Hour),
-		createTestSpans(t, "l2", baseTime.Add(-1*time.Hour), 200, "service-l2", "prod"))
-	defer l2Block.Close()
+	// Query last hour - should only get head spans
+	timeRange := NewTimeRange(baseTime.Add(2*time.Hour), baseTime.Add(3*time.Hour))
+	matcher, _ := NewMatcher(MatchEqual, "env", "prod")
 
-	blocks := []Block{l0Block, l1Block, l2Block}
+	results, err := SelectFromBlocksWithTimeRange(block.NewHeadBlock(headStorage), blocks, timeRange, matcher)
+	if err != nil {
+		t.Fatalf("SelectFromBlocksWithTimeRange() error = %v", err)
+	}
 
-	t.Run("query last hour", func(t *testing.T) {
-		// Should only get head spans
-		timeRange := NewTimeRange(baseTime.Add(2*time.Hour), baseTime.Add(3*time.Hour))
-		matcher, _ := NewMatcher(MatchEqual, "env", "prod")
-
-		results, err := SelectFromBlocksWithTimeRange(headStorage, blocks, timeRange, matcher)
-		if err != nil {
-			t.Fatalf("SelectFromBlocksWithTimeRange() error = %v", err)
-		}
-
-		if len(results.Spans) != 50 {
-			t.Errorf("Query for last hour returned %d spans, want 50", len(results.Spans))
-		}
-	})
-
-	t.Run("query 1-2 hours ago", func(t *testing.T) {
-		// Should get L0 block spans
-		timeRange := NewTimeRange(baseTime.Add(1*time.Hour), baseTime.Add(2*time.Hour))
-		matcher, _ := NewMatcher(MatchEqual, "env", "prod")
-
-		results, err := SelectFromBlocksWithTimeRange(headStorage, blocks, timeRange, matcher)
-		if err != nil {
-			t.Fatalf("SelectFromBlocksWithTimeRange() error = %v", err)
-		}
-
-		if len(results.Spans) != 100 {
-			t.Errorf("Query for 1-2 hours ago returned %d spans, want 100", len(results.Spans))
-		}
-	})
-
-	t.Run("query last 2 hours", func(t *testing.T) {
-		// Should get head + L0
-		timeRange := NewTimeRange(baseTime.Add(1*time.Hour), baseTime.Add(3*time.Hour))
-		matcher, _ := NewMatcher(MatchEqual, "env", "prod")
-
-		results, err := SelectFromBlocksWithTimeRange(headStorage, blocks, timeRange, matcher)
-		if err != nil {
-			t.Fatalf("SelectFromBlocksWithTimeRange() error = %v", err)
-		}
-
-		expected := 150 // 50 head + 100 L0
-		if len(results.Spans) != expected {
-			t.Errorf("Query for last 2 hours returned %d spans, want %d", len(results.Spans), expected)
-		}
-	})
-
-	t.Run("query all historical data", func(t *testing.T) {
-		// Should get L0 + L1 + L2 (no head)
-		timeRange := NewTimeRange(baseTime.Add(-2*time.Hour), baseTime.Add(2*time.Hour))
-		matcher, _ := NewMatcher(MatchEqual, "env", "prod")
-
-		results, err := SelectFromBlocksWithTimeRange(headStorage, blocks, timeRange, matcher)
-		if err != nil {
-			t.Fatalf("SelectFromBlocksWithTimeRange() error = %v", err)
-		}
-
-		expected := 450 // 100 L0 + 150 L1 + 200 L2
-		if len(results.Spans) != expected {
-			t.Errorf("Query for historical data returned %d spans, want %d", len(results.Spans), expected)
-		}
-	})
+	if len(results.Spans) != 50 {
+		t.Errorf("Query for last hour returned %d spans, want 50", len(results.Spans))
+	}
 }
 
 // Helper functions

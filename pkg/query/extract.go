@@ -12,7 +12,14 @@ import (
 
 // extractSpanFromRecord extracts a span from an Arrow record at the given row
 // This is a duplicate of the storage method, but needed here for query access
-func extractSpanFromRecord(record arrow.Record, rowIndex int) (*span.Span, error) {
+// Set extractTags=false to skip tag extraction for better performance when tags aren't needed
+func extractSpanFromRecord(record arrow.RecordBatch, rowIndex int) (*span.Span, error) {
+	return extractSpanFromRecordWithOptions(record, rowIndex, true)
+}
+
+// extractSpanFromRecordWithOptions extracts a span with control over what to extract
+// extractTags controls whether to materialize the tags map (expensive operation)
+func extractSpanFromRecordWithOptions(record arrow.RecordBatch, rowIndex int, extractTags bool) (*span.Span, error) {
 	if rowIndex >= int(record.NumRows()) {
 		return nil, fmt.Errorf("invalid row index %d", rowIndex)
 	}
@@ -38,21 +45,34 @@ func extractSpanFromRecord(record arrow.Record, rowIndex int) (*span.Span, error
 
 	sp.ServiceName = record.Column(7).(*array.String).Value(rowIndex)
 
-	tagsCol := record.Column(8).(*array.Map)
-	if !tagsCol.IsNull(rowIndex) {
-		sp.Tags = make(map[string]string)
+	// Only extract tags if needed (expensive operation)
+	if extractTags {
+		tagsCol := record.Column(8).(*array.Map)
+		if !tagsCol.IsNull(rowIndex) {
+			sp.Tags = make(map[string]string)
 
-		// Get the offset for this map entry
-		offset := tagsCol.Offsets()[rowIndex]
-		nextOffset := tagsCol.Offsets()[rowIndex+1]
+			// Get the offset for this map entry
+			offsets := tagsCol.Offsets()
+			// Bounds check: ensure rowIndex+1 is within offsets array
+			if rowIndex+1 >= len(offsets) {
+				return nil, fmt.Errorf("invalid row index %d for tag extraction (offsets length: %d)", rowIndex, len(offsets))
+			}
 
-		keys := tagsCol.Keys().(*array.String)
-		items := tagsCol.Items().(*array.String)
+			offset := offsets[rowIndex]
+			nextOffset := offsets[rowIndex+1]
 
-		for i := int(offset); i < int(nextOffset); i++ {
-			key := keys.Value(i)
-			value := items.Value(i)
-			sp.Tags[key] = value
+			keys := tagsCol.Keys().(*array.String)
+			items := tagsCol.Items().(*array.String)
+
+			for i := int(offset); i < int(nextOffset); i++ {
+				// Bounds check for keys and items arrays
+				if i >= keys.Len() || i >= items.Len() {
+					break
+				}
+				key := keys.Value(i)
+				value := items.Value(i)
+				sp.Tags[key] = value
+			}
 		}
 	}
 

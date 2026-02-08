@@ -96,28 +96,36 @@ func NewWALWithSegmentSize(dir string, segmentSize int64, logger *slog.Logger) (
 	return w, nil
 }
 
-// WriteSpan writes a span to the WAL
-func (w *WAL) WriteSpan(s *span.Span) error {
+// WriteSpan writes a span to the WAL and returns the segment index it was written to
+func (w *WAL) WriteSpan(s *span.Span) (int, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
 	data, err := json.Marshal(s)
 	if err != nil {
-		return fmt.Errorf("failed to marshal span: %w", err)
+		return 0, fmt.Errorf("failed to marshal span: %w", err)
 	}
 
 	// Check if we need to rotate to a new segment
 	if w.currentSize+int64(len(data))+recordHeaderSize > w.segmentSize {
 		if err := w.rotateSegment(); err != nil {
-			return err
+			return 0, err
 		}
 	}
 
+	// CRITICAL: Capture segment index AFTER rotation check
+	// This ensures we return the segment that actually contains the span
+	segmentIndex := w.segmentIndex
+
 	if err := w.writeRecord(RecordTypeSpan, data); err != nil {
-		return err
+		return 0, err
 	}
 
-	return w.writer.Flush()
+	if err := w.writer.Flush(); err != nil {
+		return 0, err
+	}
+
+	return segmentIndex, nil
 }
 
 // writeRecord writes a single record to the WAL
@@ -290,7 +298,10 @@ func (r *Reader) readSegment(filename string, callback func(*span.Span) error) e
 				return err
 			}
 		default:
-			panic(fmt.Sprintf("unknown record type: %d", typ))
+			// Return error instead of panic for unknown record types
+			// This allows the replay logic to handle the error gracefully (skip or stop)
+			// instead of crashing the entire database
+			return fmt.Errorf("unknown record type: %d", typ)
 		}
 	}
 }

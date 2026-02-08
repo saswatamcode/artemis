@@ -8,10 +8,8 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
-	"sync"
 	"time"
 
-	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/parquet-go/parquet-go"
 	"github.com/parquet-go/parquet-go/compress/snappy"
 
@@ -53,13 +51,11 @@ type ParquetSpanMetadata struct {
 
 // ParquetBlock represents a block stored as Parquet (compacted data)
 type ParquetBlock struct {
-	meta          *BlockMeta
-	dir           string
-	file          *parquet.File // Parquet file handle for metadata and row group access
-	osFile        *os.File      // Underlying OS file (must be closed)
-	index         *index.Index
-	rowGroupCache map[int][]*span.Span // Cache for row groups (key = row group index)
-	cacheMu       sync.RWMutex         // Protects rowGroupCache
+	meta   *BlockMeta
+	dir    string
+	file   *parquet.File // Parquet file handle for page-level access
+	osFile *os.File      // Underlying OS file (must be closed)
+	index  *index.Index
 }
 
 // NewParquetBlock creates a new Parquet block from disk
@@ -147,26 +143,6 @@ func (pb *ParquetBlock) Meta() *BlockMeta {
 	return pb.meta
 }
 
-// ParquetSchema returns the Parquet schema
-func (pb *ParquetBlock) ParquetSchema() *parquet.Schema {
-	if pb.file != nil {
-		return pb.file.Schema()
-	}
-	return nil
-}
-
-// Schema returns nil for Parquet blocks (Arrow-specific)
-// Implements Block interface
-func (pb *ParquetBlock) Schema() *arrow.Schema {
-	return nil
-}
-
-// Records returns nil for Parquet blocks (Arrow-specific)
-// Implements Block interface
-func (pb *ParquetBlock) Records() []arrow.Record {
-	return nil
-}
-
 // Index returns the block's index (may be nil if not loaded)
 func (pb *ParquetBlock) Index() *index.Index {
 	return pb.index
@@ -183,6 +159,7 @@ func (pb *ParquetBlock) Dir() string {
 }
 
 // GetSpanByID retrieves a span by ID using the index
+// Uses page-level seeking via OffsetIndex (GenericRowGroupReader.SeekToRow uses it internally)
 func (pb *ParquetBlock) GetSpanByID(spanID string) (*span.Span, error) {
 	if !pb.HasIndex() {
 		return nil, fmt.Errorf("block has no index")
@@ -196,148 +173,153 @@ func (pb *ParquetBlock) GetSpanByID(spanID string) (*span.Span, error) {
 	return pb.readSpanAt(ref.RecordIndex, ref.RowIndex)
 }
 
-// readSpanAt reads a span from a specific row group and row index
-// Uses row group caching for O(1) access after first read
-func (pb *ParquetBlock) readSpanAt(rowGroupIdx, rowIdx int) (*span.Span, error) {
-	pb.cacheMu.RLock()
-	cached := pb.rowGroupCache[rowGroupIdx]
-	pb.cacheMu.RUnlock()
-
-	if cached != nil {
-		// Cache hit
-		if rowIdx < len(cached) {
-			return cached[rowIdx], nil
-		}
-		return nil, fmt.Errorf("row index %d out of bounds for row group %d", rowIdx, rowGroupIdx)
-	}
-
-	// Cache miss - read entire row group at once
-	spans, err := pb.readRowGroup(rowGroupIdx)
-	if err != nil {
-		return nil, err
-	}
-
-	// Cache the row group for future reads
-	pb.cacheMu.Lock()
-	if pb.rowGroupCache == nil {
-		pb.rowGroupCache = make(map[int][]*span.Span)
-	}
-	pb.rowGroupCache[rowGroupIdx] = spans
-	pb.cacheMu.Unlock()
-
-	if rowIdx < len(spans) {
-		return spans[rowIdx], nil
-	}
-
-	return nil, fmt.Errorf("row index %d out of bounds for row group %d", rowIdx, rowGroupIdx)
-}
-
-// readRowGroup reads an entire row group at once using batch reading
-// This is much more efficient than reading rows one-by-one
-func (pb *ParquetBlock) readRowGroup(rowGroupIdx int) ([]*span.Span, error) {
+// readSpanAt reads a single span using PAGE-LEVEL access with OffsetIndex
+// This is the most efficient way to read a single row from Parquet:
+// 1. Create a reader for ONLY the specific row group (not the whole file)
+// 2. SeekToRow uses OffsetIndex internally to jump to the right page in each column
+// 3. Read exactly one row
+func (pb *ParquetBlock) readSpanAt(rowGroupIdx, rowIdxInGroup int) (*span.Span, error) {
 	rowGroups := pb.file.RowGroups()
 	if rowGroupIdx >= len(rowGroups) {
 		return nil, fmt.Errorf("invalid row group index: %d", rowGroupIdx)
 	}
 
+	// Get the specific row group
 	rowGroup := rowGroups[rowGroupIdx]
-	numRows := int(rowGroup.NumRows())
 
-	// Use row group reader for efficient batch reading
-	reader := parquet.NewRowGroupReader(rowGroup)
+	// Create a reader for ONLY this row group (not the whole file)
+	// This is efficient because we only initialize page readers for one row group
+	reader := parquet.NewGenericRowGroupReader[ParquetSpan](rowGroup)
 	defer reader.Close()
 
-	spans := make([]*span.Span, 0, numRows)
-	for {
-		parquetSpan := ParquetSpan{}
-		err := reader.Read(&parquetSpan)
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			return nil, fmt.Errorf("failed to read row: %w", err)
-		}
-
-		spans = append(spans, parquetSpanToSpan(&parquetSpan))
+	// Seek to the specific row within this row group
+	// SeekToRow uses OffsetIndex internally to jump to the right page in each column
+	if err := reader.SeekToRow(int64(rowIdxInGroup)); err != nil {
+		return nil, fmt.Errorf("failed to seek to row: %w", err)
 	}
 
-	return spans, nil
+	// Read exactly one row
+	batch := make([]ParquetSpan, 1)
+	n, err := reader.Read(batch)
+	if err != nil && err != io.EOF {
+		return nil, err
+	}
+	if n == 0 {
+		return nil, fmt.Errorf("no data at row")
+	}
+
+	return parquetSpanToSpan(&batch[0]), nil
 }
 
 // ReadAll reads all spans from the Parquet block (for full scans)
-// Optimized to read row groups in batch
+// Memory efficient: Uses streaming reader, doesn't load all spans at once
 func (pb *ParquetBlock) ReadAll() ([]*span.Span, error) {
-	rowGroups := pb.file.RowGroups()
-	totalSpans := make([]*span.Span, 0, pb.file.NumRows())
+	reader := parquet.NewGenericReader[ParquetSpan](pb.file)
+	defer reader.Close()
 
-	for i := range rowGroups {
-		spans, err := pb.readRowGroup(i)
-		if err != nil {
-			return nil, fmt.Errorf("failed to read row group %d: %w", i, err)
+	totalSpans := make([]*span.Span, 0, pb.file.NumRows())
+	batch := make([]ParquetSpan, 1024) // Read in batches of 1024
+
+	for {
+		n, err := reader.Read(batch)
+		if err != nil && err != io.EOF {
+			return nil, fmt.Errorf("failed to read spans: %w", err)
 		}
-		totalSpans = append(totalSpans, spans...)
+
+		for i := range n {
+			totalSpans = append(totalSpans, parquetSpanToSpan(&batch[i]))
+		}
+
+		if err == io.EOF {
+			break
+		}
 	}
 
 	return totalSpans, nil
 }
 
 // GetSpansBatch efficiently retrieves multiple spans by ID
-// Groups reads by row group to minimize I/O operations
+// Optimized PAGE-LEVEL reads:
+// 1. Group spans by row group
+// 2. Create one reader per row group (minimizes memory)
+// 3. Within each row group, seek to each row using OffsetIndex
+// 4. Each SeekToRow jumps to the right page, not entire row group
 func (pb *ParquetBlock) GetSpansBatch(spanIDs []string) ([]*span.Span, error) {
 	if !pb.HasIndex() {
 		return nil, fmt.Errorf("block has no index")
 	}
 
-	type lookup struct {
+	// Group lookups by row group
+	type rowLookup struct {
 		rowGroupIdx int
 		rowIdx      int
-		spanID      string
 	}
 
-	lookups := make([]lookup, 0, len(spanIDs))
+	lookupsByRowGroup := make(map[int][]rowLookup)
 	for _, spanID := range spanIDs {
 		ref, ok := pb.index.LookupSpanID(spanID)
 		if !ok {
 			continue // Skip spans not found
 		}
-		lookups = append(lookups, lookup{
+
+		lookupsByRowGroup[ref.RecordIndex] = append(lookupsByRowGroup[ref.RecordIndex], rowLookup{
 			rowGroupIdx: ref.RecordIndex,
 			rowIdx:      ref.RowIndex,
-			spanID:      spanID,
 		})
 	}
 
-	if len(lookups) == 0 {
+	if len(lookupsByRowGroup) == 0 {
 		return nil, nil
 	}
 
-	// Sort by row group to read each row group only once
-	sort.Slice(lookups, func(i, j int) bool {
-		if lookups[i].rowGroupIdx != lookups[j].rowGroupIdx {
-			return lookups[i].rowGroupIdx < lookups[j].rowGroupIdx
+	results := make([]*span.Span, 0, len(spanIDs))
+	rowGroups := pb.file.RowGroups()
+
+	// Process each row group separately
+	for rgIdx, lookups := range lookupsByRowGroup {
+		if rgIdx >= len(rowGroups) {
+			continue
 		}
-		return lookups[i].rowIdx < lookups[j].rowIdx
-	})
 
-	// Read spans grouped by row group
-	results := make([]*span.Span, 0, len(lookups))
-	currentRowGroup := -1
-	var currentSpans []*span.Span
+		// Sort lookups within this row group by row index for sequential reads
+		sort.Slice(lookups, func(i, j int) bool {
+			return lookups[i].rowIdx < lookups[j].rowIdx
+		})
 
-	for _, lookup := range lookups {
-		if lookup.rowGroupIdx != currentRowGroup {
-			// Read new row group (will use cache if already loaded)
-			var err error
-			currentSpans, err = pb.readRowGroup(lookup.rowGroupIdx)
-			if err != nil {
-				return nil, fmt.Errorf("failed to read row group %d: %w", lookup.rowGroupIdx, err)
+		// Create a reader for ONLY this row group
+		rowGroup := rowGroups[rgIdx]
+		reader := parquet.NewGenericRowGroupReader[ParquetSpan](rowGroup)
+
+		// Use anonymous function to ensure reader.Close() is called at end of each iteration
+		// defer in a loop doesn't execute until function returns, causing resource leaks
+		func() {
+			defer reader.Close()
+
+			// Read each span from this row group
+			currentRow := int64(-1)
+			batch := make([]ParquetSpan, 1)
+
+			for _, lookup := range lookups {
+				// Only seek if we're not already at the right position
+				if currentRow != int64(lookup.rowIdx) {
+					if err := reader.SeekToRow(int64(lookup.rowIdx)); err != nil {
+						continue // Skip this span on seek error
+					}
+					currentRow = int64(lookup.rowIdx)
+				}
+
+				n, err := reader.Read(batch)
+				if err != nil && err != io.EOF {
+					continue // Skip this span on read error
+				}
+				if n == 0 {
+					continue
+				}
+
+				results = append(results, parquetSpanToSpan(&batch[0]))
+				currentRow++ // We've read one row
 			}
-			currentRowGroup = lookup.rowGroupIdx
-		}
-
-		if lookup.rowIdx < len(currentSpans) {
-			results = append(results, currentSpans[lookup.rowIdx])
-		}
+		}()
 	}
 
 	return results, nil
@@ -405,57 +387,155 @@ func (pb *ParquetBlock) findRowGroup(globalRowIdx int64, rowGroups []parquet.Row
 	return lastRG, int(globalRowIdx - currentRow)
 }
 
+// getAbsoluteRowNumber converts a row group index and local row index to an absolute row number
+func (pb *ParquetBlock) getAbsoluteRowNumber(rowGroupIdx, rowIdx int) int64 {
+	rowGroups := pb.file.RowGroups()
+	if rowGroupIdx >= len(rowGroups) {
+		return -1
+	}
+
+	absoluteRow := int64(0)
+	for i := 0; i < rowGroupIdx; i++ {
+		absoluteRow += rowGroups[i].NumRows()
+	}
+	absoluteRow += int64(rowIdx)
+	return absoluteRow
+}
+
 // GetSpansByRowReferences efficiently fetches spans for a list of row references
-// Groups reads by row group to minimize I/O
+// Optimized: Converts to absolute row numbers and uses direct seeks
 func (pb *ParquetBlock) GetSpansByRowReferences(refs []RowReference) ([]*span.Span, error) {
 	if len(refs) == 0 {
 		return nil, nil
 	}
 
-	sortedRefs := make([]RowReference, len(refs))
-	copy(sortedRefs, refs)
-	sort.Slice(sortedRefs, func(i, j int) bool {
-		if sortedRefs[i].RowGroupIdx != sortedRefs[j].RowGroupIdx {
-			return sortedRefs[i].RowGroupIdx < sortedRefs[j].RowGroupIdx
+	// Convert row references to absolute row numbers
+	type absoluteLookup struct {
+		absoluteRow int64
+	}
+
+	lookups := make([]absoluteLookup, 0, len(refs))
+	for _, ref := range refs {
+		absoluteRow := pb.getAbsoluteRowNumber(ref.RowGroupIdx, ref.RowIdx)
+		if absoluteRow >= 0 {
+			lookups = append(lookups, absoluteLookup{absoluteRow: absoluteRow})
 		}
-		return sortedRefs[i].RowIdx < sortedRefs[j].RowIdx
+	}
+
+	if len(lookups) == 0 {
+		return nil, nil
+	}
+
+	// Sort by absolute row number for sequential reads
+	sort.Slice(lookups, func(i, j int) bool {
+		return lookups[i].absoluteRow < lookups[j].absoluteRow
 	})
 
-	results := make([]*span.Span, 0, len(sortedRefs))
-	currentRowGroup := -1
-	var currentSpans []*span.Span
+	// Use single reader and seek to each position
+	reader := parquet.NewGenericReader[ParquetSpan](pb.file)
+	defer reader.Close()
 
-	for _, ref := range sortedRefs {
-		if ref.RowGroupIdx != currentRowGroup {
-			// Read new row group (will use cache if already loaded)
-			var err error
-			currentSpans, err = pb.readRowGroup(ref.RowGroupIdx)
-			if err != nil {
-				return nil, fmt.Errorf("failed to read row group %d: %w", ref.RowGroupIdx, err)
+	results := make([]*span.Span, 0, len(lookups))
+	currentRow := int64(-1)
+	batch := make([]ParquetSpan, 1)
+
+	for _, lookup := range lookups {
+		if currentRow != lookup.absoluteRow {
+			if err := reader.SeekToRow(lookup.absoluteRow); err != nil {
+				continue
 			}
-			currentRowGroup = ref.RowGroupIdx
+			currentRow = lookup.absoluteRow
 		}
 
-		if ref.RowIdx < len(currentSpans) {
-			results = append(results, currentSpans[ref.RowIdx])
+		n, err := reader.Read(batch)
+		if err != nil && err != io.EOF {
+			continue
 		}
+		if n == 0 {
+			continue
+		}
+
+		results = append(results, parquetSpanToSpan(&batch[0]))
+		currentRow++
 	}
 
 	return results, nil
 }
 
 // Close releases resources held by this block
+// This method is idempotent - it can be called multiple times safely
 func (pb *ParquetBlock) Close() error {
+	var closeErr error
+
 	// Close the underlying OS file handle
 	if pb.osFile != nil {
-		if err := pb.osFile.Close(); err != nil {
-			return fmt.Errorf("failed to close parquet file: %w", err)
-		}
+		closeErr = pb.osFile.Close()
+		// Always nil out the fields to make Close() idempotent
+		// and prevent file handle leaks even if Close() fails
 		pb.osFile = nil
 	}
 	pb.file = nil
-	pb.rowGroupCache = nil
+
+	if closeErr != nil {
+		return fmt.Errorf("failed to close parquet file: %w", closeErr)
+	}
 	return nil
+}
+
+// GetTraceByID retrieves all spans for a given trace ID
+// Uses index for efficient lookup
+func (pb *ParquetBlock) GetTraceByID(traceID string) ([]*span.Span, error) {
+	if !pb.HasIndex() {
+		// Fallback to metadata scan
+		return pb.scanByTraceID(traceID)
+	}
+
+	spanIDs := pb.index.LookupByTraceID(traceID)
+	return pb.GetSpansBatch(spanIDs)
+}
+
+// GetSpansByTag retrieves all spans that have a specific tag key-value pair
+// Uses index for efficient lookup
+func (pb *ParquetBlock) GetSpansByTag(tagKey, tagValue string) ([]*span.Span, error) {
+	if !pb.HasIndex() {
+		// Fallback to full scan (tags require full span data)
+		return pb.scanByTag(tagKey, tagValue)
+	}
+
+	spanIDs := pb.index.LookupByTag(tagKey, tagValue)
+	return pb.GetSpansBatch(spanIDs)
+}
+
+// scanByTraceID is a fallback metadata scan when no index is available
+func (pb *ParquetBlock) scanByTraceID(traceID string) ([]*span.Span, error) {
+	filterFunc := func(meta *ParquetSpanMetadata) bool {
+		return meta.TraceID == traceID
+	}
+
+	refs, err := pb.ScanMetadata(filterFunc)
+	if err != nil {
+		return nil, err
+	}
+
+	return pb.GetSpansByRowReferences(refs)
+}
+
+// scanByTag is a fallback full scan when no index is available
+// Note: This requires reading full span data since tags aren't in metadata projection
+func (pb *ParquetBlock) scanByTag(tagKey, tagValue string) ([]*span.Span, error) {
+	allSpans, err := pb.ReadAll()
+	if err != nil {
+		return nil, err
+	}
+
+	result := make([]*span.Span, 0)
+	for _, sp := range allSpans {
+		if sp.Tags != nil && sp.Tags[tagKey] == tagValue {
+			result = append(result, sp)
+		}
+	}
+
+	return result, nil
 }
 
 // spanToParquetSpan converts a Span to ParquetSpan

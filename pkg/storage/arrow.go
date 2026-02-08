@@ -21,7 +21,7 @@ type BlockManager interface {
 // ArrowStorage stores spans in-memory using Apache Arrow columnar format
 type ArrowStorage struct {
 	mu            sync.RWMutex
-	records       []arrow.Record
+	records       []arrow.RecordBatch
 	schema        *arrow.Schema
 	mem           memory.Allocator
 	builder       *SpanRecordBuilder
@@ -58,7 +58,7 @@ func NewArrowStorage() *ArrowStorage {
 	schema := createSpanSchema()
 
 	return &ArrowStorage{
-		records:       make([]arrow.Record, 0),
+		records:       make([]arrow.RecordBatch, 0),
 		schema:        schema,
 		mem:           mem,
 		builder:       NewSpanRecordBuilder(mem, schema),
@@ -165,7 +165,7 @@ func (b *SpanRecordBuilder) Append(s *span.Span) {
 }
 
 // NewRecord builds and returns a new Arrow record, resetting the builder
-func (b *SpanRecordBuilder) NewRecord() arrow.Record {
+func (b *SpanRecordBuilder) NewRecord() arrow.RecordBatch {
 	if b.currentRowCount == 0 {
 		return nil
 	}
@@ -206,7 +206,13 @@ func (s *ArrowStorage) AddSpan(sp *span.Span) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	s.addSpanLocked(sp)
+	timeRangeChanged := s.addSpanLocked(sp)
+
+	// Notify block manager if time range changed (consistency with AddSpans)
+	if timeRangeChanged && s.blockManager != nil {
+		s.blockManager.UpdateHeadTimeRange(s.minTime, s.maxTime)
+	}
+
 	return nil
 }
 
@@ -275,7 +281,10 @@ func (s *ArrowStorage) addSpanLocked(sp *span.Span) bool {
 	if s.builder.currentRowCount == 0 {
 		// We just flushed, span is the last row of the last record
 		currentRecordIndex = len(s.records) - 1
-		currentRowInBuilder = batchSize - 1
+		lastRecord := s.records[currentRecordIndex]
+		// Use actual NumRows instead of assuming batchSize
+		// A partial batch flush (via Flush()) will have fewer than batchSize rows
+		currentRowInBuilder = int(lastRecord.NumRows()) - 1
 	} else {
 		// Span is in the builder at the current position
 		currentRecordIndex = len(s.records)
@@ -300,11 +309,15 @@ func (s *ArrowStorage) Flush() error {
 }
 
 // GetRecords returns all Arrow records
-func (s *ArrowStorage) GetRecords() []arrow.Record {
+// Returns a defensive copy of the slice to prevent concurrent modification issues
+func (s *ArrowStorage) GetRecords() []arrow.RecordBatch {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	return s.records
+	// Return a copy of the slice (not the records themselves, as they're immutable)
+	copied := make([]arrow.RecordBatch, len(s.records))
+	copy(copied, s.records)
+	return copied
 }
 
 // RowCount returns the total number of spans stored
@@ -353,15 +366,21 @@ func (s *ArrowStorage) GetSpanByID(spanID string) (*span.Span, error) {
 	}
 
 	if ref.RecordIndex >= len(s.records) {
-		return nil, fmt.Errorf("invalid record index %d", ref.RecordIndex)
+		return nil, fmt.Errorf("span %s: invalid record index %d (have %d records)", spanID, ref.RecordIndex, len(s.records))
 	}
 
 	record := s.records[ref.RecordIndex]
+
+	// Validate row index bounds before extraction
+	if ref.RowIndex < 0 || ref.RowIndex >= int(record.NumRows()) {
+		return nil, fmt.Errorf("span %s: invalid row index %d (record has %d rows)", spanID, ref.RowIndex, record.NumRows())
+	}
+
 	return s.extractSpan(record, ref.RowIndex)
 }
 
 // extractSpan extracts a span from an Arrow record at the given row
-func (s *ArrowStorage) extractSpan(record arrow.Record, rowIndex int) (*span.Span, error) {
+func (s *ArrowStorage) extractSpan(record arrow.RecordBatch, rowIndex int) (*span.Span, error) {
 	if rowIndex >= int(record.NumRows()) {
 		return nil, fmt.Errorf("invalid row index %d", rowIndex)
 	}
@@ -454,6 +473,32 @@ func (s *ArrowStorage) GetWALSegmentRange() (int, int) {
 	return s.minWALSegment, s.maxWALSegment
 }
 
+// MetadataSnapshot holds a consistent snapshot of storage metadata
+type MetadataSnapshot struct {
+	RowCount      int64
+	RecordCount   int
+	MinTime       int64
+	MaxTime       int64
+	MinWALSegment int
+	MaxWALSegment int
+}
+
+// GetMetadataSnapshot returns a consistent snapshot of all metadata under a single lock
+// This prevents inconsistencies that could occur from calling individual getters separately
+func (s *ArrowStorage) GetMetadataSnapshot() MetadataSnapshot {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	return MetadataSnapshot{
+		RowCount:      s.rowCount,
+		RecordCount:   len(s.records),
+		MinTime:       s.minTime,
+		MaxTime:       s.maxTime,
+		MinWALSegment: s.minWALSegment,
+		MaxWALSegment: s.maxWALSegment,
+	}
+}
+
 // Reset clears all data in the head block (called after flushing to disk)
 func (s *ArrowStorage) Reset() {
 	s.mu.Lock()
@@ -464,7 +509,7 @@ func (s *ArrowStorage) Reset() {
 		record.Release()
 	}
 
-	s.records = make([]arrow.Record, 0)
+	s.records = make([]arrow.RecordBatch, 0)
 	s.rowCount = 0
 	s.minTime = 0
 	s.maxTime = 0
@@ -475,4 +520,10 @@ func (s *ArrowStorage) Reset() {
 	s.builder = NewSpanRecordBuilder(s.mem, s.schema)
 
 	s.idx = index.NewIndex()
+
+	// Notify block manager that head block is now empty
+	// Without this, block manager would still think head has the old time range
+	if s.blockManager != nil {
+		s.blockManager.UpdateHeadTimeRange(0, 0)
+	}
 }

@@ -7,11 +7,6 @@ import (
 	"github.com/oklog/ulid/v2"
 )
 
-// CompactionLevel represents the compaction level of a block (similar to Prometheus)
-// Level 1 = initial blocks from head (typically 2h)
-// Level 2+ = compacted blocks with increasing time ranges
-type CompactionLevel int
-
 // CompactionMeta contains metadata about a compacted block
 type CompactionMeta struct {
 	Level       int         `json:"level"`        // Compaction level (1 = from head, 2+ = compacted)
@@ -30,15 +25,6 @@ type BlockMeta struct {
 	Compaction    *CompactionMeta `json:"compaction,omitempty"` // Compaction metadata (nil for L0)
 	MinWALSegment int             `json:"min_wal_segment"`      // Lowest WAL segment index included in this block
 	MaxWALSegment int             `json:"max_wal_segment"`      // Highest WAL segment index included in this block
-}
-
-// BlockStats holds statistics about a block
-type BlockStats struct {
-	SpanCount     int64
-	RecordBatches int
-	MinTime       time.Time
-	MaxTime       time.Time
-	SizeBytes     int64
 }
 
 // String returns a string representation of the block

@@ -2,7 +2,6 @@ package query
 
 import (
 	"github.com/saswatamcode/artemis/pkg/block"
-	"github.com/saswatamcode/artemis/pkg/storage"
 )
 
 // Querier provides an interface for querying spans from storage
@@ -17,33 +16,58 @@ type Querier interface {
 	SelectWithTimeRange(timeRange *TimeRange, matchers ...*Matcher) (*SelectResult, error)
 }
 
-// BlockQuerier queries spans across both head block (Arrow) and persisted blocks (Arrow L0 and Parquet L1+)
-// This is the standard implementation used in production
-//
-// TODO: Split this into a Block and Head querier so that we can keep select functions cleaner
+// BlockQuerier queries spans across all blocks uniformly through the Block interface
+// Treats HeadBlock, ArrowBlock (L0), and ParquetBlock (L1+) uniformly
+// Uses FanoutQuerier internally to query head and persisted blocks in parallel
 type BlockQuerier struct {
-	head   *storage.ArrowStorage
-	blocks []block.Block
+	fanoutQuerier *FanoutQuerier
 }
 
 // NewBlockQuerier creates a new querier that queries across head and persisted blocks
 // head can be nil if there's no in-memory data
 // blocks can be empty if there are no persisted blocks yet
-func NewBlockQuerier(head *storage.ArrowStorage, blocks []block.Block) *BlockQuerier {
+//
+// To create from a block manager:
+//
+//	querier := NewBlockQuerier(manager.GetHeadAsBlock(), manager.GetBlocks())
+//
+// The querier uses a FanoutQuerier internally to query persisted blocks and head block in parallel
+func NewBlockQuerier(head block.Block, blocks []block.Block) *BlockQuerier {
+	// Build list of queriers: persisted blocks first, then head
+	// Order matters for deduplication: persisted blocks are authoritative sources,
+	// while head block may contain spans that were just flushed (duplicates).
+	// FanoutQuerier queries all queriers in parallel, then mergeResults() deduplicates
+	// by span ID, keeping the first occurrence (from persisted blocks).
+	//
+	// NOTE: This doesn't prevent missing spans if flush happens during query,
+	// but that's handled by queryMu.RLock() in QueryWithLock() which prevents
+	// flushes during the entire query operation.
+	queriers := make([]Querier, 0, 2)
+
+	// Add persisted blocks querier if we have blocks
+	if len(blocks) > 0 {
+		queriers = append(queriers, NewPersistedBlockQuerier(blocks))
+	}
+
+	// Add head block querier if we have a head block
+	if head != nil {
+		queriers = append(queriers, NewHeadBlockQuerier(head))
+	}
+
 	return &BlockQuerier{
-		head:   head,
-		blocks: blocks,
+		fanoutQuerier: NewFanoutQuerier(queriers...),
 	}
 }
 
 // Select queries spans across all blocks using matchers
-// Queries persisted blocks first, then head block (to handle concurrent flushes correctly)
+// Queries persisted blocks and head block in parallel using FanoutQuerier
 func (q *BlockQuerier) Select(matchers ...*Matcher) (*SelectResult, error) {
-	return SelectFromBlocks(q.head, q.blocks, matchers...)
+	return q.fanoutQuerier.Select(matchers...)
 }
 
 // SelectWithTimeRange queries spans across all blocks within a specific time range
 // Time range filtering provides significant performance benefits by skipping irrelevant blocks
+// Queries persisted blocks and head block in parallel using FanoutQuerier
 func (q *BlockQuerier) SelectWithTimeRange(timeRange *TimeRange, matchers ...*Matcher) (*SelectResult, error) {
-	return SelectFromBlocksWithTimeRange(q.head, q.blocks, timeRange, matchers...)
+	return q.fanoutQuerier.SelectWithTimeRange(timeRange, matchers...)
 }

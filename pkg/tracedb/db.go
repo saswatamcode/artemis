@@ -156,35 +156,33 @@ func New(cfg *Config) (*DB, error) {
 // WriteSpan writes a span to the database
 // First writes to WAL for durability, then adds to in-memory storage
 func (db *DB) WriteSpan(s *span.Span) error {
-	// CRITICAL: Get segment index BEFORE writing to handle rotation correctly
-	// If WriteSpan triggers rotation, the span is written to the OLD segment,
-	// but SegmentIndex() after would return the NEW segment (race condition)
-	segmentBefore := db.wal.SegmentIndex()
-
-	// Write to WAL first for durability
-	if err := db.wal.WriteSpan(s); err != nil {
-		return fmt.Errorf("failed to write span to WAL: %w", err)
-	}
-
-	// CRITICAL: Acquire read lock to prevent head block flush during write
-	// This prevents data loss when flushHeadBlock() resets storage
-	db.queryMu.RLock()
-	defer db.queryMu.RUnlock()
-
-	// Check if database is closed AFTER acquiring queryMu to prevent TOCTOU race
-	// This ensures Close() cannot proceed with shutdown while we're writing
+	// CRITICAL: Check if closed while holding mu lock, then acquire queryMu
+	// This prevents TOCTOU race where Close() runs between check and queryMu acquisition
 	db.mu.Lock()
 	if db.closed {
 		db.mu.Unlock()
 		return fmt.Errorf("database is closed")
 	}
-	db.mu.Unlock()
 
-	// CRITICAL: Track ONLY the segment that actually contains this span
-	// The span was written to segmentBefore (before any potential rotation)
-	// Tracking segments that don't contain the span would cause checkpoint
-	// to incorrectly delete WAL segments, leading to data loss
-	db.storage.UpdateWALSegment(segmentBefore)
+	// CRITICAL: Acquire read lock to prevent head block flush during write
+	// This prevents data loss when flushHeadBlock() resets storage
+	// We must acquire queryMu WHILE holding mu to prevent Close() from running
+	db.queryMu.RLock()
+	db.mu.Unlock() // Release mu now that we have queryMu
+	defer db.queryMu.RUnlock()
+
+	// Write to WAL first for durability and get the actual segment index
+	// WAL now returns the segment index where the span was written
+	// This eliminates the race condition where rotation could happen between
+	// getting the segment index and writing the span
+	actualSegment, err := db.wal.WriteSpan(s)
+	if err != nil {
+		return fmt.Errorf("failed to write span to WAL: %w", err)
+	}
+
+	// CRITICAL: Track the ACTUAL segment that contains this span
+	// This ensures checkpoint only deletes WAL segments that have been flushed to blocks
+	db.storage.UpdateWALSegment(actualSegment)
 
 	if err := db.storage.AddSpan(s); err != nil {
 		return fmt.Errorf("failed to add span to storage: %w", err)
@@ -201,33 +199,37 @@ func (db *DB) WriteSpans(spans []*span.Span) error {
 		return nil
 	}
 
-	// Track the segment range for this batch
-	startSegment := db.wal.SegmentIndex()
-
-	// Write to WAL first for durability (one by one as WAL doesn't have bulk API)
-	for _, s := range spans {
-		if err := db.wal.WriteSpan(s); err != nil {
-			return fmt.Errorf("failed to write span to WAL: %w", err)
-		}
-	}
-
-	// CRITICAL: Acquire read lock to prevent head block flush during write
-	// This prevents data loss when flushHeadBlock() resets storage
-	db.queryMu.RLock()
-	defer db.queryMu.RUnlock()
-
-	// Check if database is closed AFTER acquiring queryMu to prevent TOCTOU race
-	// This ensures Close() cannot proceed with shutdown while we're writing
+	// CRITICAL: Check if closed while holding mu lock, then acquire queryMu
+	// This prevents TOCTOU race where Close() runs between check and queryMu acquisition
 	db.mu.Lock()
 	if db.closed {
 		db.mu.Unlock()
 		return fmt.Errorf("database is closed")
 	}
-	db.mu.Unlock()
 
-	// Update WAL segment range (segments may have rotated during writes)
-	endSegment := db.wal.SegmentIndex()
-	for seg := startSegment; seg <= endSegment; seg++ {
+	// CRITICAL: Acquire read lock to prevent head block flush during write
+	// This prevents data loss when flushHeadBlock() resets storage
+	// We must acquire queryMu WHILE holding mu to prevent Close() from running
+	db.queryMu.RLock()
+	db.mu.Unlock() // Release mu now that we have queryMu
+	defer db.queryMu.RUnlock()
+
+	// Track which segments we actually write to
+	segmentSet := make(map[int]bool)
+
+	// Write to WAL first for durability (one by one as WAL doesn't have bulk API)
+	// FIX: Collect actual segment indices from each write
+	for _, s := range spans {
+		actualSegment, err := db.wal.WriteSpan(s)
+		if err != nil {
+			return fmt.Errorf("failed to write span to WAL: %w", err)
+		}
+		segmentSet[actualSegment] = true
+	}
+
+	// Update WAL segment tracking for all segments that were actually written to
+	// This is precise - we only track segments that contain data
+	for seg := range segmentSet {
 		db.storage.UpdateWALSegment(seg)
 	}
 
@@ -536,6 +538,27 @@ func (db *DB) createCheckpoint() error {
 		return nil
 	}
 
+	// CRITICAL: Re-check current WAL segment right before deletion
+	// This prevents deleting a segment that became active between
+	// findMaxPersistedWALSegment() and now (WAL rotation race)
+	currentWALSegment := db.wal.SegmentIndex()
+	if deleteTo >= currentWALSegment {
+		// The current segment is in the deletion range
+		// Only delete up to the segment before the current one
+		if currentWALSegment > 0 {
+			deleteTo = currentWALSegment - 1
+			deleteCount = deleteTo - deleteFrom + 1
+		} else {
+			// Current segment is 0, can't delete anything
+			return nil
+		}
+	}
+
+	// Recheck threshold after adjustment
+	if deleteCount < db.checkpointThreshold {
+		return nil
+	}
+
 	// CRITICAL: Write checkpoint metadata FIRST, THEN delete segments
 	// This ensures if system crashes during deletion, checkpoint metadata
 	// correctly reflects what should be deleted (next checkpoint can retry)
@@ -702,6 +725,12 @@ func (db *DB) GetBlocks() []block.Block {
 // GetQuerier creates a new querier for the current database state
 // This provides a clean interface for querying spans across head and persisted blocks
 // A new querier is created each time to ensure it has the latest block list
+//
+// IMPORTANT: This method is DEPRECATED in favor of QueryWithLock().
+// The returned querier may reference blocks that could be deleted by compaction.
+// For safe querying, use QueryWithLock() which holds queryMu during the entire query.
+//
+// If you must use this method, ensure the query completes quickly before compaction runs.
 func (db *DB) GetQuerier() query.Querier {
 	// Flush any pending data to ensure queries see all data
 	db.storage.Flush()
@@ -711,7 +740,8 @@ func (db *DB) GetQuerier() query.Querier {
 		blocks = db.blockManager.GetBlocks()
 	}
 
-	return query.NewBlockQuerier(db.storage, blocks)
+	headBlock := block.NewHeadBlock(db.storage)
+	return query.NewBlockQuerier(headBlock, blocks)
 }
 
 // GetBlockManager returns the block manager (nil if not configured)

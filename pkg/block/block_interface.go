@@ -6,18 +6,28 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/apache/arrow-go/v18/arrow"
-
 	"github.com/saswatamcode/artemis/pkg/index"
+	"github.com/saswatamcode/artemis/pkg/span"
 )
 
-// Block is the interface that all block types must implement
-// Provides a unified API for querying both Arrow (L0) and Parquet (L1+) blocks
+// Block is a unified interface for querying span data across different storage formats:
+// - HeadBlock: In-memory Arrow (mutable, active ingestion, no directory)
+// - ArrowBlock: Arrow IPC files on disk (immutable L0 blocks from flushed head)
+// - ParquetBlock: Parquet files (immutable L1+ blocks from compaction)
+//
+// All block types support the same query operations, but implement them differently:
+// - HeadBlock: Direct memory access to ArrowStorage, always has index, thread-safe
+// - ArrowBlock: Loads entire Arrow IPC file into memory, indexed record lookups
+// - ParquetBlock: Page-level Parquet reads using OffsetIndex for minimal I/O
 type Block interface {
 	// Meta returns the block metadata
+	// For HeadBlock, metadata is computed dynamically
+	// For disk blocks, metadata is loaded from meta.json
 	Meta() *BlockMeta
 
 	// Dir returns the directory path of this block
+	// Returns empty string "" for HeadBlock (no directory)
+	// Returns absolute path for disk-based blocks
 	Dir() string
 
 	// Index returns the block's index (may be nil if not loaded)
@@ -29,11 +39,20 @@ type Block interface {
 	// Close releases resources held by this block
 	Close() error
 
-	// Records returns Arrow records (only for Arrow blocks, nil for Parquet)
-	Records() []arrow.Record
+	// GetSpanByID retrieves a single span by ID using the index
+	GetSpanByID(spanID string) (*span.Span, error)
 
-	// Schema returns the Arrow schema (only for Arrow blocks, nil for Parquet)
-	Schema() *arrow.Schema
+	// GetSpansBatch efficiently retrieves multiple spans by ID
+	GetSpansBatch(spanIDs []string) ([]*span.Span, error)
+
+	// ReadAll reads all spans from the block (for full scans)
+	ReadAll() ([]*span.Span, error)
+
+	// GetTraceByID retrieves all spans for a given trace ID
+	GetTraceByID(traceID string) ([]*span.Span, error)
+
+	// GetSpansByTag retrieves all spans that have a specific tag key-value pair
+	GetSpansByTag(tagKey, tagValue string) ([]*span.Span, error)
 }
 
 // LoadBlock loads a block from disk, automatically detecting whether it's

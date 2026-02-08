@@ -7,9 +7,6 @@ import (
 	"sort"
 	"time"
 
-	"github.com/apache/arrow-go/v18/arrow"
-	"github.com/apache/arrow-go/v18/arrow/array"
-	"github.com/apache/arrow-go/v18/arrow/memory"
 	"github.com/oklog/ulid/v2"
 
 	"github.com/saswatamcode/artemis/pkg/block"
@@ -21,7 +18,6 @@ import (
 type Compactor struct {
 	baseDir      string
 	levelConfigs map[int]*LevelConfig
-	mem          memory.Allocator
 }
 
 // NewCompactor creates a new compactor with default level configs
@@ -29,7 +25,6 @@ func NewCompactor(baseDir string) *Compactor {
 	return &Compactor{
 		baseDir:      baseDir,
 		levelConfigs: DefaultLevelConfigs(),
-		mem:          memory.NewGoAllocator(),
 	}
 }
 
@@ -38,7 +33,6 @@ func NewCompactorWithConfigs(baseDir string, levelConfigs map[int]*LevelConfig) 
 	return &Compactor{
 		baseDir:      baseDir,
 		levelConfigs: levelConfigs,
-		mem:          memory.NewGoAllocator(),
 	}
 }
 
@@ -108,15 +102,40 @@ func (c *Compactor) Compact(plan *CompactionPlan) (*block.BlockMeta, error) {
 
 	// Determine WAL segment range from source blocks
 	// The compacted block should cover the union of all source block WAL segments
+	// IMPORTANT: Validate that source blocks have contiguous or overlapping ranges
 	minWALSegment := -1
 	maxWALSegment := -1
+	segmentRanges := make([][2]int, 0, len(plan.Blocks))
+
 	for _, blk := range plan.Blocks {
 		meta := blk.Meta()
+		segmentRanges = append(segmentRanges, [2]int{meta.MinWALSegment, meta.MaxWALSegment})
+
 		if minWALSegment == -1 || meta.MinWALSegment < minWALSegment {
 			minWALSegment = meta.MinWALSegment
 		}
 		if meta.MaxWALSegment > maxWALSegment {
 			maxWALSegment = meta.MaxWALSegment
+		}
+	}
+
+	// Validate WAL segment continuity
+	// Check if all segments from minWALSegment to maxWALSegment are covered
+	if minWALSegment != -1 && maxWALSegment != -1 {
+		covered := make([]bool, maxWALSegment-minWALSegment+1)
+		for _, r := range segmentRanges {
+			for seg := r[0]; seg <= r[1]; seg++ {
+				if seg >= minWALSegment && seg <= maxWALSegment {
+					covered[seg-minWALSegment] = true
+				}
+			}
+		}
+
+		// Check for gaps
+		for i, isCovered := range covered {
+			if !isCovered {
+				return nil, fmt.Errorf("WAL segment gap detected: segment %d not covered by any source block (compacting blocks with non-contiguous WAL segments)", minWALSegment+i)
+			}
 		}
 	}
 
@@ -168,32 +187,12 @@ func (c *Compactor) collectSpans(blocks []block.Block) ([]*span.Span, int64, int
 			maxTime = meta.MaxTime
 		}
 
-		// Check if this is a Parquet block (Records() returns nil)
-		if blk.Records() == nil {
-			pblk, err := block.NewParquetBlock(blk.Dir())
-			if err != nil {
-				return nil, 0, 0, fmt.Errorf("failed to open parquet block: %w", err)
-			}
-			defer pblk.Close()
-
-			spans, err := pblk.ReadAll()
-			if err != nil {
-				return nil, 0, 0, fmt.Errorf("failed to read parquet block: %w", err)
-			}
-			allSpans = append(allSpans, spans...)
-		} else {
-			// This is an Arrow IPC block (L0)
-			records := blk.Records()
-			for _, record := range records {
-				for row := 0; row < int(record.NumRows()); row++ {
-					sp, err := extractSpanFromRecord(record, row)
-					if err != nil {
-						continue
-					}
-					allSpans = append(allSpans, sp)
-				}
-			}
+		// Use the unified ReadAll() method - works for both Arrow and Parquet blocks
+		spans, err := blk.ReadAll()
+		if err != nil {
+			return nil, 0, 0, fmt.Errorf("failed to read block %s: %w", blk.Dir(), err)
 		}
+		allSpans = append(allSpans, spans...)
 	}
 
 	return allSpans, minTime, maxTime, nil
@@ -212,53 +211,6 @@ func (c *Compactor) buildIndex(spans []*span.Span) *index.Index {
 	}
 
 	return idx
-}
-
-// extractSpanFromRecord extracts a span from an Arrow record
-func extractSpanFromRecord(record arrow.Record, rowIndex int) (*span.Span, error) {
-	if rowIndex >= int(record.NumRows()) {
-		return nil, fmt.Errorf("invalid row index %d", rowIndex)
-	}
-
-	sp := &span.Span{}
-
-	sp.TraceID = record.Column(0).(*array.String).Value(rowIndex)
-
-	sp.SpanID = record.Column(1).(*array.String).Value(rowIndex)
-
-	parentCol := record.Column(2).(*array.String)
-	if !parentCol.IsNull(rowIndex) {
-		sp.ParentSpanID = parentCol.Value(rowIndex)
-	}
-
-	sp.Name = record.Column(3).(*array.String).Value(rowIndex)
-
-	sp.StartTime = time.Unix(0, record.Column(4).(*array.Int64).Value(rowIndex))
-
-	sp.EndTime = time.Unix(0, record.Column(5).(*array.Int64).Value(rowIndex))
-
-	sp.Duration = record.Column(6).(*array.Int64).Value(rowIndex)
-
-	sp.ServiceName = record.Column(7).(*array.String).Value(rowIndex)
-
-	tagsCol := record.Column(8).(*array.Map)
-	if !tagsCol.IsNull(rowIndex) {
-		sp.Tags = make(map[string]string)
-
-		offset := tagsCol.Offsets()[rowIndex]
-		nextOffset := tagsCol.Offsets()[rowIndex+1]
-
-		keys := tagsCol.Keys().(*array.String)
-		items := tagsCol.Items().(*array.String)
-
-		for i := int(offset); i < int(nextOffset); i++ {
-			key := keys.Value(i)
-			value := items.Value(i)
-			sp.Tags[key] = value
-		}
-	}
-
-	return sp, nil
 }
 
 // extractULIDs extracts ULIDs from a list of blocks

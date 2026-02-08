@@ -151,9 +151,23 @@ func (bm *Manager) ShouldFlush() bool {
 
 // FlushHead flushes the head block to disk
 // minWALSegment and maxWALSegment are the WAL segment index range whose data is included in this block
+// NOTE: Caller should reset the head storage after this returns successfully to avoid data loss
 func (bm *Manager) FlushHead(minWALSegment, maxWALSegment int) (*BlockMeta, error) {
 	bm.mu.Lock()
 	defer bm.mu.Unlock()
+
+	// Snapshot the current head to avoid race conditions
+	// This prevents concurrent writes from modifying data while we're flushing
+	oldHead := bm.head
+	if oldHead == nil {
+		return nil, fmt.Errorf("head is nil, cannot flush")
+	}
+
+	// CRITICAL FIX: Flush builder state before snapshot to materialize pending records
+	// Without this, any spans in the builder (not yet in a record) would be lost
+	if err := oldHead.Flush(); err != nil {
+		return nil, fmt.Errorf("failed to flush builder: %w", err)
+	}
 
 	entropy := ulid.Monotonic(rand.New(rand.NewSource(time.Now().UnixNano())), 0)
 	blockID := ulid.MustNew(ulid.Timestamp(time.Now()), entropy)
@@ -162,7 +176,7 @@ func (bm *Manager) FlushHead(minWALSegment, maxWALSegment int) (*BlockMeta, erro
 		ULID:          blockID,
 		MinTime:       bm.headMinTime,
 		MaxTime:       bm.headMaxTime,
-		SpanCount:     bm.head.RowCount(),
+		SpanCount:     oldHead.RowCount(),
 		Version:       1,
 		CreatedAt:     time.Now(),
 		MinWALSegment: minWALSegment,
@@ -171,9 +185,10 @@ func (bm *Manager) FlushHead(minWALSegment, maxWALSegment int) (*BlockMeta, erro
 
 	blockDir := filepath.Join(bm.dir, blockID.String())
 
-	records := bm.head.GetRecords()
-	schema := bm.head.Schema()
-	idx := bm.head.GetIndex()
+	// Get data from the old head snapshot
+	records := oldHead.GetRecords()
+	schema := oldHead.Schema()
+	idx := oldHead.GetIndex()
 
 	// Flush to disk
 	if err := FlushBlock(blockDir, meta, records, schema, idx); err != nil {
@@ -216,9 +231,16 @@ func (bm *Manager) GetBlocks() []Block {
 	return blocks
 }
 
-// GetHead returns the head block
+// GetHead returns the head block's underlying ArrowStorage
+// Use this for write operations (AddSpan, etc.)
 func (bm *Manager) GetHead() *storage.ArrowStorage {
 	return bm.head
+}
+
+// GetHeadAsBlock returns the head block as a Block interface
+// Use this for read/query operations to get uniform access across all block types
+func (bm *Manager) GetHeadAsBlock() Block {
+	return NewHeadBlock(bm.head)
 }
 
 // RemoveBlock removes a block from the manager's list

@@ -151,7 +151,7 @@ func TestDB_QueryFlushRaceCondition(t *testing.T) {
 				var result *query.SelectResult
 				err := db.QueryWithLock(func(head *storage.ArrowStorage, blocks []block.Block) error {
 					var queryErr error
-					result, queryErr = query.SelectFromBlocks(head, blocks, matcher)
+					result, queryErr = query.SelectFromBlocks(block.NewHeadBlock(head), blocks, matcher)
 					return queryErr
 				})
 				if err != nil {
@@ -194,7 +194,7 @@ func TestDB_QueryFlushRaceCondition(t *testing.T) {
 	var finalResult *query.SelectResult
 	err = db.QueryWithLock(func(head *storage.ArrowStorage, blocks []block.Block) error {
 		var queryErr error
-		finalResult, queryErr = query.SelectFromBlocks(head, blocks, matcher)
+		finalResult, queryErr = query.SelectFromBlocks(block.NewHeadBlock(head), blocks, matcher)
 		return queryErr
 	})
 	if err != nil {
@@ -269,7 +269,7 @@ func TestDB_ConcurrentWritesAndQueries(t *testing.T) {
 				var result *query.SelectResult
 				err := db.QueryWithLock(func(head *storage.ArrowStorage, blocks []block.Block) error {
 					var queryErr error
-					result, queryErr = query.SelectFromBlocks(head, blocks, matcher)
+					result, queryErr = query.SelectFromBlocks(block.NewHeadBlock(head), blocks, matcher)
 					return queryErr
 				})
 				if err != nil {
@@ -300,7 +300,7 @@ func TestDB_ConcurrentWritesAndQueries(t *testing.T) {
 	var finalResult *query.SelectResult
 	err = db.QueryWithLock(func(head *storage.ArrowStorage, blocks []block.Block) error {
 		var queryErr error
-		finalResult, queryErr = query.SelectFromBlocks(head, blocks, matcher)
+		finalResult, queryErr = query.SelectFromBlocks(block.NewHeadBlock(head), blocks, matcher)
 		return queryErr
 	})
 	if err != nil {

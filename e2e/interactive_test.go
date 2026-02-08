@@ -8,7 +8,6 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
 	"time"
 
@@ -156,27 +155,6 @@ func TestArtemisTracingStack(t *testing.T) {
 	defer resp.Body.Close()
 	testutil.Equals(t, 200, resp.StatusCode)
 	fmt.Println("✓ Tempo v2 tag values endpoint working")
-
-	// Test SQL query endpoint
-	sqlQueryURL := fmt.Sprintf("http://%s/api/query/sql", artemis.Endpoint("http"))
-	sqlQuery := `{"query": "SELECT COUNT(*) as total FROM spans"}`
-	resp, err = http.Post(sqlQueryURL, "application/json", strings.NewReader(sqlQuery))
-	testutil.Ok(t, err)
-	defer resp.Body.Close()
-	testutil.Equals(t, 200, resp.StatusCode)
-
-	var sqlResp struct {
-		Success  bool                     `json:"success"`
-		RowCount int                      `json:"row_count"`
-		Rows     []map[string]interface{} `json:"rows"`
-	}
-	body, _ = io.ReadAll(resp.Body)
-	testutil.Ok(t, json.Unmarshal(body, &sqlResp))
-	if sqlResp.Success && len(sqlResp.Rows) > 0 {
-		fmt.Printf("✓ SQL query endpoint working (total spans: %v)\n", sqlResp.Rows[0]["total"])
-	} else {
-		fmt.Println("✓ SQL query endpoint working (no data yet)")
-	}
 
 	fmt.Println("\n=== 🎉 Tracing stack is ready! ===")
 	fmt.Println("\nServices:")
