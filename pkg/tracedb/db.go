@@ -531,10 +531,11 @@ func (db *DB) createCheckpoint() error {
 		return nil
 	}
 
-	deleteCount := deleteTo - deleteFrom + 1
+	// Number of segments being deleted in this checkpoint operation
+	deleteCountIncremental := deleteTo - deleteFrom + 1
 
 	// Don't checkpoint if we don't have enough segments to delete
-	if deleteCount < db.checkpointThreshold {
+	if deleteCountIncremental < db.checkpointThreshold {
 		return nil
 	}
 
@@ -547,7 +548,7 @@ func (db *DB) createCheckpoint() error {
 		// Only delete up to the segment before the current one
 		if currentWALSegment > 0 {
 			deleteTo = currentWALSegment - 1
-			deleteCount = deleteTo - deleteFrom + 1
+			deleteCountIncremental = deleteTo - deleteFrom + 1
 		} else {
 			// Current segment is 0, can't delete anything
 			return nil
@@ -555,14 +556,18 @@ func (db *DB) createCheckpoint() error {
 	}
 
 	// Recheck threshold after adjustment
-	if deleteCount < db.checkpointThreshold {
+	if deleteCountIncremental < db.checkpointThreshold {
 		return nil
 	}
+
+	// Total number of segments deleted (0 through deleteTo, inclusive)
+	// This is what the checkpoint metadata validation expects
+	deleteCountTotal := deleteTo + 1
 
 	// CRITICAL: Write checkpoint metadata FIRST, THEN delete segments
 	// This ensures if system crashes during deletion, checkpoint metadata
 	// correctly reflects what should be deleted (next checkpoint can retry)
-	if err := wal.WriteCheckpointMetadata(db.walDir, deleteTo, deleteCount); err != nil {
+	if err := wal.WriteCheckpointMetadata(db.walDir, deleteTo, deleteCountTotal); err != nil {
 		return fmt.Errorf("failed to write checkpoint metadata: %w", err)
 	}
 
@@ -575,7 +580,8 @@ func (db *DB) createCheckpoint() error {
 	db.logger.Info("checkpoint created",
 		"deleted_from", deleteFrom,
 		"deleted_to", deleteTo,
-		"segment_count", deleteCount)
+		"segment_count_incremental", deleteCountIncremental,
+		"segment_count_total", deleteCountTotal)
 
 	return nil
 }
