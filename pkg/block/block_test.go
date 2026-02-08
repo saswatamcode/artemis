@@ -453,10 +453,13 @@ func TestLoadPersistedBlock(t *testing.T) {
 		t.Errorf("Loaded SpanCount = %d, want 1", loadedMeta.SpanCount)
 	}
 
-	// Verify we can read spans
-	records := block.Records()
-	if len(records) != 1 {
-		t.Errorf("Records() returned %d records, want 1", len(records))
+	// Verify we can read spans using the unified interface
+	allSpans, err := block.ReadAll()
+	if err != nil {
+		t.Fatalf("ReadAll() error = %v", err)
+	}
+	if len(allSpans) != 1 {
+		t.Errorf("ReadAll() returned %d spans, want 1", len(allSpans))
 	}
 
 	// Verify index
@@ -465,8 +468,8 @@ func TestLoadPersistedBlock(t *testing.T) {
 		t.Error("Index() should not return nil")
 	}
 
-	_, ok := idx.LookupSpanID("span-1")
-	if !ok {
+	_, found := idx.LookupSpanID("span-1")
+	if !found {
 		t.Error("Index should contain span-1")
 	}
 }
@@ -618,12 +621,6 @@ func TestNewParquetBlock(t *testing.T) {
 	}
 	if loadedMeta.Level() != 1 {
 		t.Errorf("Meta().Level() = %d, want 1", loadedMeta.Level())
-	}
-
-	// Verify schema (Parquet blocks return nil for Arrow schema)
-	schema := pb.Schema()
-	if schema != nil {
-		t.Error("ParquetBlock.Schema() should return nil")
 	}
 
 	// Verify index
@@ -887,10 +884,13 @@ func TestPersistedBlock_LoadArrowBlock(t *testing.T) {
 		t.Errorf("Level() = %d, want 0", block.Meta().Level())
 	}
 
-	// Verify we can read records
-	records := block.Records()
-	if len(records) == 0 {
-		t.Error("Records() should return at least one record")
+	// Verify we can read spans using the unified interface
+	allSpans, err := block.ReadAll()
+	if err != nil {
+		t.Fatalf("ReadAll() error = %v", err)
+	}
+	if len(allSpans) == 0 {
+		t.Error("ReadAll() should return at least one span")
 	}
 
 	// Verify index
@@ -899,8 +899,8 @@ func TestPersistedBlock_LoadArrowBlock(t *testing.T) {
 		t.Fatal("Index() should not return nil")
 	}
 
-	_, ok := idx.LookupSpanID("span-1")
-	if !ok {
+	_, found := idx.LookupSpanID("span-1")
+	if !found {
 		t.Error("Index should contain span-1")
 	}
 }
@@ -956,10 +956,9 @@ func TestPersistedBlock_LoadParquetBlock(t *testing.T) {
 		t.Errorf("Level() = %d, want 1", block.Meta().Level())
 	}
 
-	// For Parquet blocks, Records() should return nil
-	records := block.Records()
-	if records != nil {
-		t.Error("Parquet blocks should return nil for Records()")
+	// Verify it's a Parquet block by checking it's not an Arrow block
+	if _, ok := block.(*ArrowBlock); ok {
+		t.Error("L1 block should not be an Arrow block")
 	}
 
 	// Verify index
@@ -968,8 +967,8 @@ func TestPersistedBlock_LoadParquetBlock(t *testing.T) {
 		t.Fatal("Index() should not return nil")
 	}
 
-	_, ok := idx.LookupSpanID("span-1")
-	if !ok {
+	_, found := idx.LookupSpanID("span-1")
+	if !found {
 		t.Error("Index should contain span-1")
 	}
 }

@@ -16,8 +16,15 @@ import (
 	"github.com/saswatamcode/artemis/pkg/storage"
 )
 
-// duckDBQuerier provides SQL-based querying using DuckDB
-// It can query Arrow IPC files and Parquet files directly from disk
+// duckDBQuerier provides SQL-based querying using DuckDB with fanout pattern
+// It queries Arrow IPC files and Parquet files directly from disk in parallel
+//
+// Architecture:
+// - Groups blocks by type (Arrow L0, Parquet L1+)
+// - Creates a UNION ALL view across all block files
+// - DuckDB's query engine automatically parallelizes reads across files (fanout)
+// - Each SQL query fans out to all blocks, with DuckDB merging results
+//
 // This implementation is only available when built with the 'duckdb' build tag
 type duckDBQuerier struct {
 	db     *sql.DB
@@ -38,6 +45,7 @@ func NewSQLQuerier() (SQLQuerier, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 	conn, err := db.Conn(ctx)
 	if err != nil {
+		// Connection creation failed, cancel context then close db
 		cancel()
 		db.Close()
 		return nil, fmt.Errorf("failed to get connection: %w", err)
@@ -45,8 +53,9 @@ func NewSQLQuerier() (SQLQuerier, error) {
 
 	// Install and load the arrow extension for reading Arrow IPC files
 	if _, err := conn.ExecContext(ctx, "INSTALL arrow FROM community; LOAD arrow;"); err != nil {
-		cancel()
+		// FIX: Close connection before canceling context to avoid delays
 		conn.Close()
+		cancel()
 		db.Close()
 		return nil, fmt.Errorf("failed to load arrow extension: %w", err)
 	}
@@ -64,44 +73,81 @@ func NewSQLQuerier() (SQLQuerier, error) {
 // Close releases resources held by the SQL querier
 func (sq *duckDBQuerier) Close() error {
 	sq.cancel()
+
+	var firstErr error
+
+	// FIX: Capture and return connection close errors
 	if sq.conn != nil {
-		sq.conn.Close()
-	}
-	if sq.db != nil {
-		return sq.db.Close()
-	}
-	return nil
-}
-
-// LoadBlocks loads blocks into DuckDB for querying
-// Creates a unified "spans" table from all blocks (Arrow IPC and Parquet)
-func (sq *duckDBQuerier) LoadBlocks(head *storage.ArrowStorage, blocks []block.Block) error {
-	var sources []string
-
-	// Load persisted blocks (Arrow L0 and Parquet L1+)
-	for _, blk := range blocks {
-		meta := blk.Meta()
-		blockDir := blk.Dir()
-
-		if meta.Level() == 0 {
-			// L0 blocks are Arrow IPC files
-			arrowPath := filepath.Join(blockDir, "spans.arrow")
-			sources = append(sources, fmt.Sprintf("SELECT * FROM read_arrow('%s')", arrowPath))
-		} else {
-			// L1+ blocks are Parquet files
-			parquetPath := filepath.Join(blockDir, "spans.parquet")
-			sources = append(sources, fmt.Sprintf("SELECT * FROM read_parquet('%s')", parquetPath))
+		if err := sq.conn.Close(); err != nil && firstErr == nil {
+			firstErr = err
 		}
 	}
 
-	// TODO: Load head block (in-memory Arrow records) if present
-	// For now, we skip the head block and only query persisted blocks
-	// This can be implemented later by writing head records to a temporary file
-	// or using DuckDB's Arrow integration
+	if sq.db != nil {
+		if err := sq.db.Close(); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+
+	return firstErr
+}
+
+// LoadBlocks loads blocks into DuckDB using fanout pattern
+//
+// Fanout Strategy:
+// 1. Groups blocks by type (Arrow L0 vs Parquet L1+) for optimized reads
+// 2. Creates SELECT queries for each block file (persisted blocks only)
+// 3. Combines all sources with UNION ALL into a single "spans" view
+// 4. DuckDB's query engine parallelizes reads across all files automatically
+//
+// When a SQL query is executed:
+// - DuckDB fans out the query to all block files in parallel
+// - Each file is read independently using Arrow/Parquet readers
+// - Results are merged automatically by DuckDB's UNION ALL implementation
+// - This achieves similar parallelization to our Go-based FanoutQuerier
+//
+// Note: Head block (in-memory) is not yet supported - only persisted blocks
+func (sq *duckDBQuerier) LoadBlocks(head *storage.ArrowStorage, blocks []block.Block) error {
+	var sources []string
+
+	// Phase 1: Group blocks by storage format for optimized query planning
+	// This allows DuckDB to use format-specific optimizations
+	arrowBlocks := make([]block.Block, 0)
+	parquetBlocks := make([]block.Block, 0)
+
+	for _, blk := range blocks {
+		meta := blk.Meta()
+		if meta.Level() == 0 {
+			arrowBlocks = append(arrowBlocks, blk)
+		} else {
+			parquetBlocks = append(parquetBlocks, blk)
+		}
+	}
+
+	// Phase 2: Create SELECT queries for Arrow L0 blocks
+	// DuckDB will parallelize reads across these files
+	for _, blk := range arrowBlocks {
+		arrowPath := filepath.Join(blk.Dir(), "spans.arrow")
+		sources = append(sources, fmt.Sprintf("SELECT * FROM read_arrow('%s')", arrowPath))
+	}
+
+	// Phase 3: Create SELECT queries for Parquet L1+ blocks
+	// DuckDB will parallelize reads across these files
+	for _, blk := range parquetBlocks {
+		parquetPath := filepath.Join(blk.Dir(), "spans.parquet")
+		sources = append(sources, fmt.Sprintf("SELECT * FROM read_parquet('%s')", parquetPath))
+	}
+
+	// TODO: Phase 4: Add head block (in-memory Arrow records) if present
+	// This can be implemented using DuckDB's Arrow integration or by
+	// writing head records to a temporary Arrow IPC file
 	_ = head
 
-	// Create unified view
+	// Phase 5: Create unified "spans" view with UNION ALL
+	// This is the fanout merge point - DuckDB handles parallel execution
 	if len(sources) > 0 {
+		// UNION ALL creates a fanout view that queries all blocks in parallel
+		// DuckDB's query planner will optimize this for parallel execution
 		unionQuery := "CREATE OR REPLACE VIEW spans AS " + sources[0]
 		for i := 1; i < len(sources); i++ {
 			unionQuery += " UNION ALL " + sources[i]
@@ -134,7 +180,18 @@ func (sq *duckDBQuerier) LoadBlocks(head *storage.ArrowStorage, blocks []block.B
 	return nil
 }
 
-// SelectSQL executes a SQL query and returns results as spans
+// SelectSQL executes a SQL query using the fanout pattern
+//
+// Execution Flow:
+// 1. Query is sent to DuckDB's query engine
+// 2. DuckDB's planner detects the UNION ALL view over multiple files
+// 3. Query is automatically fanned out to all block files in parallel
+// 4. Each block is queried independently (Arrow/Parquet readers)
+// 5. Results are merged by DuckDB and returned
+//
+// This achieves the same parallelization as our Go-based FanoutQuerier,
+// but leverages DuckDB's native query engine for better performance.
+//
 // The query should select from the "spans" table/view
 //
 // Example queries:

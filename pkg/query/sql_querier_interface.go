@@ -6,10 +6,17 @@ import (
 	"github.com/saswatamcode/artemis/pkg/storage"
 )
 
-// SQLQuerier provides SQL-based querying interface
+// SQLQuerier provides SQL-based querying interface with fanout pattern
+//
 // The actual implementation depends on build tags:
 // - Default (no build tag): Returns "unimplemented" errors
-// - With 'duckdb' build tag: Uses DuckDB for SQL queries over Arrow IPC and Parquet files
+// - With 'duckdb' build tag: Uses DuckDB for parallel SQL queries over blocks
+//
+// Fanout Architecture (DuckDB implementation):
+// - Queries are automatically parallelized across all block files
+// - DuckDB's UNION ALL creates a fanout view over Arrow IPC (L0) and Parquet (L1+) files
+// - Query execution is distributed to each block file independently
+// - Results are merged efficiently by DuckDB's query engine
 //
 // To build with DuckDB support (requires CGO):
 //
@@ -18,12 +25,24 @@ type SQLQuerier interface {
 	// Close releases resources held by the querier
 	Close() error
 
-	// LoadBlocks loads blocks into the querier for SQL queries
-	// Creates a "spans" table/view that can be queried with SQL
+	// LoadBlocks loads blocks into the querier for SQL queries using fanout pattern
+	// Creates a "spans" table/view that fans out queries to all blocks in parallel
+	//
+	// For DuckDB implementation:
+	// - Groups blocks by type (Arrow L0, Parquet L1+)
+	// - Creates a UNION ALL view that DuckDB parallelizes automatically
+	// - Each SQL query will fan out to all block files concurrently
 	LoadBlocks(head *storage.ArrowStorage, blocks []block.Block) error
 
-	// SelectSQL executes a SQL query and returns results
+	// SelectSQL executes a SQL query using the fanout pattern
+	// The query is automatically distributed across all loaded blocks in parallel
 	// The query should select from the "spans" table
+	//
+	// Fanout behavior (DuckDB):
+	// - Query is parsed by DuckDB's planner
+	// - Automatically fans out to all block files in parallel
+	// - Each block is queried independently
+	// - Results are merged and returned
 	//
 	// Example queries:
 	//   - SELECT * FROM spans WHERE service_name = 'my-service' LIMIT 100

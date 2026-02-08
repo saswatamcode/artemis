@@ -92,14 +92,23 @@ func (idx *Index) LookupSpanID(spanID string) (SpanRef, bool) {
 }
 
 // LookupByTraceID returns all span IDs for a given trace ID
+// Returns a defensive copy to prevent concurrent modification issues
 func (idx *Index) LookupByTraceID(traceID string) []string {
 	idx.mu.RLock()
 	defer idx.mu.RUnlock()
 
-	return idx.traceIndex[traceID]
+	result := idx.traceIndex[traceID]
+	if result == nil {
+		return nil
+	}
+	// Return a copy to prevent concurrent modification
+	copied := make([]string, len(result))
+	copy(copied, result)
+	return copied
 }
 
 // LookupByTag returns all span IDs matching a specific tag key-value pair
+// Returns a defensive copy to prevent concurrent modification issues
 func (idx *Index) LookupByTag(key, value string) []string {
 	idx.mu.RLock()
 	defer idx.mu.RUnlock()
@@ -115,7 +124,14 @@ func (idx *Index) LookupByTag(key, value string) []string {
 	}
 
 	tagPair := fmt.Sprintf("%d:%d", keyID, valueID)
-	return idx.tagIndex[tagPair]
+	result := idx.tagIndex[tagPair]
+	if result == nil {
+		return nil
+	}
+	// Return a copy to prevent concurrent modification
+	copied := make([]string, len(result))
+	copy(copied, result)
+	return copied
 }
 
 // Stats returns index statistics
@@ -165,17 +181,48 @@ type SerializedIndex struct {
 }
 
 // Serialize converts the index to a serializable format
+// Makes deep copies of all maps to prevent concurrent modification during serialization
 func (idx *Index) Serialize() *SerializedIndex {
 	idx.mu.RLock()
 	defer idx.mu.RUnlock()
 
+	// Deep copy spanIndex map
+	spanIndexCopy := make(map[string]SpanRef, len(idx.spanIndex))
+	for k, v := range idx.spanIndex {
+		spanIndexCopy[k] = v
+	}
+
+	// Deep copy traceIndex map (including slices)
+	traceIndexCopy := make(map[string][]string, len(idx.traceIndex))
+	for k, v := range idx.traceIndex {
+		copied := make([]string, len(v))
+		copy(copied, v)
+		traceIndexCopy[k] = copied
+	}
+
+	// Deep copy tagIndex map (including slices)
+	tagIndexCopy := make(map[string][]string, len(idx.tagIndex))
+	for k, v := range idx.tagIndex {
+		copied := make([]string, len(v))
+		copy(copied, v)
+		tagIndexCopy[k] = copied
+	}
+
+	// Deep copy spanTags map (including slices)
+	spanTagsCopy := make(map[string][]string, len(idx.spanTags))
+	for k, v := range idx.spanTags {
+		copied := make([]string, len(v))
+		copy(copied, v)
+		spanTagsCopy[k] = copied
+	}
+
 	return &SerializedIndex{
 		TagKeys:    idx.tagKeys.SerializeToMap(),
 		TagValues:  idx.tagValues.SerializeToMap(),
-		SpanIndex:  idx.spanIndex,
-		TraceIndex: idx.traceIndex,
-		TagIndex:   idx.tagIndex,
-		SpanTags:   idx.spanTags,
+		SpanIndex:  spanIndexCopy,
+		TraceIndex: traceIndexCopy,
+		TagIndex:   tagIndexCopy,
+		SpanTags:   spanTagsCopy,
 	}
 }
 

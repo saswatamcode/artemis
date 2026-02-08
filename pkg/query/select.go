@@ -1,7 +1,11 @@
 package query
 
 import (
+	"fmt"
 	"time"
+
+	"github.com/apache/arrow-go/v18/arrow"
+	"github.com/apache/arrow-go/v18/arrow/array"
 
 	"github.com/saswatamcode/artemis/pkg/block"
 	"github.com/saswatamcode/artemis/pkg/span"
@@ -148,16 +152,19 @@ func selectWithScan(storage *storage.ArrowStorage, ms Matchers) (*SelectResult, 
 
 // SelectFromBlocks queries spans across both head block and persisted blocks
 // This is the main query interface when using block management
-// Works with both Arrow (L0) and Parquet (L1+) blocks
-func SelectFromBlocks(head *storage.ArrowStorage, blocks []block.Block, matchers ...*Matcher) (*SelectResult, error) {
+// Works uniformly across HeadBlock (in-memory), ArrowBlock (L0), and ParquetBlock (L1+)
+//
+// The head block is treated as just another Block for uniform query interface
+// Pass nil for head if querying only persisted blocks
+func SelectFromBlocks(head block.Block, blocks []block.Block, matchers ...*Matcher) (*SelectResult, error) {
 	return SelectFromBlocksWithTimeRange(head, blocks, nil, matchers...)
 }
 
 // SelectFromBlocksWithTimeRange queries spans across blocks within a specific time range
 // Time range filtering provides significant performance benefits by skipping irrelevant blocks
-// Works with both Arrow (L0) and Parquet (L1+) blocks
+// Works uniformly across HeadBlock (in-memory), ArrowBlock (L0), and ParquetBlock (L1+)
 // TODO: Parallelize such fanout
-func SelectFromBlocksWithTimeRange(head *storage.ArrowStorage, blocks []block.Block, timeRange *TimeRange, matchers ...*Matcher) (*SelectResult, error) {
+func SelectFromBlocksWithTimeRange(head block.Block, blocks []block.Block, timeRange *TimeRange, matchers ...*Matcher) (*SelectResult, error) {
 	ms := Matchers(matchers)
 	result := &SelectResult{
 		Spans: make([]*span.Span, 0),
@@ -184,37 +191,32 @@ func SelectFromBlocksWithTimeRange(head *storage.ArrowStorage, blocks []block.Bl
 
 	// Query head block last (most recent data)
 	if head != nil {
-		if timeRange == nil || headOverlapsTimeRange(head, timeRange) {
-			headResult, err := Select(head, matchers...)
-			if err == nil && headResult != nil {
-				for _, sp := range headResult.Spans {
-					if timeRange == nil || spanInTimeRange(sp, timeRange) {
-						result.Spans = append(result.Spans, sp)
-					}
-				}
-			}
+		if timeRange == nil || timeRangeOverlapsBlock(head, timeRange) {
+			headSpans := queryBlockWithTimeRange(head, ms, timeRange)
+			result.Spans = append(result.Spans, headSpans...)
 		}
 	}
 
 	return result, nil
 }
 
-// headOverlapsTimeRange checks if the head block overlaps with a time range
-func headOverlapsTimeRange(head *storage.ArrowStorage, timeRange *TimeRange) bool {
-	minTime, maxTime := head.GetTimeRange()
-	if minTime == 0 && maxTime == 0 {
-		return true // Empty head block or no time tracking
+// timeRangeOverlapsBlock checks if a time range overlaps with a block's time range
+func timeRangeOverlapsBlock(blk block.Block, timeRange *TimeRange) bool {
+	meta := blk.Meta()
+	if meta.MinTime == 0 && meta.MaxTime == 0 {
+		return true // Empty block or no time tracking
 	}
-	return timeRange.Overlaps(minTime, maxTime)
+	return timeRange.Overlaps(meta.MinTime, meta.MaxTime)
 }
 
-// spanInTimeRange checks if a span falls within the time range
+// spanInTimeRange checks if a span overlaps with the time range
+// A span overlaps if: span.endTime >= range.start AND span.startTime <= range.end
 func spanInTimeRange(sp *span.Span, timeRange *TimeRange) bool {
-	// A span is in range if either its start or end time is in the range
-	// or if it completely encompasses the range
-	return timeRange.Contains(sp.StartTime) ||
-		timeRange.Contains(sp.EndTime) ||
-		(sp.StartTime.Before(timeRange.Start) && sp.EndTime.After(timeRange.End))
+	if timeRange == nil {
+		return true
+	}
+	// Standard interval overlap check: spans overlap if they have any time in common
+	return !sp.EndTime.Before(timeRange.Start) && !sp.StartTime.After(timeRange.End)
 }
 
 // isTopLevelField checks if a field name refers to a top-level span field
@@ -233,11 +235,12 @@ func isTopLevelField(name string) bool {
 func createMetadataFilter(ms Matchers, timeRange *TimeRange) func(*block.ParquetSpanMetadata) bool {
 	return func(meta *block.ParquetSpanMetadata) bool {
 		// Check time range first (quick rejection)
+		// A span overlaps with the time range if: startNano <= rangeEnd && endNano >= rangeStart
 		if timeRange != nil {
-			startTime := time.Unix(0, meta.StartTime)
-			endTime := time.Unix(0, meta.EndTime)
-			if !timeRange.Contains(startTime) && !timeRange.Contains(endTime) &&
-				(!startTime.Before(timeRange.Start) || !endTime.After(timeRange.End)) {
+			startNano := timeRange.Start.UnixNano()
+			endNano := timeRange.End.UnixNano()
+			// Reject if span doesn't overlap with time range
+			if meta.StartTime > endNano || meta.EndTime < startNano {
 				return false
 			}
 		}
@@ -281,14 +284,43 @@ func createMetadataFilter(ms Matchers, timeRange *TimeRange) func(*block.Parquet
 }
 
 // queryBlockWithTimeRange queries a single block with matchers and time range
-// Works with both Arrow (L0) and Parquet (L1+) blocks
+// Works with HeadBlock (in-memory), ArrowBlock (L0), and ParquetBlock (L1+)
 func queryBlockWithTimeRange(blk block.Block, ms Matchers, timeRange *TimeRange) []*span.Span {
 	spans := make([]*span.Span, 0)
 
-	// Check if this is a Parquet block (Records() returns nil)
-	isParquetBlock := blk.Records() == nil
-	if blk.HasIndex() && len(ms) > 0 {
-		idx := blk.Index()
+	// Try HeadBlock first (in-memory)
+	if hb, ok := blk.(*block.HeadBlock); ok {
+		return queryHeadBlock(hb, ms, timeRange)
+	}
+
+	// Try Parquet block
+	if pb, ok := blk.(*block.ParquetBlock); ok {
+		return queryParquetBlock(pb, ms, timeRange)
+	}
+
+	// Try Arrow block
+	if ab, ok := blk.(*block.ArrowBlock); ok {
+		return queryArrowBlock(ab, ms, timeRange)
+	}
+
+	// Unknown block type - this indicates a bug or new block type not handled
+	// Log warning to help with debugging
+	meta := blk.Meta()
+	if meta != nil {
+		// Use fmt.Printf as a simple warning mechanism since we don't have logger context here
+		// In production, this should be rare and indicates a code issue
+		fmt.Printf("WARNING: Unknown block type encountered in query: ULID=%s, Level=%d, Dir=%s\n",
+			meta.ULID, meta.Level(), blk.Dir())
+	}
+	return spans
+}
+
+// queryParquetBlock queries a Parquet block with matchers and time range
+func queryParquetBlock(pb *block.ParquetBlock, ms Matchers, timeRange *TimeRange) []*span.Span {
+	spans := make([]*span.Span, 0)
+
+	if pb.HasIndex() && len(ms) > 0 {
+		idx := pb.Index()
 
 		// Find first exact match to use as index lookup
 		// Priority: trace_id > span_id > other fields
@@ -308,38 +340,16 @@ func queryBlockWithTimeRange(blk block.Block, ms Matchers, timeRange *TimeRange)
 				}
 
 				if len(candidateSpanIDs) > 0 {
-					if isParquetBlock {
-						// Parquet block: use GetSpansBatch for efficient batched reads
-						// This groups I/O by row group instead of reading spans one-by-one
-						if pb, ok := blk.(*block.ParquetBlock); ok {
-							batchSpans, err := pb.GetSpansBatch(candidateSpanIDs)
-							if err == nil {
-								for _, sp := range batchSpans {
-									if ms.Matches(sp) && (timeRange == nil || spanInTimeRange(sp, timeRange)) {
-										spans = append(spans, sp)
-									}
-								}
-							}
-						}
-					} else {
-						records := blk.Records()
-						for _, spanID := range candidateSpanIDs {
-							ref, ok := idx.LookupSpanID(spanID)
-							if !ok || ref.RecordIndex >= len(records) {
-								continue
-							}
-
-							sp, err := extractSpanFromRecord(records[ref.RecordIndex], ref.RowIndex)
-							if err != nil {
-								continue
-							}
-
+					// Parquet block: use GetSpansBatch for efficient batched reads
+					// This groups I/O by row group instead of reading spans one-by-one
+					batchSpans, err := pb.GetSpansBatch(candidateSpanIDs)
+					if err == nil {
+						for _, sp := range batchSpans {
 							if ms.Matches(sp) && (timeRange == nil || spanInTimeRange(sp, timeRange)) {
 								spans = append(spans, sp)
 							}
 						}
 					}
-
 					return spans
 				}
 			}
@@ -347,35 +357,331 @@ func queryBlockWithTimeRange(blk block.Block, ms Matchers, timeRange *TimeRange)
 	}
 
 	// Fall back to full scan (no index or no exact match matchers)
-	if isParquetBlock {
-		// For Parquet blocks, use efficient column projection instead of ReadAll()
-		// This only reads metadata columns (excludes tags), which is much faster
-		if pb, ok := blk.(*block.ParquetBlock); ok {
-			filterFunc := createMetadataFilter(ms, timeRange)
-			// Scan metadata columns only
-			refs, err := pb.ScanMetadata(filterFunc)
-			if err != nil {
-				return spans
-			}
-
-			// Fetch full spans only for matching rows
-			matchedSpans, err := pb.GetSpansByRowReferences(refs)
-			if err != nil {
-				return spans
-			}
-
-			// Final filtering with full matcher (includes tag checks)
-			for _, sp := range matchedSpans {
-				if ms.Matches(sp) && (timeRange == nil || spanInTimeRange(sp, timeRange)) {
-					spans = append(spans, sp)
-				}
-			}
-		}
+	// For Parquet blocks, use efficient column projection instead of ReadAll()
+	// This only reads metadata columns (excludes tags), which is much faster
+	filterFunc := createMetadataFilter(ms, timeRange)
+	// Scan metadata columns only
+	refs, err := pb.ScanMetadata(filterFunc)
+	if err != nil {
 		return spans
 	}
 
+	// Fetch full spans only for matching rows
+	matchedSpans, err := pb.GetSpansByRowReferences(refs)
+	if err != nil {
+		return spans
+	}
+
+	// Final filtering with full matcher (includes tag checks)
+	for _, sp := range matchedSpans {
+		if ms.Matches(sp) && (timeRange == nil || spanInTimeRange(sp, timeRange)) {
+			spans = append(spans, sp)
+		}
+	}
+
+	return spans
+}
+
+// queryHeadBlock queries a HeadBlock (in-memory) with matchers and time range
+// Uses Arrow columnar optimizations for better performance
+func queryHeadBlock(hb *block.HeadBlock, ms Matchers, timeRange *TimeRange) []*span.Span {
+	spans := make([]*span.Span, 0)
+
+	// Get the underlying storage
+	storage := hb.Storage()
+
+	if hb.HasIndex() && len(ms) > 0 {
+		idx := hb.Index()
+
+		// Find first exact match to use as index lookup
+		// Priority: trace_id > span_id > other fields
+		for _, m := range ms {
+			if m.Type == MatchEqual {
+				var candidateSpanIDs []string
+				// Check if this is a trace ID lookup (highly selective!)
+				switch m.Name {
+				case "trace_id":
+					candidateSpanIDs = idx.LookupByTraceID(m.Value)
+				case "span_id":
+					if _, ok := idx.LookupSpanID(m.Value); ok {
+						candidateSpanIDs = []string{m.Value}
+					}
+				default:
+					candidateSpanIDs = idx.LookupByTag(m.Name, m.Value)
+				}
+
+				if len(candidateSpanIDs) > 0 {
+					records := storage.GetRecords()
+					// Determine if we need to extract tags for matching
+					needTags := matchersNeedTags(ms)
+
+					for _, spanID := range candidateSpanIDs {
+						ref, ok := idx.LookupSpanID(spanID)
+						if !ok || ref.RecordIndex >= len(records) {
+							continue
+						}
+
+						sp, err := extractSpanFromRecordWithOptions(records[ref.RecordIndex], ref.RowIndex, needTags)
+						if err != nil {
+							continue
+						}
+
+						if ms.Matches(sp) && (timeRange == nil || spanInTimeRange(sp, timeRange)) {
+							// If we didn't extract tags during filtering, extract them now for the final result
+							if !needTags {
+								sp, err = extractSpanFromRecordWithOptions(records[ref.RecordIndex], ref.RowIndex, true)
+								if err != nil {
+									continue
+								}
+							}
+							spans = append(spans, sp)
+						}
+					}
+					return spans
+				}
+			}
+		}
+	}
+
+	// Fall back to full scan using two-phase columnar filtering
+	// Phase 1: Build selection bitmap using columnar access (fast)
+	// Phase 2: Extract only matching spans (avoids unnecessary allocations)
+	records := storage.GetRecords()
+	needTags := matchersNeedTags(ms)
+
+	for _, record := range records {
+		// Phase 1: Build selection bitmap using columnar filtering
+		selection := buildSelectionBitmap(record, ms, timeRange)
+
+		// Phase 2: Extract only selected spans
+		for row := 0; row < int(record.NumRows()); row++ {
+			if !selection[row] {
+				continue
+			}
+
+			sp, err := extractSpanFromRecordWithOptions(record, row, needTags)
+			if err != nil {
+				continue
+			}
+
+			// Final validation with full matchers (includes tag checks if needed)
+			if ms.Matches(sp) && (timeRange == nil || spanInTimeRange(sp, timeRange)) {
+				// If we didn't extract tags during filtering, extract them now for the final result
+				if !needTags {
+					sp, err = extractSpanFromRecordWithOptions(record, row, true)
+					if err != nil {
+						continue
+					}
+				}
+				spans = append(spans, sp)
+			}
+		}
+	}
+
+	return spans
+}
+
+// matchersNeedTags checks if any matcher requires tags to be extracted
+// This allows us to skip expensive tag extraction when only querying top-level fields
+func matchersNeedTags(ms Matchers) bool {
+	// If there are no matchers, we're returning all spans to the user, so extract tags
+	if len(ms) == 0 {
+		return true
+	}
+
+	for _, m := range ms {
+		// If matcher is not a top-level field, it must be a tag matcher
+		if !isTopLevelField(m.Name) {
+			return true
+		}
+	}
+	return false
+}
+
+// buildSelectionBitmap creates a selection bitmap using columnar filtering
+// This leverages Arrow's columnar format for efficient filtering before materialization
+func buildSelectionBitmap(record arrow.RecordBatch, ms Matchers, timeRange *TimeRange) []bool {
+	numRows := int(record.NumRows())
+	selection := make([]bool, numRows)
+
+	// Start with all rows selected
+	for i := range selection {
+		selection[i] = true
+	}
+
+	// Validate schema has enough columns for time range filtering
+	if timeRange != nil && record.NumCols() >= 6 {
+		// Phase 1: Filter by time range using columnar access (very fast, SIMD-friendly)
+		startTimeCol := record.Column(4).(*array.Int64)
+		endTimeCol := record.Column(5).(*array.Int64)
+		startNano := timeRange.Start.UnixNano()
+		endNano := timeRange.End.UnixNano()
+
+		for row := 0; row < numRows; row++ {
+			if !selection[row] {
+				continue
+			}
+
+			spanStart := startTimeCol.Value(row)
+			spanEnd := endTimeCol.Value(row)
+
+			// Check if span overlaps with time range
+			// A span overlaps if: startNano <= spanEnd && endNano >= spanStart
+			if startNano > spanEnd || endNano < spanStart {
+				selection[row] = false
+			}
+		}
+	}
+
+	// Phase 2: Filter by top-level field matchers using columnar access
+	// Skip tag matchers - they require full span materialization
+	for _, m := range ms {
+		if !isTopLevelField(m.Name) {
+			continue // Tag matcher - skip for now, will check after extraction
+		}
+
+		// Apply matcher using columnar access
+		applyMatcherColumnar(record, m, selection)
+	}
+
+	return selection
+}
+
+// applyMatcherColumnar applies a matcher to a selection bitmap using columnar access
+// This is much faster than extracting individual spans
+func applyMatcherColumnar(record arrow.RecordBatch, m *Matcher, selection []bool) {
+	numRows := int(record.NumRows())
+	numCols := int(record.NumCols())
+
+	// Validate schema before accessing columns
+	switch m.Name {
+	case "trace_id":
+		if numCols < 1 {
+			return
+		}
+		col := record.Column(0).(*array.String)
+		for row := 0; row < numRows; row++ {
+			if !selection[row] {
+				continue
+			}
+			if !m.MatchesValue(col.Value(row), true) {
+				selection[row] = false
+			}
+		}
+
+	case "span_id":
+		if numCols < 2 {
+			return
+		}
+		col := record.Column(1).(*array.String)
+		for row := 0; row < numRows; row++ {
+			if !selection[row] {
+				continue
+			}
+			if !m.MatchesValue(col.Value(row), true) {
+				selection[row] = false
+			}
+		}
+
+	case "parent_span_id":
+		if numCols < 3 {
+			return
+		}
+		col := record.Column(2).(*array.String)
+		for row := 0; row < numRows; row++ {
+			if !selection[row] {
+				continue
+			}
+			isNull := col.IsNull(row)
+			val := ""
+			if !isNull {
+				val = col.Value(row)
+			}
+			if !m.MatchesValue(val, !isNull) {
+				selection[row] = false
+			}
+		}
+
+	case "name":
+		if numCols < 4 {
+			return
+		}
+		col := record.Column(3).(*array.String)
+		for row := 0; row < numRows; row++ {
+			if !selection[row] {
+				continue
+			}
+			if !m.MatchesValue(col.Value(row), true) {
+				selection[row] = false
+			}
+		}
+
+	case "service.name", "service_name":
+		if numCols < 8 {
+			return
+		}
+		col := record.Column(7).(*array.String)
+		for row := 0; row < numRows; row++ {
+			if !selection[row] {
+				continue
+			}
+			if !m.MatchesValue(col.Value(row), true) {
+				selection[row] = false
+			}
+		}
+	}
+}
+
+// queryArrowBlock queries an Arrow block with matchers and time range
+func queryArrowBlock(ab *block.ArrowBlock, ms Matchers, timeRange *TimeRange) []*span.Span {
+	spans := make([]*span.Span, 0)
+
+	if ab.HasIndex() && len(ms) > 0 {
+		idx := ab.Index()
+
+		// Find first exact match to use as index lookup
+		// Priority: trace_id > span_id > other fields
+		for _, m := range ms {
+			if m.Type == MatchEqual {
+				var candidateSpanIDs []string
+				// Check if this is a trace ID lookup (highly selective!)
+				switch m.Name {
+				case "trace_id":
+					candidateSpanIDs = idx.LookupByTraceID(m.Value)
+				case "span_id":
+					if _, ok := idx.LookupSpanID(m.Value); ok {
+						candidateSpanIDs = []string{m.Value}
+					}
+				default:
+					candidateSpanIDs = idx.LookupByTag(m.Name, m.Value)
+				}
+
+				if len(candidateSpanIDs) > 0 {
+					records := ab.Records()
+					for _, spanID := range candidateSpanIDs {
+						ref, ok := idx.LookupSpanID(spanID)
+						if !ok || ref.RecordIndex >= len(records) {
+							continue
+						}
+
+						sp, err := extractSpanFromRecord(records[ref.RecordIndex], ref.RowIndex)
+						if err != nil {
+							continue
+						}
+
+						if ms.Matches(sp) && (timeRange == nil || spanInTimeRange(sp, timeRange)) {
+							spans = append(spans, sp)
+						}
+					}
+					return spans
+				}
+			}
+		}
+	}
+
+	// Fall back to full scan (no index or no exact match matchers)
 	// Arrow block: full scan using Records()
-	records := blk.Records()
+	records := ab.Records()
 	for _, record := range records {
 		for row := 0; row < int(record.NumRows()); row++ {
 			sp, err := extractSpanFromRecord(record, row)

@@ -31,7 +31,7 @@ func TestWAL_WriteAndRead(t *testing.T) {
 		},
 	}
 
-	err = w.WriteSpan(sp)
+	_, err = w.WriteSpan(sp)
 	if err != nil {
 		t.Fatalf("WriteSpan() error = %v", err)
 	}
@@ -76,7 +76,7 @@ func TestWAL_MultipleSpans(t *testing.T) {
 			EndTime:     time.Now().Add(time.Millisecond),
 			ServiceName: "service",
 		}
-		if err := w.WriteSpan(sp); err != nil {
+		if _, err := w.WriteSpan(sp); err != nil {
 			t.Fatalf("WriteSpan() error = %v", err)
 		}
 	}
@@ -122,7 +122,7 @@ func TestWAL_SegmentRotation(t *testing.T) {
 				"tag2": "value2-very-long-value-to-increase-size",
 			},
 		}
-		if err := w.WriteSpan(sp); err != nil {
+		if _, err := w.WriteSpan(sp); err != nil {
 			t.Fatalf("WriteSpan() error = %v", err)
 		}
 	}
@@ -186,7 +186,7 @@ func TestWAL_CorruptionHandling(t *testing.T) {
 			EndTime:     time.Now().Add(time.Millisecond),
 			ServiceName: "service",
 		}
-		w.WriteSpan(sp)
+		w.WriteSpan(sp) // Ignore errors and segment index for this test
 	}
 
 	w.Close()
@@ -243,7 +243,7 @@ func TestWAL_SegmentIndexContinuesAfterRestart(t *testing.T) {
 			EndTime:     time.Now().Add(time.Millisecond),
 			ServiceName: "service",
 		}
-		if err := w1.WriteSpan(sp); err != nil {
+		if _, err := w1.WriteSpan(sp); err != nil {
 			t.Fatalf("WriteSpan() error = %v", err)
 		}
 	}
@@ -344,7 +344,7 @@ func TestReplay_WithCheckpointMetadata(t *testing.T) {
 			EndTime:     time.Now().Add(time.Millisecond),
 			ServiceName: "service",
 		}
-		if err := w.WriteSpan(sp); err != nil {
+		if _, err := w.WriteSpan(sp); err != nil {
 			t.Fatalf("WriteSpan() error = %v", err)
 		}
 	}
@@ -360,7 +360,7 @@ func TestReplay_WithCheckpointMetadata(t *testing.T) {
 				EndTime:     time.Now().Add(time.Millisecond),
 				ServiceName: "service",
 			}
-			w.WriteSpan(sp)
+			w.WriteSpan(sp) // Ignore errors and segment index for this test
 		}
 		w.Close()
 	}
@@ -451,6 +451,6 @@ func BenchmarkWAL_WriteSpan(b *testing.B) {
 	}
 
 	for b.Loop() {
-		w.WriteSpan(sp)
+		w.WriteSpan(sp) // Ignore errors and segment index for benchmark
 	}
 }

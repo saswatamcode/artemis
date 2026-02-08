@@ -314,8 +314,8 @@ func TestCompactor_MultiLevelCompaction(t *testing.T) {
 		l0Blocks[i] = blk
 
 		// Verify it's an Arrow block
-		if blk.Records() == nil {
-			t.Errorf("L0 block %d should be Arrow IPC format (Records() should not be nil)", i)
+		if _, ok := blk.(*block.ArrowBlock); !ok {
+			t.Errorf("L0 block %d should be Arrow IPC format", i)
 		}
 		if blk.Meta().Level() != 0 {
 			t.Errorf("Block %d level = %d, want 0", i, blk.Meta().Level())
@@ -347,8 +347,8 @@ func TestCompactor_MultiLevelCompaction(t *testing.T) {
 		}
 
 		// Verify it's a Parquet block
-		if blk.Records() != nil {
-			t.Errorf("L1 block %d should be Parquet format (Records() should be nil)", i)
+		if _, ok := blk.(*block.ParquetBlock); !ok {
+			t.Errorf("L1 block %d should be Parquet format", i)
 		}
 
 		// Verify we can read data back
@@ -374,8 +374,8 @@ func TestCompactor_MultiLevelCompaction(t *testing.T) {
 		}
 
 		// Verify it's a Parquet block
-		if blk.Records() != nil {
-			t.Errorf("L2 block %d should be Parquet format (Records() should be nil)", i)
+		if _, ok := blk.(*block.ParquetBlock); !ok {
+			t.Errorf("L2 block %d should be Parquet format", i)
 		}
 
 		// Verify we can read data back
@@ -419,8 +419,8 @@ func TestCompactor_MultiLevelCompaction(t *testing.T) {
 		}
 
 		// Verify it's a Parquet block
-		if blk.Records() != nil {
-			t.Errorf("L3 block %d should be Parquet format (Records() should be nil)", i)
+		if _, ok := blk.(*block.ParquetBlock); !ok {
+			t.Errorf("L3 block %d should be Parquet format", i)
 		}
 
 		// Verify we can read data back
@@ -461,8 +461,8 @@ func TestCompactor_MultiLevelCompaction(t *testing.T) {
 		}
 
 		// Verify it's a Parquet block
-		if blk.Records() != nil {
-			t.Errorf("L4 block %d should be Parquet format (Records() should be nil)", i)
+		if _, ok := blk.(*block.ParquetBlock); !ok {
+			t.Errorf("L4 block %d should be Parquet format", i)
 		}
 
 		// Verify we can read data back
@@ -504,8 +504,8 @@ func TestCompactor_MultiLevelCompaction(t *testing.T) {
 		}
 
 		// Verify it's a Parquet block
-		if blk.Records() != nil {
-			t.Errorf("L5 block %d should be Parquet format (Records() should be nil)", i)
+		if _, ok := blk.(*block.ParquetBlock); !ok {
+			t.Errorf("L5 block %d should be Parquet format", i)
 		}
 
 		// Verify we can read data back
@@ -546,47 +546,29 @@ func compactLevel(t *testing.T, c *Compactor, blocks []block.Block, level int, t
 func verifyBlockData(t *testing.T, blk block.Block, expectedSpans int64) {
 	t.Helper()
 
-	// Check if it's a Parquet block
-	if blk.Records() == nil {
-		// Parquet block
-		pb, ok := blk.(*block.ParquetBlock)
-		if !ok {
-			t.Fatal("Block should be ParquetBlock")
-		}
+	// Use the unified ReadAll() method
+	spans, err := blk.ReadAll()
+	if err != nil {
+		t.Fatalf("Failed to read spans from block: %v", err)
+	}
 
-		spans, err := pb.ReadAll()
-		if err != nil {
-			t.Fatalf("Failed to read spans from Parquet block: %v", err)
-		}
+	if int64(len(spans)) != expectedSpans {
+		t.Errorf("Read %d spans, expected %d", len(spans), expectedSpans)
+	}
 
-		if int64(len(spans)) != expectedSpans {
-			t.Errorf("Read %d spans, expected %d", len(spans), expectedSpans)
+	// Verify basic span data integrity
+	for i, sp := range spans {
+		if sp.TraceID == "" {
+			t.Errorf("Span %d has empty TraceID", i)
 		}
-
-		// Verify basic span data integrity
-		for i, sp := range spans {
-			if sp.TraceID == "" {
-				t.Errorf("Span %d has empty TraceID", i)
-			}
-			if sp.SpanID == "" {
-				t.Errorf("Span %d has empty SpanID", i)
-			}
-			if sp.Name == "" {
-				t.Errorf("Span %d has empty Name", i)
-			}
-			if sp.ServiceName == "" {
-				t.Errorf("Span %d has empty ServiceName", i)
-			}
+		if sp.SpanID == "" {
+			t.Errorf("Span %d has empty SpanID", i)
 		}
-	} else {
-		// Arrow block - verify record count
-		records := blk.Records()
-		var totalRows int64
-		for _, record := range records {
-			totalRows += record.NumRows()
+		if sp.Name == "" {
+			t.Errorf("Span %d has empty Name", i)
 		}
-		if totalRows != expectedSpans {
-			t.Errorf("Arrow block has %d rows, expected %d", totalRows, expectedSpans)
+		if sp.ServiceName == "" {
+			t.Errorf("Span %d has empty ServiceName", i)
 		}
 	}
 }
@@ -647,19 +629,25 @@ func createTestBlockWithSpans(t *testing.T, baseDir string, level int, createdAt
 	if level == 0 {
 		err = block.FlushBlock(blockDir, meta, arrowStorage.GetRecords(), arrowStorage.Schema(), arrowStorage.GetIndex())
 	} else {
-		// For Parquet blocks, we need to extract spans from Arrow storage
-		// Extract all spans from Arrow records
-		spans := make([]*span.Span, 0, spanCount)
-		records := arrowStorage.GetRecords()
-		for _, record := range records {
-			for row := 0; row < int(record.NumRows()); row++ {
-				sp, err := extractSpanFromRecord(record, row)
-				if err != nil {
-					continue
-				}
-				spans = append(spans, sp)
-			}
+		// For Parquet blocks, create a temporary L0 block first, then read spans from it
+		tmpBlockDir := filepath.Join(baseDir, "tmp-"+blockID.String())
+		if err := block.FlushBlock(tmpBlockDir, meta, arrowStorage.GetRecords(), arrowStorage.Schema(), arrowStorage.GetIndex()); err != nil {
+			t.Fatalf("Failed to create temporary block: %v", err)
 		}
+
+		// Load the temporary block and read all spans
+		tmpBlock, err := block.LoadBlock(tmpBlockDir)
+		if err != nil {
+			t.Fatalf("Failed to load temporary block: %v", err)
+		}
+
+		spans, err := tmpBlock.ReadAll()
+		tmpBlock.Close()
+		if err != nil {
+			t.Fatalf("Failed to read spans from temporary block: %v", err)
+		}
+
+		// Write as Parquet with updated metadata for the correct level
 		err = block.WriteParquetBlock(blockDir, meta, spans, arrowStorage.GetIndex())
 	}
 
