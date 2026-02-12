@@ -195,10 +195,29 @@ func (bm *Manager) FlushHead(minWALSegment, maxWALSegment int) (*BlockMeta, erro
 		return nil, fmt.Errorf("failed to flush block: %w", err)
 	}
 
+	bm.logger.Info("flushed head block",
+		slog.String("block_id", meta.ULID.String()),
+		slog.Int64("span_count", meta.SpanCount),
+		slog.Int("level", meta.Level()))
+
+	// Reset head time tracking
+	bm.headMinTime = 0
+	bm.headMaxTime = 0
+
+	// NOTE: Block is NOT loaded here - caller should write events.arrow then call AddBlock()
+	return meta, nil
+}
+
+// AddFlushedBlock loads and adds a newly flushed block to the manager
+// Call this after FlushHead and writing any event files
+func (bm *Manager) AddFlushedBlock(blockDir string) error {
+	bm.mu.Lock()
+	defer bm.mu.Unlock()
+
 	// Load the newly created block
 	block, err := LoadBlock(blockDir)
 	if err != nil {
-		return nil, fmt.Errorf("failed to load flushed block: %w", err)
+		return fmt.Errorf("failed to load flushed block: %w", err)
 	}
 
 	// Add to persisted blocks
@@ -209,16 +228,7 @@ func (bm *Manager) FlushHead(minWALSegment, maxWALSegment int) (*BlockMeta, erro
 		return bm.persistedBlocks[i].Meta().MinTime < bm.persistedBlocks[j].Meta().MinTime
 	})
 
-	bm.logger.Info("flushed head block",
-		slog.String("block_id", meta.ULID.String()),
-		slog.Int64("span_count", meta.SpanCount),
-		slog.Int("level", meta.Level()))
-
-	// Reset head time tracking
-	bm.headMinTime = 0
-	bm.headMaxTime = 0
-
-	return meta, nil
+	return nil
 }
 
 // GetBlocks returns all persisted blocks

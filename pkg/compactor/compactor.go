@@ -2,6 +2,7 @@ package compactor
 
 import (
 	"fmt"
+	"log/slog"
 	"math/rand"
 	"path/filepath"
 	"sort"
@@ -95,6 +96,18 @@ func (c *Compactor) Compact(plan *CompactionPlan) (*block.BlockMeta, error) {
 		return nil, err
 	}
 
+	// Collect events from all source blocks
+	allEvents, err := c.collectEvents(plan.Blocks)
+	if err != nil {
+		return nil, err
+	}
+
+	// Collect links from all source blocks
+	allLinks, err := c.collectLinks(plan.Blocks)
+	if err != nil {
+		return nil, err
+	}
+
 	// Sort spans by start time
 	sort.Slice(allSpans, func(i, j int) bool {
 		return allSpans[i].StartTime.Before(allSpans[j].StartTime)
@@ -168,6 +181,28 @@ func (c *Compactor) Compact(plan *CompactionPlan) (*block.BlockMeta, error) {
 		return nil, fmt.Errorf("failed to write parquet block: %w", err)
 	}
 
+	// Write events to Parquet if any events were collected
+	if len(allEvents) > 0 {
+		slog.Default().Info("writing parquet events",
+			slog.String("block_dir", blockDir),
+			slog.Int("event_count", len(allEvents)))
+		if err := block.WriteParquetEvents(blockDir, allEvents); err != nil {
+			return nil, fmt.Errorf("failed to write parquet events: %w", err)
+		}
+		slog.Default().Info("successfully wrote parquet events file")
+	}
+
+	// Write links to Parquet if any links were collected
+	if len(allLinks) > 0 {
+		slog.Default().Info("writing parquet links",
+			slog.String("block_dir", blockDir),
+			slog.Int("link_count", len(allLinks)))
+		if err := block.WriteParquetLinks(blockDir, allLinks); err != nil {
+			return nil, fmt.Errorf("failed to write parquet links: %w", err)
+		}
+		slog.Default().Info("successfully wrote parquet links file")
+	}
+
 	return meta, nil
 }
 
@@ -196,6 +231,128 @@ func (c *Compactor) collectSpans(blocks []block.Block) ([]*span.Span, int64, int
 	}
 
 	return allSpans, minTime, maxTime, nil
+}
+
+// collectEvents collects all events from a list of blocks (Arrow or Parquet)
+func (c *Compactor) collectEvents(blocks []block.Block) ([]*span.SpanEvent, error) {
+	var allEvents []*span.SpanEvent
+
+	for _, blk := range blocks {
+		slog.Default().Info("processing block for events",
+			slog.String("block_dir", blk.Dir()),
+			slog.String("block_type", fmt.Sprintf("%T", blk)),
+			slog.Int("level", blk.Meta().Level()))
+
+		// Try to read events directly from ArrowBlock or ParquetBlock
+		switch b := blk.(type) {
+		case *block.ArrowBlock:
+			slog.Default().Info("matched ArrowBlock")
+			events, err := b.ReadAllEvents()
+			if err != nil {
+				slog.Default().Warn("failed to read events from Arrow block",
+					slog.String("block_dir", blk.Dir()),
+					slog.String("error", err.Error()))
+				continue
+			}
+			if events != nil && len(events) > 0 {
+				slog.Default().Info("collected events from Arrow block",
+					slog.String("block_dir", blk.Dir()),
+					slog.Int("event_count", len(events)))
+				allEvents = append(allEvents, events...)
+			} else {
+				slog.Default().Info("Arrow block has no events",
+					slog.String("block_dir", blk.Dir()))
+			}
+		case *block.ParquetBlock:
+			slog.Default().Info("matched ParquetBlock")
+			events, err := b.ReadAllEvents()
+			if err != nil {
+				slog.Default().Warn("failed to read events from Parquet block",
+					slog.String("block_dir", blk.Dir()),
+					slog.String("error", err.Error()))
+				continue
+			}
+			if events != nil && len(events) > 0 {
+				slog.Default().Info("collected events from Parquet block",
+					slog.String("block_dir", blk.Dir()),
+					slog.Int("event_count", len(events)))
+				allEvents = append(allEvents, events...)
+			} else {
+				slog.Default().Info("Parquet block has no events",
+					slog.String("block_dir", blk.Dir()))
+			}
+		default:
+			slog.Default().Warn("block type doesn't support events",
+				slog.String("block_dir", blk.Dir()),
+				slog.String("block_type", fmt.Sprintf("%T", blk)))
+		}
+	}
+
+	slog.Default().Info("total events collected for compaction",
+		slog.Int("total_events", len(allEvents)))
+
+	return allEvents, nil
+}
+
+// collectLinks collects all links from a list of blocks (Arrow or Parquet)
+func (c *Compactor) collectLinks(blocks []block.Block) ([]*span.SpanLink, error) {
+	var allLinks []*span.SpanLink
+
+	for _, blk := range blocks {
+		slog.Default().Info("processing block for links",
+			slog.String("block_dir", blk.Dir()),
+			slog.String("block_type", fmt.Sprintf("%T", blk)),
+			slog.Int("level", blk.Meta().Level()))
+
+		// Try to read links directly from ArrowBlock or ParquetBlock
+		switch b := blk.(type) {
+		case *block.ArrowBlock:
+			slog.Default().Info("matched ArrowBlock")
+			links, err := b.ReadAllLinks()
+			if err != nil {
+				slog.Default().Warn("failed to read links from Arrow block",
+					slog.String("block_dir", blk.Dir()),
+					slog.String("error", err.Error()))
+				continue
+			}
+			if links != nil && len(links) > 0 {
+				slog.Default().Info("collected links from Arrow block",
+					slog.String("block_dir", blk.Dir()),
+					slog.Int("link_count", len(links)))
+				allLinks = append(allLinks, links...)
+			} else {
+				slog.Default().Info("Arrow block has no links",
+					slog.String("block_dir", blk.Dir()))
+			}
+		case *block.ParquetBlock:
+			slog.Default().Info("matched ParquetBlock")
+			links, err := b.ReadAllLinks()
+			if err != nil {
+				slog.Default().Warn("failed to read links from Parquet block",
+					slog.String("block_dir", blk.Dir()),
+					slog.String("error", err.Error()))
+				continue
+			}
+			if links != nil && len(links) > 0 {
+				slog.Default().Info("collected links from Parquet block",
+					slog.String("block_dir", blk.Dir()),
+					slog.Int("link_count", len(links)))
+				allLinks = append(allLinks, links...)
+			} else {
+				slog.Default().Info("Parquet block has no links",
+					slog.String("block_dir", blk.Dir()))
+			}
+		default:
+			slog.Default().Warn("block type doesn't support links",
+				slog.String("block_dir", blk.Dir()),
+				slog.String("block_type", fmt.Sprintf("%T", blk)))
+		}
+	}
+
+	slog.Default().Info("total links collected for compaction",
+		slog.Int("total_links", len(allLinks)))
+
+	return allLinks, nil
 }
 
 // buildIndex builds an index for spans

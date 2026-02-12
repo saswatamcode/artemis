@@ -189,6 +189,22 @@ func (s *Server) handleGetTrace(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Load events for all spans in the trace
+	for _, sp := range result.Spans {
+		if sp != nil {
+			events, err := s.db.GetEventsForSpan(sp.SpanID)
+			if err != nil {
+				s.logger.Warn("failed to load events for span",
+					slog.String("span_id", sp.SpanID),
+					slog.String("error", err.Error()))
+				// Continue without events rather than failing the entire request
+				sp.Events = nil
+			} else {
+				sp.Events = events
+			}
+		}
+	}
+
 	resourceSpansList := ConvertSpansToOTLP(result.Spans)
 	if len(resourceSpansList) == 0 {
 		http.Error(w, "failed to convert trace", http.StatusInternalServerError)

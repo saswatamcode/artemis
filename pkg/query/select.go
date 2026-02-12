@@ -17,6 +17,13 @@ type SelectResult struct {
 	Spans []*span.Span
 }
 
+// QueryOptions holds options for querying spans
+type QueryOptions struct {
+	// IncludeEvents controls whether span events should be loaded
+	// If true, the Events field on each span will be populated
+	IncludeEvents bool
+}
+
 // TimeRange specifies a time range for queries
 type TimeRange struct {
 	Start time.Time

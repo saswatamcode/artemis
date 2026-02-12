@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/apache/arrow-go/v18/arrow/array"
 	"github.com/oklog/ulid/v2"
 
 	"github.com/saswatamcode/artemis/pkg/block"
@@ -661,4 +662,334 @@ func createTestBlockWithSpans(t *testing.T, baseDir string, level int, createdAt
 func fileExists(path string) bool {
 	_, err := filepath.Glob(path)
 	return err == nil
+}
+
+// TestCompactor_CompactWithEvents tests that events are preserved during compaction
+func TestCompactor_CompactWithEvents(t *testing.T) {
+	tmpDir := t.TempDir()
+	c := NewCompactor(tmpDir)
+
+	// Create two L0 blocks with spans and events
+	now := time.Now().Add(-15 * time.Minute)
+	blockDir1 := createTestBlockWithSpansAndEvents(t, tmpDir, 0, now, 5, 3)
+	blockDir2 := createTestBlockWithSpansAndEvents(t, tmpDir, 0, now.Add(1*time.Minute), 5, 3)
+
+	blk1, err := block.LoadBlock(blockDir1)
+	if err != nil {
+		t.Fatalf("Failed to create test block 1: %v", err)
+	}
+	defer blk1.Close()
+
+	blk2, err := block.LoadBlock(blockDir2)
+	if err != nil {
+		t.Fatalf("Failed to create test block 2: %v", err)
+	}
+	defer blk2.Close()
+
+	// Verify source blocks have events
+	verifyBlockHasEvents(t, blk1, 15) // 5 spans × 3 events each
+	verifyBlockHasEvents(t, blk2, 15)
+
+	// Create compaction plan
+	plan := &CompactionPlan{
+		Level:   0,
+		Blocks:  []block.Block{blk1, blk2},
+		Sources: []ulid.ULID{blk1.Meta().ULID, blk2.Meta().ULID},
+	}
+
+	// Compact
+	meta, err := c.Compact(plan)
+	if err != nil {
+		t.Fatalf("Compact() error = %v", err)
+	}
+
+	// Verify the compacted block was created
+	blockDir := filepath.Join(tmpDir, meta.ULID.String())
+	parquetPath := filepath.Join(blockDir, "spans.parquet")
+	if !fileExists(parquetPath) {
+		t.Error("spans.parquet should exist")
+	}
+
+	// Verify events.parquet was created
+	eventsParquetPath := filepath.Join(blockDir, "events.parquet")
+	if !fileExists(eventsParquetPath) {
+		t.Error("events.parquet should exist for compacted block with events")
+	}
+
+	// Load the compacted block
+	compactedBlk, err := block.LoadBlock(blockDir)
+	if err != nil {
+		t.Fatalf("Failed to load compacted block: %v", err)
+	}
+	defer compactedBlk.Close()
+
+	// Verify all 10 spans are present
+	verifyBlockData(t, compactedBlk, 10)
+
+	// Verify all 30 events are present (10 spans × 3 events each)
+	verifyBlockHasEvents(t, compactedBlk, 30)
+
+	t.Log("✓ Events successfully preserved during L0 → L1 compaction")
+}
+
+// TestCompactor_CompactMultipleLevelsWithEvents tests events through multiple compaction levels
+func TestCompactor_CompactMultipleLevelsWithEvents(t *testing.T) {
+	tmpDir := t.TempDir()
+	c := NewCompactor(tmpDir)
+
+	baseTime := time.Now().Add(-24 * time.Hour)
+	spansPerBlock := 10
+	eventsPerSpan := 2
+
+	// Create 4 L0 blocks with events
+	t.Log("Creating L0 blocks with events...")
+	l0Blocks := make([]block.Block, 4)
+	for i := range 4 {
+		blockTime := baseTime.Add(time.Duration(i) * time.Hour)
+		blockDir := createTestBlockWithSpansAndEvents(t, tmpDir, 0, blockTime, spansPerBlock, eventsPerSpan)
+		blk, err := block.LoadBlock(blockDir)
+		if err != nil {
+			t.Fatalf("Failed to load L0 block %d: %v", i, err)
+		}
+		defer blk.Close()
+		l0Blocks[i] = blk
+
+		// Verify events in L0 block
+		expectedEvents := spansPerBlock * eventsPerSpan
+		verifyBlockHasEvents(t, blk, expectedEvents)
+	}
+
+	totalSpans := int64(spansPerBlock * 4)
+	totalEvents := totalSpans * int64(eventsPerSpan)
+
+	// Compact L0 → L1
+	t.Log("Compacting L0 → L1...")
+	plan1 := &CompactionPlan{
+		Level:   0,
+		Blocks:  l0Blocks[:2],
+		Sources: extractULIDs(l0Blocks[:2]),
+	}
+	meta1, err := c.Compact(plan1)
+	if err != nil {
+		t.Fatalf("Failed to compact L0 → L1 (first): %v", err)
+	}
+
+	plan2 := &CompactionPlan{
+		Level:   0,
+		Blocks:  l0Blocks[2:],
+		Sources: extractULIDs(l0Blocks[2:]),
+	}
+	meta2, err := c.Compact(plan2)
+	if err != nil {
+		t.Fatalf("Failed to compact L0 → L1 (second): %v", err)
+	}
+
+	// Load L1 blocks
+	l1Blk1, err := block.LoadBlock(filepath.Join(tmpDir, meta1.ULID.String()))
+	if err != nil {
+		t.Fatalf("Failed to load L1 block 1: %v", err)
+	}
+	defer l1Blk1.Close()
+
+	l1Blk2, err := block.LoadBlock(filepath.Join(tmpDir, meta2.ULID.String()))
+	if err != nil {
+		t.Fatalf("Failed to load L1 block 2: %v", err)
+	}
+	defer l1Blk2.Close()
+
+	// Verify events in L1 blocks
+	verifyBlockHasEvents(t, l1Blk1, spansPerBlock*2*eventsPerSpan)
+	verifyBlockHasEvents(t, l1Blk2, spansPerBlock*2*eventsPerSpan)
+
+	// Compact L1 → L2
+	t.Log("Compacting L1 → L2...")
+	plan3 := &CompactionPlan{
+		Level:   1,
+		Blocks:  []block.Block{l1Blk1, l1Blk2},
+		Sources: []ulid.ULID{meta1.ULID, meta2.ULID},
+	}
+	meta3, err := c.Compact(plan3)
+	if err != nil {
+		t.Fatalf("Failed to compact L1 → L2: %v", err)
+	}
+
+	// Load L2 block
+	l2Blk, err := block.LoadBlock(filepath.Join(tmpDir, meta3.ULID.String()))
+	if err != nil {
+		t.Fatalf("Failed to load L2 block: %v", err)
+	}
+	defer l2Blk.Close()
+
+	// Verify all events survived through L0 → L1 → L2
+	verifyBlockHasEvents(t, l2Blk, int(totalEvents))
+
+	t.Logf("✓ All %d events preserved through L0 → L1 → L2 compaction", totalEvents)
+}
+
+// createTestBlockWithSpansAndEvents creates a test block with spans and events
+func createTestBlockWithSpansAndEvents(t *testing.T, baseDir string, level int, createdAt time.Time, spanCount int, eventsPerSpan int) string {
+	t.Helper()
+
+	arrowStorage := storage.NewArrowStorage()
+	eventStorage := storage.NewArrowEventStorage()
+	defer arrowStorage.Release()
+	defer eventStorage.Release()
+
+	// Add test spans and events
+	now := time.Now()
+	for i := range spanCount {
+		spanID := ulid.Make().String()
+		sp := &span.Span{
+			TraceID:     "trace-1",
+			SpanID:      spanID,
+			Name:        "test-operation",
+			StartTime:   now.Add(time.Duration(i) * time.Millisecond),
+			EndTime:     now.Add(time.Duration(i+1) * time.Millisecond),
+			ServiceName: "test-service",
+			Tags: map[string]string{
+				"test": "value",
+			},
+		}
+		arrowStorage.AddSpan(sp)
+
+		// Add events for this span
+		for j := range eventsPerSpan {
+			evt := &span.SpanEvent{
+				SpanID:    spanID,
+				Name:      "test-event",
+				Timestamp: now.Add(time.Duration(i*1000+j) * time.Microsecond),
+				Attributes: map[string]string{
+					"event_index": ulid.Make().String(),
+				},
+			}
+			eventStorage.AddEvent(evt)
+		}
+	}
+	arrowStorage.Flush()
+	eventStorage.Flush()
+
+	// Create block metadata
+	blockID := ulid.Make()
+	var compactionMeta *block.CompactionMeta
+	if level > 0 {
+		compactionMeta = &block.CompactionMeta{
+			Level:       level,
+			Sources:     []ulid.ULID{},
+			CompactedAt: createdAt,
+		}
+	}
+
+	meta := &block.BlockMeta{
+		ULID:       blockID,
+		MinTime:    now.Add(-1 * time.Hour).UnixNano(),
+		MaxTime:    now.UnixNano(),
+		SpanCount:  int64(spanCount),
+		Version:    1,
+		CreatedAt:  createdAt,
+		Compaction: compactionMeta,
+	}
+
+	blockDir := filepath.Join(baseDir, blockID.String())
+
+	// Write block (L0 = Arrow, L1+ = Parquet)
+	if level == 0 {
+		// Write Arrow IPC block
+		if err := block.FlushBlock(blockDir, meta, arrowStorage.GetRecords(), arrowStorage.Schema(), arrowStorage.GetIndex()); err != nil {
+			t.Fatalf("Failed to flush Arrow block: %v", err)
+		}
+		// Write events
+		if err := block.FlushEventsBlock(blockDir, eventStorage.GetRecords(), eventStorage.Schema()); err != nil {
+			t.Fatalf("Failed to flush events: %v", err)
+		}
+	} else {
+		// For Parquet blocks, we need to read spans first
+		tmpBlockDir := filepath.Join(baseDir, "tmp-"+blockID.String())
+		if err := block.FlushBlock(tmpBlockDir, meta, arrowStorage.GetRecords(), arrowStorage.Schema(), arrowStorage.GetIndex()); err != nil {
+			t.Fatalf("Failed to create temporary block: %v", err)
+		}
+
+		tmpBlock, err := block.LoadBlock(tmpBlockDir)
+		if err != nil {
+			t.Fatalf("Failed to load temporary block: %v", err)
+		}
+
+		spans, err := tmpBlock.ReadAll()
+		tmpBlock.Close()
+		if err != nil {
+			t.Fatalf("Failed to read spans: %v", err)
+		}
+
+		// Write Parquet block
+		if err := block.WriteParquetBlock(blockDir, meta, spans, arrowStorage.GetIndex()); err != nil {
+			t.Fatalf("Failed to write Parquet block: %v", err)
+		}
+
+		// Get events and write them
+		var events []*span.SpanEvent
+		for _, rec := range eventStorage.GetRecords() {
+			for row := 0; row < int(rec.NumRows()); row++ {
+				// Extract event from Arrow record
+				evt := &span.SpanEvent{
+					SpanID:     rec.Column(0).(*array.String).Value(row),
+					Name:       rec.Column(1).(*array.String).Value(row),
+					Timestamp:  time.Unix(0, rec.Column(2).(*array.Int64).Value(row)),
+					Attributes: make(map[string]string),
+				}
+				// Extract attributes map
+				attrsCol := rec.Column(3).(*array.Map)
+				if !attrsCol.IsNull(row) {
+					offsets := attrsCol.Offsets()
+					offset := offsets[row]
+					nextOffset := offsets[row+1]
+					keys := attrsCol.Keys().(*array.String)
+					items := attrsCol.Items().(*array.String)
+					for i := int(offset); i < int(nextOffset); i++ {
+						evt.Attributes[keys.Value(i)] = items.Value(i)
+					}
+				}
+				events = append(events, evt)
+			}
+		}
+
+		if err := block.WriteParquetEvents(blockDir, events); err != nil {
+			t.Fatalf("Failed to write Parquet events: %v", err)
+		}
+	}
+
+	return blockDir
+}
+
+// verifyBlockHasEvents verifies that a block has the expected number of events
+func verifyBlockHasEvents(t *testing.T, blk block.Block, expectedEvents int) {
+	t.Helper()
+
+	// Use type assertion to access event methods
+	type eventGetter interface {
+		GetEventsBySpanID(spanID string) ([]*span.SpanEvent, error)
+	}
+
+	eg, ok := blk.(eventGetter)
+	if !ok {
+		t.Fatal("Block does not support GetEventsBySpanID()")
+	}
+
+	// Read all spans to get their IDs
+	spans, err := blk.ReadAll()
+	if err != nil {
+		t.Fatalf("Failed to read spans: %v", err)
+	}
+
+	// Count all events
+	totalEvents := 0
+	for _, sp := range spans {
+		events, err := eg.GetEventsBySpanID(sp.SpanID)
+		if err != nil {
+			t.Fatalf("Failed to get events for span %s: %v", sp.SpanID, err)
+		}
+		totalEvents += len(events)
+	}
+
+	if totalEvents != expectedEvents {
+		t.Errorf("Block has %d events, expected %d", totalEvents, expectedEvents)
+	}
 }

@@ -2,6 +2,7 @@ package query
 
 import (
 	"github.com/saswatamcode/artemis/pkg/block"
+	"github.com/saswatamcode/artemis/pkg/span"
 )
 
 // Querier provides an interface for querying spans from storage
@@ -9,11 +10,30 @@ import (
 type Querier interface {
 	// Select queries spans using matchers
 	// Returns all spans that match the given matchers
+	// Events field is not populated (nil/empty)
 	Select(matchers ...*Matcher) (*SelectResult, error)
 
 	// SelectWithTimeRange queries spans using matchers within a time range
 	// Time range filtering provides significant performance benefits by skipping irrelevant blocks
+	// Events field is not populated (nil/empty)
 	SelectWithTimeRange(timeRange *TimeRange, matchers ...*Matcher) (*SelectResult, error)
+
+	// SelectWithOptions queries spans with custom options
+	// Use QueryOptions.IncludeEvents to populate the Events field
+	SelectWithOptions(opts *QueryOptions, matchers ...*Matcher) (*SelectResult, error)
+
+	// SelectWithTimeRangeAndOptions queries spans with time range and custom options
+	SelectWithTimeRangeAndOptions(timeRange *TimeRange, opts *QueryOptions, matchers ...*Matcher) (*SelectResult, error)
+}
+
+// EventQuerier provides methods for querying span events separately
+type EventQuerier interface {
+	// GetEventsForSpan retrieves all events for a specific span
+	GetEventsForSpan(spanID string) ([]span.SpanEvent, error)
+
+	// GetEventsForTrace retrieves all events for all spans in a trace
+	// Returns a map of spanID -> events
+	GetEventsForTrace(traceID string) (map[string][]span.SpanEvent, error)
 }
 
 // BlockQuerier queries spans across all blocks uniformly through the Block interface
@@ -70,4 +90,18 @@ func (q *BlockQuerier) Select(matchers ...*Matcher) (*SelectResult, error) {
 // Queries persisted blocks and head block in parallel using FanoutQuerier
 func (q *BlockQuerier) SelectWithTimeRange(timeRange *TimeRange, matchers ...*Matcher) (*SelectResult, error) {
 	return q.fanoutQuerier.SelectWithTimeRange(timeRange, matchers...)
+}
+
+// SelectWithOptions queries spans across all blocks with custom options
+// Use QueryOptions.IncludeEvents to populate the Events field on returned spans
+// Queries persisted blocks and head block in parallel using FanoutQuerier
+func (q *BlockQuerier) SelectWithOptions(opts *QueryOptions, matchers ...*Matcher) (*SelectResult, error) {
+	return q.fanoutQuerier.SelectWithOptions(opts, matchers...)
+}
+
+// SelectWithTimeRangeAndOptions queries spans across all blocks with time range and custom options
+// Use QueryOptions.IncludeEvents to populate the Events field on returned spans
+// Queries persisted blocks and head block in parallel using FanoutQuerier
+func (q *BlockQuerier) SelectWithTimeRangeAndOptions(timeRange *TimeRange, opts *QueryOptions, matchers ...*Matcher) (*SelectResult, error) {
+	return q.fanoutQuerier.SelectWithTimeRangeAndOptions(timeRange, opts, matchers...)
 }

@@ -26,8 +26,10 @@ const (
 type RecordType byte
 
 const (
-	RecordTypeSpan RecordType = 1
-	RecordTypeFull RecordType = 2 // For full records (future use)
+	RecordTypeSpan  RecordType = 1
+	RecordTypeEvent RecordType = 2 // Span events
+	RecordTypeLink  RecordType = 3 // Span links
+	RecordTypeFull  RecordType = 4 // For full records (future use)
 )
 
 // WAL implements a Write-Ahead Log for spans
@@ -128,6 +130,146 @@ func (w *WAL) WriteSpan(s *span.Span) (int, error) {
 	return segmentIndex, nil
 }
 
+// WriteEvent writes a span event to the WAL and returns the segment index it was written to
+func (w *WAL) WriteEvent(e *span.SpanEvent) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	data, err := json.Marshal(e)
+	if err != nil {
+		return 0, fmt.Errorf("failed to marshal event: %w", err)
+	}
+
+	// Check if we need to rotate to a new segment
+	if w.currentSize+int64(len(data))+recordHeaderSize > w.segmentSize {
+		if err := w.rotateSegment(); err != nil {
+			return 0, err
+		}
+	}
+
+	segmentIndex := w.segmentIndex
+
+	if err := w.writeRecord(RecordTypeEvent, data); err != nil {
+		return 0, err
+	}
+
+	if err := w.writer.Flush(); err != nil {
+		return 0, err
+	}
+
+	return segmentIndex, nil
+}
+
+// WriteEvents writes multiple span events to the WAL and returns the segment index
+// More efficient than calling WriteEvent multiple times as it batches the writes
+func (w *WAL) WriteEvents(events []*span.SpanEvent) (int, error) {
+	if len(events) == 0 {
+		return w.SegmentIndex(), nil
+	}
+
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	var segmentIndex int
+
+	for _, e := range events {
+		data, err := json.Marshal(e)
+		if err != nil {
+			return 0, fmt.Errorf("failed to marshal event: %w", err)
+		}
+
+		// Check if we need to rotate to a new segment
+		if w.currentSize+int64(len(data))+recordHeaderSize > w.segmentSize {
+			if err := w.rotateSegment(); err != nil {
+				return 0, err
+			}
+		}
+
+		// Capture the segment index (will be the latest after all rotations)
+		segmentIndex = w.segmentIndex
+
+		if err := w.writeRecord(RecordTypeEvent, data); err != nil {
+			return 0, err
+		}
+	}
+
+	if err := w.writer.Flush(); err != nil {
+		return 0, err
+	}
+
+	return segmentIndex, nil
+}
+
+// WriteLink writes a span link to the WAL and returns the segment index it was written to
+func (w *WAL) WriteLink(l *span.SpanLink) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	data, err := json.Marshal(l)
+	if err != nil {
+		return 0, fmt.Errorf("failed to marshal link: %w", err)
+	}
+
+	// Check if we need to rotate to a new segment
+	if w.currentSize+int64(len(data))+recordHeaderSize > w.segmentSize {
+		if err := w.rotateSegment(); err != nil {
+			return 0, err
+		}
+	}
+
+	segmentIndex := w.segmentIndex
+
+	if err := w.writeRecord(RecordTypeLink, data); err != nil {
+		return 0, err
+	}
+
+	if err := w.writer.Flush(); err != nil {
+		return 0, err
+	}
+
+	return segmentIndex, nil
+}
+
+// WriteLinks writes multiple span links to the WAL and returns the segment index
+// More efficient than calling WriteLink multiple times as it batches the writes
+func (w *WAL) WriteLinks(links []*span.SpanLink) (int, error) {
+	if len(links) == 0 {
+		return w.SegmentIndex(), nil
+	}
+
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	var segmentIndex int
+
+	for _, l := range links {
+		data, err := json.Marshal(l)
+		if err != nil {
+			return 0, fmt.Errorf("failed to marshal link: %w", err)
+		}
+
+		// Check if we need to rotate to a new segment
+		if w.currentSize+int64(len(data))+recordHeaderSize > w.segmentSize {
+			if err := w.rotateSegment(); err != nil {
+				return 0, err
+			}
+		}
+
+		// Capture the segment index (will be the latest after all rotations)
+		segmentIndex = w.segmentIndex
+
+		if err := w.writeRecord(RecordTypeLink, data); err != nil {
+			return 0, err
+		}
+	}
+
+	if err := w.writer.Flush(); err != nil {
+		return 0, err
+	}
+
+	return segmentIndex, nil
+}
+
 // writeRecord writes a single record to the WAL
 func (w *WAL) writeRecord(typ RecordType, data []byte) error {
 	crc := crc32.ChecksumIEEE(data)
@@ -210,7 +352,7 @@ func (w *WAL) SegmentIndex() int {
 	return w.segmentIndex
 }
 
-// Reader reads spans from WAL files
+// Reader reads spans and events from WAL files
 type Reader struct {
 	dir    string
 	logger *slog.Logger
@@ -243,7 +385,48 @@ func (r *Reader) ReadAll(callback func(*span.Span) error) error {
 	return nil
 }
 
-// readSegment reads a single WAL segment
+// ReadAllWithEvents reads all spans and events from all WAL segments
+// Provides separate callbacks for spans and events
+func (r *Reader) ReadAllWithEvents(
+	spanCallback func(*span.Span) error,
+	eventCallback func(*span.SpanEvent) error,
+) error {
+	files, err := filepath.Glob(filepath.Join(r.dir, "*.wal"))
+	if err != nil {
+		return err
+	}
+
+	for _, file := range files {
+		if err := r.readSegmentWithEvents(file, spanCallback, eventCallback); err != nil {
+			return fmt.Errorf("failed to read segment %s: %w", file, err)
+		}
+	}
+
+	return nil
+}
+
+// ReadAllWithEventsAndLinks reads all spans, events, and links from all WAL segments
+// Provides separate callbacks for spans, events, and links
+func (r *Reader) ReadAllWithEventsAndLinks(
+	spanCallback func(*span.Span) error,
+	eventCallback func(*span.SpanEvent) error,
+	linkCallback func(*span.SpanLink) error,
+) error {
+	files, err := filepath.Glob(filepath.Join(r.dir, "*.wal"))
+	if err != nil {
+		return err
+	}
+
+	for _, file := range files {
+		if err := r.readSegmentWithAll(file, spanCallback, eventCallback, linkCallback); err != nil {
+			return fmt.Errorf("failed to read segment %s: %w", file, err)
+		}
+	}
+
+	return nil
+}
+
+// readSegment reads a single WAL segment (spans only, for backward compatibility)
 func (r *Reader) readSegment(filename string, callback func(*span.Span) error) error {
 	f, err := os.Open(filename)
 	if err != nil {
@@ -297,10 +480,182 @@ func (r *Reader) readSegment(filename string, callback func(*span.Span) error) e
 			if err := callback(&s); err != nil {
 				return err
 			}
+		case RecordTypeEvent:
+			// Skip events in span-only mode
+			continue
 		default:
 			// Return error instead of panic for unknown record types
 			// This allows the replay logic to handle the error gracefully (skip or stop)
 			// instead of crashing the entire database
+			return fmt.Errorf("unknown record type: %d", typ)
+		}
+	}
+}
+
+// readSegmentWithEvents reads a single WAL segment with both spans and events
+func (r *Reader) readSegmentWithEvents(
+	filename string,
+	spanCallback func(*span.Span) error,
+	eventCallback func(*span.SpanEvent) error,
+) error {
+	f, err := os.Open(filename)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	reader := bufio.NewReader(f)
+
+	for {
+		// Read CRC (4 bytes)
+		var crc uint32
+		if err := binary.Read(reader, binary.BigEndian, &crc); err != nil {
+			if err == io.EOF {
+				return nil
+			}
+			return err
+		}
+
+		// Read length (4 bytes)
+		var length uint32
+		if err := binary.Read(reader, binary.BigEndian, &length); err != nil {
+			return err
+		}
+
+		// Read type (1 byte)
+		typ, err := reader.ReadByte()
+		if err != nil {
+			return err
+		}
+
+		// Read data
+		data := make([]byte, length)
+		if _, err := io.ReadFull(reader, data); err != nil {
+			return err
+		}
+
+		// Verify CRC
+		if crc32.ChecksumIEEE(data) != crc {
+			return fmt.Errorf("CRC mismatch")
+		}
+
+		// Process record based on type
+		switch RecordType(typ) {
+		case RecordTypeSpan:
+			if spanCallback != nil {
+				var s span.Span
+				if err := json.Unmarshal(data, &s); err != nil {
+					return fmt.Errorf("failed to unmarshal span: %w", err)
+				}
+
+				if err := spanCallback(&s); err != nil {
+					return err
+				}
+			}
+		case RecordTypeEvent:
+			if eventCallback != nil {
+				var e span.SpanEvent
+				if err := json.Unmarshal(data, &e); err != nil {
+					return fmt.Errorf("failed to unmarshal event: %w", err)
+				}
+
+				if err := eventCallback(&e); err != nil {
+					return err
+				}
+			}
+		case RecordTypeLink:
+			// Skip links in events-only mode (backward compatibility)
+			continue
+		default:
+			return fmt.Errorf("unknown record type: %d", typ)
+		}
+	}
+}
+
+// readSegmentWithAll reads a single WAL segment with spans, events, and links
+func (r *Reader) readSegmentWithAll(
+	filename string,
+	spanCallback func(*span.Span) error,
+	eventCallback func(*span.SpanEvent) error,
+	linkCallback func(*span.SpanLink) error,
+) error {
+	f, err := os.Open(filename)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	reader := bufio.NewReader(f)
+
+	for {
+		// Read CRC (4 bytes)
+		var crc uint32
+		if err := binary.Read(reader, binary.BigEndian, &crc); err != nil {
+			if err == io.EOF {
+				return nil
+			}
+			return err
+		}
+
+		// Read length (4 bytes)
+		var length uint32
+		if err := binary.Read(reader, binary.BigEndian, &length); err != nil {
+			return err
+		}
+
+		// Read type (1 byte)
+		typ, err := reader.ReadByte()
+		if err != nil {
+			return err
+		}
+
+		// Read data
+		data := make([]byte, length)
+		if _, err := io.ReadFull(reader, data); err != nil {
+			return err
+		}
+
+		// Verify CRC
+		if crc32.ChecksumIEEE(data) != crc {
+			return fmt.Errorf("CRC mismatch")
+		}
+
+		// Process record based on type
+		switch RecordType(typ) {
+		case RecordTypeSpan:
+			if spanCallback != nil {
+				var s span.Span
+				if err := json.Unmarshal(data, &s); err != nil {
+					return fmt.Errorf("failed to unmarshal span: %w", err)
+				}
+
+				if err := spanCallback(&s); err != nil {
+					return err
+				}
+			}
+		case RecordTypeEvent:
+			if eventCallback != nil {
+				var e span.SpanEvent
+				if err := json.Unmarshal(data, &e); err != nil {
+					return fmt.Errorf("failed to unmarshal event: %w", err)
+				}
+
+				if err := eventCallback(&e); err != nil {
+					return err
+				}
+			}
+		case RecordTypeLink:
+			if linkCallback != nil {
+				var l span.SpanLink
+				if err := json.Unmarshal(data, &l); err != nil {
+					return fmt.Errorf("failed to unmarshal link: %w", err)
+				}
+
+				if err := linkCallback(&l); err != nil {
+					return err
+				}
+			}
+		default:
 			return fmt.Errorf("unknown record type: %d", typ)
 		}
 	}

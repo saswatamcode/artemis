@@ -42,12 +42,16 @@ const (
 // - HeadBlock: In-memory, mutable, active ingestion
 // - ParquetBlock: Parquet format, L1+, better compression, page-level reads
 type ArrowBlock struct {
-	meta    *BlockMeta
-	dir     string
-	records []arrow.RecordBatch
-	mem     memory.Allocator
-	schema  *arrow.Schema
-	index   *index.Index
+	meta         *BlockMeta
+	dir          string
+	records      []arrow.RecordBatch
+	mem          memory.Allocator
+	schema       *arrow.Schema
+	index        *index.Index
+	eventRecords []arrow.RecordBatch // Event records (optional)
+	eventSchema  *arrow.Schema       // Event schema (optional)
+	linkRecords  []arrow.RecordBatch // Link records (optional)
+	linkSchema   *arrow.Schema       // Link schema (optional)
 }
 
 // NewArrowBlock creates a new Arrow block from disk
@@ -71,6 +75,42 @@ func NewArrowBlock(dir string) (*ArrowBlock, error) {
 
 	if err := ab.loadRecords(); err != nil {
 		return nil, fmt.Errorf("failed to load records: %w", err)
+	}
+
+	// Load event records if they exist
+	if err := ab.loadEventRecords(); err != nil {
+		// If events file exists but can't be read, that's a real error
+		return nil, fmt.Errorf("failed to load event records: %w", err)
+	}
+
+	if ab.eventRecords != nil && len(ab.eventRecords) > 0 {
+		// Count total events
+		totalEvents := int64(0)
+		for _, rec := range ab.eventRecords {
+			totalEvents += rec.NumRows()
+		}
+		slog.Default().Info("loaded event records for Arrow block",
+			slog.String("block_dir", dir),
+			slog.Int("num_records", len(ab.eventRecords)),
+			slog.Int64("total_events", totalEvents))
+	}
+
+	// Load link records if they exist
+	if err := ab.loadLinkRecords(); err != nil {
+		// If links file exists but can't be read, that's a real error
+		return nil, fmt.Errorf("failed to load link records: %w", err)
+	}
+
+	if ab.linkRecords != nil && len(ab.linkRecords) > 0 {
+		// Count total links
+		totalLinks := int64(0)
+		for _, rec := range ab.linkRecords {
+			totalLinks += rec.NumRows()
+		}
+		slog.Default().Info("loaded link records for Arrow block",
+			slog.String("block_dir", dir),
+			slog.Int("num_records", len(ab.linkRecords)),
+			slog.Int64("total_links", totalLinks))
 	}
 
 	// Load index if it exists
@@ -117,6 +157,28 @@ func (ab *ArrowBlock) loadRecords() error {
 	}
 
 	ab.records = records
+	return nil
+}
+
+// loadEventRecords loads event records from the events IPC file if it exists
+func (ab *ArrowBlock) loadEventRecords() error {
+	eventRecords, eventSchema, err := loadEventRecords(ab.dir, ab.mem)
+	if err != nil {
+		return err
+	}
+	ab.eventRecords = eventRecords
+	ab.eventSchema = eventSchema
+	return nil
+}
+
+// loadLinkRecords loads link records from the links IPC file if it exists
+func (ab *ArrowBlock) loadLinkRecords() error {
+	linkRecords, linkSchema, err := loadLinkRecords(ab.dir, ab.mem)
+	if err != nil {
+		return err
+	}
+	ab.linkRecords = linkRecords
+	ab.linkSchema = linkSchema
 	return nil
 }
 
@@ -177,6 +239,16 @@ func (ab *ArrowBlock) Close() error {
 		rec.Release()
 	}
 	ab.records = nil
+
+	for _, rec := range ab.eventRecords {
+		rec.Release()
+	}
+	ab.eventRecords = nil
+
+	for _, rec := range ab.linkRecords {
+		rec.Release()
+	}
+	ab.linkRecords = nil
 	return nil
 }
 
@@ -493,6 +565,68 @@ func fsyncDir(dir string) error {
 	}
 	defer d.Close()
 	return d.Sync()
+}
+
+// GetEventsBySpanID retrieves all events for a given span ID from this block
+func (ab *ArrowBlock) GetEventsBySpanID(spanID string) ([]*span.SpanEvent, error) {
+	if ab.eventRecords == nil || len(ab.eventRecords) == 0 {
+		return nil, nil // No events in this block
+	}
+	return GetEventsBySpanIDFromArrow(ab.eventRecords, spanID)
+}
+
+// HasEvents returns true if the block has event records loaded
+func (ab *ArrowBlock) HasEvents() bool {
+	return ab.eventRecords != nil && len(ab.eventRecords) > 0
+}
+
+// EventRecords returns all event records in this block
+func (ab *ArrowBlock) EventRecords() []arrow.RecordBatch {
+	return ab.eventRecords
+}
+
+// ReadAllEvents reads all events from this block
+func (ab *ArrowBlock) ReadAllEvents() ([]*span.SpanEvent, error) {
+	if ab.eventRecords == nil || len(ab.eventRecords) == 0 {
+		return nil, nil // No events in this block
+	}
+	return ReadAllEventsFromArrow(ab.eventRecords)
+}
+
+// EventSchema returns the event schema
+func (ab *ArrowBlock) EventSchema() *arrow.Schema {
+	return ab.eventSchema
+}
+
+// GetLinksBySpanID retrieves all links for a given span ID from this block
+func (ab *ArrowBlock) GetLinksBySpanID(spanID string) ([]*span.SpanLink, error) {
+	if ab.linkRecords == nil || len(ab.linkRecords) == 0 {
+		return nil, nil // No links in this block
+	}
+	return GetLinksBySpanIDFromArrow(ab.linkRecords, spanID)
+}
+
+// HasLinks returns true if the block has link records loaded
+func (ab *ArrowBlock) HasLinks() bool {
+	return ab.linkRecords != nil && len(ab.linkRecords) > 0
+}
+
+// LinkRecords returns all link records in this block
+func (ab *ArrowBlock) LinkRecords() []arrow.RecordBatch {
+	return ab.linkRecords
+}
+
+// ReadAllLinks reads all links from this block
+func (ab *ArrowBlock) ReadAllLinks() ([]*span.SpanLink, error) {
+	if ab.linkRecords == nil || len(ab.linkRecords) == 0 {
+		return nil, nil // No links in this block
+	}
+	return ReadAllLinksFromArrow(ab.linkRecords)
+}
+
+// LinkSchema returns the link schema
+func (ab *ArrowBlock) LinkSchema() *arrow.Schema {
+	return ab.linkSchema
 }
 
 // DeleteBlock deletes a block directory and all its contents

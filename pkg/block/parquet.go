@@ -568,6 +568,26 @@ func parquetSpanToSpan(ps *ParquetSpan) *span.Span {
 	}
 }
 
+// GetEventsBySpanID retrieves all events for a given span ID from this block
+func (pb *ParquetBlock) GetEventsBySpanID(spanID string) ([]*span.SpanEvent, error) {
+	return GetEventsBySpanIDFromParquet(pb.dir, spanID)
+}
+
+// ReadAllEvents reads all events from this block
+func (pb *ParquetBlock) ReadAllEvents() ([]*span.SpanEvent, error) {
+	return ReadParquetEvents(pb.dir)
+}
+
+// GetLinksBySpanID retrieves all links for a given span ID from this block
+func (pb *ParquetBlock) GetLinksBySpanID(spanID string) ([]*span.SpanLink, error) {
+	return GetLinksBySpanIDFromParquet(pb.dir, spanID)
+}
+
+// ReadAllLinks reads all links from this block
+func (pb *ParquetBlock) ReadAllLinks() ([]*span.SpanLink, error) {
+	return ReadParquetLinks(pb.dir)
+}
+
 // WriteParquetBlock writes spans to a Parquet file with optimizations
 // Uses atomic write with temporary directory to prevent corruption
 func WriteParquetBlock(dir string, meta *BlockMeta, spans []*span.Span, idx *index.Index) error {

@@ -13,6 +13,8 @@ type Span struct {
 	Duration     int64             // Duration in nanoseconds
 	Tags         map[string]string // Span tags/attributes
 	ServiceName  string            // Service that created this span
+	Events       []SpanEvent       // Span events (nil by default, populated on request)
+	Links        []SpanLink        // Span links (nil by default, populated on request)
 }
 
 // Duration returns the span duration in nanoseconds

@@ -25,6 +25,21 @@ func (q *HeadBlockQuerier) Select(matchers ...*Matcher) (*SelectResult, error) {
 
 // SelectWithTimeRange queries spans from the head block within a time range
 func (q *HeadBlockQuerier) SelectWithTimeRange(timeRange *TimeRange, matchers ...*Matcher) (*SelectResult, error) {
+	return q.SelectWithTimeRangeAndOptions(timeRange, nil, matchers...)
+}
+
+// SelectWithOptions queries spans from the head block with custom options
+// Note: Event loading is not supported at the querier level.
+// Events field will be nil. Use DB.GetEventsForSpan() to load events separately.
+func (q *HeadBlockQuerier) SelectWithOptions(opts *QueryOptions, matchers ...*Matcher) (*SelectResult, error) {
+	return q.SelectWithTimeRangeAndOptions(nil, opts, matchers...)
+}
+
+// SelectWithTimeRangeAndOptions queries spans from the head block within a time range with options
+// Note: Event loading is not supported at the querier level.
+// Events field will be nil regardless of opts.IncludeEvents.
+// Use DB.GetEventsForSpan() to load events separately.
+func (q *HeadBlockQuerier) SelectWithTimeRangeAndOptions(timeRange *TimeRange, opts *QueryOptions, matchers ...*Matcher) (*SelectResult, error) {
 	ms := Matchers(matchers)
 	result := &SelectResult{
 		Spans: make([]*span.Span, 0),
@@ -51,6 +66,9 @@ func (q *HeadBlockQuerier) SelectWithTimeRange(timeRange *TimeRange, matchers ..
 	// Query the head block
 	spans := queryHeadBlock(headBlock, ms, timeRange)
 	result.Spans = append(result.Spans, spans...)
+
+	// Note: opts.IncludeEvents is ignored at this level
+	// Event loading should be done via DB.GetEventsForSpan()
 
 	return result, nil
 }
