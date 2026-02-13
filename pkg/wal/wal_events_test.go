@@ -19,7 +19,7 @@ func TestWAL_WriteAndReadEvents(t *testing.T) {
 
 	// Write a span event
 	evt := &span.SpanEvent{
-		SpanID:    "span-1",
+		SpanID:    "fedcba9876543210",
 		Name:      "cache.hit",
 		Timestamp: time.Now(),
 		Attributes: map[string]string{
@@ -57,8 +57,8 @@ func TestWAL_WriteAndReadEvents(t *testing.T) {
 		t.Fatalf("ReadAllWithEvents() returned %d events, want 1", len(events))
 	}
 
-	if events[0].SpanID != "span-1" {
-		t.Errorf("Event SpanID = %s, want span-1", events[0].SpanID)
+	if events[0].SpanID != "fedcba9876543210" {
+		t.Errorf("Event SpanID = %s, want fedcba9876543210", events[0].SpanID)
 	}
 
 	if events[0].Name != "cache.hit" {
@@ -81,7 +81,7 @@ func TestWAL_WriteMultipleEvents(t *testing.T) {
 	// Write 100 events
 	for i := range 100 {
 		evt := &span.SpanEvent{
-			SpanID:    fmt.Sprintf("span-%d", i%10), // 10 different spans
+			SpanID:    fmt.Sprintf("%016d", i%10), // 10 different spans
 			Name:      fmt.Sprintf("event-%d", i),
 			Timestamp: time.Now(),
 			Attributes: map[string]string{
@@ -127,7 +127,7 @@ func TestWAL_WriteEventsBatch(t *testing.T) {
 	events := make([]*span.SpanEvent, 50)
 	for i := range 50 {
 		events[i] = &span.SpanEvent{
-			SpanID:    "span-1",
+			SpanID:    "fedcba9876543210",
 			Name:      fmt.Sprintf("event-%d", i),
 			Timestamp: time.Now(),
 			Attributes: map[string]string{
@@ -180,8 +180,8 @@ func TestWAL_MixedSpansAndEvents(t *testing.T) {
 	for i := range 10 {
 		// Write a span
 		sp := &span.Span{
-			TraceID:     "trace-1",
-			SpanID:      fmt.Sprintf("span-%d", i),
+			TraceID:     "0123456789abcdef0123456789abcdef",
+			SpanID:      fmt.Sprintf("%016d", i),
 			Name:        "operation",
 			StartTime:   time.Now(),
 			EndTime:     time.Now().Add(time.Millisecond),
@@ -194,7 +194,7 @@ func TestWAL_MixedSpansAndEvents(t *testing.T) {
 		// Write events for this span
 		for j := range 3 {
 			evt := &span.SpanEvent{
-				SpanID:    fmt.Sprintf("span-%d", i),
+				SpanID:    fmt.Sprintf("%016d", i),
 				Name:      fmt.Sprintf("event-%d", j),
 				Timestamp: time.Now(),
 				Attributes: map[string]string{
@@ -242,7 +242,7 @@ func TestWAL_MixedSpansAndEvents(t *testing.T) {
 
 	// Verify each span has exactly 3 events
 	for i := range 10 {
-		spanID := fmt.Sprintf("span-%d", i)
+		spanID := fmt.Sprintf("%016d", i)
 		if eventsBySpan[spanID] != 3 {
 			t.Errorf("Span %s has %d events, want 3", spanID, eventsBySpan[spanID])
 		}
@@ -261,7 +261,7 @@ func TestWAL_EventSegmentRotation(t *testing.T) {
 	// Write many events to trigger rotation
 	for i := range 500 {
 		evt := &span.SpanEvent{
-			SpanID:    fmt.Sprintf("span-%d", i),
+			SpanID:    fmt.Sprintf("%016d", i),
 			Name:      "event-with-long-name-to-increase-size",
 			Timestamp: time.Now(),
 			Attributes: map[string]string{
@@ -336,7 +336,7 @@ func BenchmarkWAL_WriteEvent(b *testing.B) {
 	defer w.Close()
 
 	evt := &span.SpanEvent{
-		SpanID:    "span-1",
+		SpanID:    "fedcba9876543210",
 		Name:      "cache.hit",
 		Timestamp: time.Now(),
 		Attributes: map[string]string{
@@ -363,7 +363,7 @@ func BenchmarkWAL_WriteEvents_Batch10(b *testing.B) {
 	events := make([]*span.SpanEvent, 10)
 	for i := range 10 {
 		events[i] = &span.SpanEvent{
-			SpanID:    "span-1",
+			SpanID:    "fedcba9876543210",
 			Name:      fmt.Sprintf("event-%d", i),
 			Timestamp: time.Now(),
 			Attributes: map[string]string{

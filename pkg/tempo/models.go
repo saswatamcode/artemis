@@ -202,6 +202,27 @@ func convertSpanToOTLP(s *span.Span) *tracev1.Span {
 		}
 	}
 
+	// Convert span links to OTLP links
+	var otlpLinks []*tracev1.Span_Link
+	if len(s.Links) > 0 {
+		otlpLinks = make([]*tracev1.Span_Link, 0, len(s.Links))
+		for _, link := range s.Links {
+			linkAttrs := make([]*commonv1.KeyValue, 0, len(link.Attributes))
+			for k, v := range link.Attributes {
+				linkAttrs = append(linkAttrs, &commonv1.KeyValue{
+					Key:   k,
+					Value: &commonv1.AnyValue{Value: &commonv1.AnyValue_StringValue{StringValue: v}},
+				})
+			}
+
+			otlpLinks = append(otlpLinks, &tracev1.Span_Link{
+				TraceId:    hexToBytes(link.LinkedTraceID),
+				SpanId:     hexToBytes(link.LinkedSpanID),
+				Attributes: linkAttrs,
+			})
+		}
+	}
+
 	return &tracev1.Span{
 		TraceId:           traceID,
 		SpanId:            spanID,
@@ -212,6 +233,7 @@ func convertSpanToOTLP(s *span.Span) *tracev1.Span {
 		EndTimeUnixNano:   uint64(s.EndTime.UnixNano()),
 		Attributes:        attrs,
 		Events:            otlpEvents,
+		Links:             otlpLinks,
 		Status: &tracev1.Status{
 			Code: tracev1.Status_STATUS_CODE_UNSET,
 		},

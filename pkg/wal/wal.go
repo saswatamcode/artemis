@@ -3,7 +3,6 @@ package wal
 import (
 	"bufio"
 	"encoding/binary"
-	"encoding/json"
 	"fmt"
 	"hash/crc32"
 	"io"
@@ -19,7 +18,13 @@ const (
 	// WAL file format: similar to Prometheus WAL
 	// Each record: [CRC32 (4 bytes)][Length (4 bytes)][Type (1 byte)][Data (Length bytes)]
 	recordHeaderSize   = 9                 // 4 + 4 + 1
+	pageSize           = 32 * 1024         // 32KB per page
+	maxRecordDataSize  = pageSize - recordHeaderSize // Maximum data size per record
 	defaultSegmentSize = 128 * 1024 * 1024 // 128MB per segment (default)
+
+	// Magic number written to mark padding at the end of segments
+	// This is written in the CRC field to indicate the rest is padding
+	paddingMagic = 0xFFAA55FF
 )
 
 // RecordType indicates the type of WAL record
@@ -32,6 +37,34 @@ const (
 	RecordTypeFull  RecordType = 4 // For full records (future use)
 )
 
+// page is an in-memory buffer used to batch disk writes.
+// Records are written to the page buffer and flushed when:
+// - The page is full (can't fit another record header)
+// - An explicit flush is requested (checkpoint, close, rotation)
+type page struct {
+	alloc   int            // Current allocation position in the page
+	flushed int            // How much of the page has been flushed to disk
+	buf     [pageSize]byte // Fixed-size buffer
+}
+
+func (p *page) remaining() int {
+	return pageSize - p.alloc
+}
+
+func (p *page) full() bool {
+	return pageSize-p.alloc < recordHeaderSize
+}
+
+func (p *page) reset() {
+	// Only zero the used portion of the buffer for efficiency
+	// This is much faster than zeroing the entire 32KB when only a small portion was used
+	for i := 0; i < p.alloc; i++ {
+		p.buf[i] = 0
+	}
+	p.alloc = 0
+	p.flushed = 0
+}
+
 // WAL implements a Write-Ahead Log for spans
 type WAL struct {
 	dir          string
@@ -40,7 +73,7 @@ type WAL struct {
 	segmentSize  int64 // Maximum segment size before rotation
 	segmentIndex int
 	mu           sync.Mutex
-	writer       *bufio.Writer
+	page         *page // Active page buffer
 	logger       *slog.Logger
 }
 
@@ -88,6 +121,7 @@ func NewWALWithSegmentSize(dir string, segmentSize int64, logger *slog.Logger) (
 		dir:          dir,
 		segmentSize:  segmentSize,
 		segmentIndex: startIndex,
+		page:         &page{},
 		logger:       logger,
 	}
 
@@ -103,7 +137,7 @@ func (w *WAL) WriteSpan(s *span.Span) (int, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
-	data, err := json.Marshal(s)
+	data, err := s.MarshalBinary()
 	if err != nil {
 		return 0, fmt.Errorf("failed to marshal span: %w", err)
 	}
@@ -123,7 +157,8 @@ func (w *WAL) WriteSpan(s *span.Span) (int, error) {
 		return 0, err
 	}
 
-	if err := w.writer.Flush(); err != nil {
+	// Flush the page to ensure durability
+	if err := w.flushPage(false); err != nil {
 		return 0, err
 	}
 
@@ -135,7 +170,7 @@ func (w *WAL) WriteEvent(e *span.SpanEvent) (int, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
-	data, err := json.Marshal(e)
+	data, err := e.MarshalBinary()
 	if err != nil {
 		return 0, fmt.Errorf("failed to marshal event: %w", err)
 	}
@@ -153,7 +188,8 @@ func (w *WAL) WriteEvent(e *span.SpanEvent) (int, error) {
 		return 0, err
 	}
 
-	if err := w.writer.Flush(); err != nil {
+	// Flush the page to ensure durability
+	if err := w.flushPage(false); err != nil {
 		return 0, err
 	}
 
@@ -173,7 +209,7 @@ func (w *WAL) WriteEvents(events []*span.SpanEvent) (int, error) {
 	var segmentIndex int
 
 	for _, e := range events {
-		data, err := json.Marshal(e)
+		data, err := e.MarshalBinary()
 		if err != nil {
 			return 0, fmt.Errorf("failed to marshal event: %w", err)
 		}
@@ -193,7 +229,8 @@ func (w *WAL) WriteEvents(events []*span.SpanEvent) (int, error) {
 		}
 	}
 
-	if err := w.writer.Flush(); err != nil {
+	// Flush the page to ensure durability
+	if err := w.flushPage(false); err != nil {
 		return 0, err
 	}
 
@@ -205,7 +242,7 @@ func (w *WAL) WriteLink(l *span.SpanLink) (int, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
-	data, err := json.Marshal(l)
+	data, err := l.MarshalBinary()
 	if err != nil {
 		return 0, fmt.Errorf("failed to marshal link: %w", err)
 	}
@@ -223,7 +260,8 @@ func (w *WAL) WriteLink(l *span.SpanLink) (int, error) {
 		return 0, err
 	}
 
-	if err := w.writer.Flush(); err != nil {
+	// Flush the page to ensure durability
+	if err := w.flushPage(false); err != nil {
 		return 0, err
 	}
 
@@ -243,7 +281,7 @@ func (w *WAL) WriteLinks(links []*span.SpanLink) (int, error) {
 	var segmentIndex int
 
 	for _, l := range links {
-		data, err := json.Marshal(l)
+		data, err := l.MarshalBinary()
 		if err != nil {
 			return 0, fmt.Errorf("failed to marshal link: %w", err)
 		}
@@ -263,53 +301,114 @@ func (w *WAL) WriteLinks(links []*span.SpanLink) (int, error) {
 		}
 	}
 
-	if err := w.writer.Flush(); err != nil {
+	// Flush the page to ensure durability
+	if err := w.flushPage(false); err != nil {
 		return 0, err
 	}
 
 	return segmentIndex, nil
 }
 
-// writeRecord writes a single record to the WAL
+// flushPage writes the current page buffer to disk and fsyncs.
+// If forceClear is true, writes padding marker and zeros out remaining space.
+func (w *WAL) flushPage(forceClear bool) error {
+	p := w.page
+	shouldClear := forceClear || p.full()
+
+	// If forcing clear or page is full, write padding marker and fill to end
+	if shouldClear && p.alloc < pageSize {
+		// Write padding magic marker at current position
+		if p.remaining() >= 4 {
+			binary.BigEndian.PutUint32(p.buf[p.alloc:], paddingMagic)
+			p.alloc += 4
+		}
+		// Extend to end of page (rest is already zeros from reset or initialization)
+		p.alloc = pageSize
+	}
+
+	// Write unflushed portion of page to disk
+	n, err := w.currentFile.Write(p.buf[p.flushed:p.alloc])
+	if err != nil {
+		p.flushed += n
+		return err
+	}
+	p.flushed += n
+
+	// Fsync to ensure data is on disk
+	if err := w.currentFile.Sync(); err != nil {
+		return err
+	}
+
+	// Reset page if we flushed everything
+	if shouldClear {
+		p.reset()
+	}
+
+	return nil
+}
+
+// writeRecord writes a single record to the page buffer.
+// Flushes the page if it becomes full.
 func (w *WAL) writeRecord(typ RecordType, data []byte) error {
+	// Validate record size - records cannot exceed page size
+	if len(data) > maxRecordDataSize {
+		return fmt.Errorf("record data size %d exceeds maximum %d bytes", len(data), maxRecordDataSize)
+	}
+
+	recordSize := recordHeaderSize + len(data)
+
+	// If page is full, flush it WITHOUT padding (we're in the middle of a segment)
+	if w.page.full() {
+		if err := w.flushPage(false); err != nil {
+			return err
+		}
+		// After flushing without padding, manually reset the page for the next write
+		w.page.reset()
+	}
+
+	// If record doesn't fit in page, flush current page and start fresh
+	// Don't pad - we're in the middle of a segment
+	if w.page.remaining() < recordSize {
+		if err := w.flushPage(false); err != nil {
+			return err
+		}
+		// After flushing without padding, manually reset the page for the next write
+		w.page.reset()
+	}
+
+	// Write record to page buffer
+	buf := w.page.buf[w.page.alloc:]
 	crc := crc32.ChecksumIEEE(data)
 
 	// Write CRC (4 bytes)
-	if err := binary.Write(w.writer, binary.BigEndian, crc); err != nil {
-		return err
-	}
+	binary.BigEndian.PutUint32(buf[0:4], crc)
 
 	// Write length (4 bytes)
-	length := uint32(len(data))
-	if err := binary.Write(w.writer, binary.BigEndian, length); err != nil {
-		return err
-	}
+	binary.BigEndian.PutUint32(buf[4:8], uint32(len(data)))
 
 	// Write type (1 byte)
-	if err := w.writer.WriteByte(byte(typ)); err != nil {
-		return err
-	}
+	buf[8] = byte(typ)
 
 	// Write data
-	n, err := w.writer.Write(data)
-	if err != nil {
-		return err
-	}
+	copy(buf[9:], data)
 
-	w.currentSize += int64(recordHeaderSize + n)
+	w.page.alloc += recordSize
+	w.currentSize += int64(recordSize)
+
 	return nil
 }
 
 // createNewSegment creates a new WAL segment file
 func (w *WAL) createNewSegment() error {
 	filename := filepath.Join(w.dir, fmt.Sprintf("%06d.wal", w.segmentIndex))
-	f, err := os.OpenFile(filename, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	// Use O_EXCL to ensure we don't accidentally append to an existing file
+	// This prevents data corruption if a segment file already exists
+	f, err := os.OpenFile(filename, os.O_CREATE|os.O_WRONLY|os.O_EXCL, 0644)
 	if err != nil {
 		return fmt.Errorf("failed to create WAL segment: %w", err)
 	}
 
 	w.currentFile = f
-	w.writer = bufio.NewWriter(f)
 	w.currentSize = 0
 
 	return nil
@@ -317,18 +416,34 @@ func (w *WAL) createNewSegment() error {
 
 // rotateSegment closes the current segment and creates a new one
 func (w *WAL) rotateSegment() error {
-	if err := w.writer.Flush(); err != nil {
-		return err
+	// Flush current page with zeros padding
+	var flushErr error
+	if w.page.alloc > 0 {
+		flushErr = w.flushPage(true)
 	}
-	if err := w.currentFile.Sync(); err != nil {
-		return err
+
+	// Always close the old file, even if flush failed
+	closeErr := w.currentFile.Close()
+
+	// If flush or close failed, return error without rotating
+	if flushErr != nil {
+		return flushErr
 	}
-	if err := w.currentFile.Close(); err != nil {
+	if closeErr != nil {
+		return closeErr
+	}
+
+	// Only increment segment index after successful close
+	// This ensures if createNewSegment fails, we can retry with same index
+	w.segmentIndex++
+	if err := w.createNewSegment(); err != nil {
+		// Failed to create new segment - decrement back to maintain consistency
+		// This leaves WAL in a closed state, but at least segment numbering is correct
+		w.segmentIndex--
 		return err
 	}
 
-	w.segmentIndex++
-	return w.createNewSegment()
+	return nil
 }
 
 // Close closes the WAL
@@ -336,13 +451,32 @@ func (w *WAL) Close() error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
-	if err := w.writer.Flush(); err != nil {
-		return err
+	// Flush current page with zeros padding
+	var flushErr error
+	if w.page.alloc > 0 {
+		flushErr = w.flushPage(true)
 	}
-	if err := w.currentFile.Sync(); err != nil {
-		return err
+
+	// Always close the file, even if flush failed
+	closeErr := w.currentFile.Close()
+
+	// Return flush error if it occurred, otherwise return close error
+	if flushErr != nil {
+		return flushErr
 	}
-	return w.currentFile.Close()
+	return closeErr
+}
+
+// Flush flushes the current page to disk without clearing it
+// This is useful for checkpointing to ensure all data is durable
+func (w *WAL) Flush() error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	if w.page.alloc > 0 {
+		return w.flushPage(false)
+	}
+	return nil
 }
 
 // SegmentIndex returns the current WAL segment index
@@ -458,6 +592,12 @@ func (r *Reader) readSegment(filename string, callback func(*span.Span) error) e
 			return err
 		}
 
+		// Detect padding - either explicit magic marker or all-zeros fallback
+		// The all-zeros fallback handles edge case where <4 bytes remained for magic
+		if crc == paddingMagic || (crc == 0 && length == 0 && typ == 0) {
+			return nil
+		}
+
 		// Read data
 		data := make([]byte, length)
 		if _, err := io.ReadFull(reader, data); err != nil {
@@ -473,7 +613,7 @@ func (r *Reader) readSegment(filename string, callback func(*span.Span) error) e
 		switch RecordType(typ) {
 		case RecordTypeSpan:
 			var s span.Span
-			if err := json.Unmarshal(data, &s); err != nil {
+			if err := s.UnmarshalBinary(data); err != nil {
 				return fmt.Errorf("failed to unmarshal span: %w", err)
 			}
 
@@ -528,6 +668,12 @@ func (r *Reader) readSegmentWithEvents(
 			return err
 		}
 
+		// Detect padding - either explicit magic marker or all-zeros fallback
+		// The all-zeros fallback handles edge case where <4 bytes remained for magic
+		if crc == paddingMagic || (crc == 0 && length == 0 && typ == 0) {
+			return nil
+		}
+
 		// Read data
 		data := make([]byte, length)
 		if _, err := io.ReadFull(reader, data); err != nil {
@@ -544,7 +690,7 @@ func (r *Reader) readSegmentWithEvents(
 		case RecordTypeSpan:
 			if spanCallback != nil {
 				var s span.Span
-				if err := json.Unmarshal(data, &s); err != nil {
+				if err := s.UnmarshalBinary(data); err != nil {
 					return fmt.Errorf("failed to unmarshal span: %w", err)
 				}
 
@@ -555,7 +701,7 @@ func (r *Reader) readSegmentWithEvents(
 		case RecordTypeEvent:
 			if eventCallback != nil {
 				var e span.SpanEvent
-				if err := json.Unmarshal(data, &e); err != nil {
+				if err := e.UnmarshalBinary(data); err != nil {
 					return fmt.Errorf("failed to unmarshal event: %w", err)
 				}
 
@@ -609,6 +755,12 @@ func (r *Reader) readSegmentWithAll(
 			return err
 		}
 
+		// Detect padding - either explicit magic marker or all-zeros fallback
+		// The all-zeros fallback handles edge case where <4 bytes remained for magic
+		if crc == paddingMagic || (crc == 0 && length == 0 && typ == 0) {
+			return nil
+		}
+
 		// Read data
 		data := make([]byte, length)
 		if _, err := io.ReadFull(reader, data); err != nil {
@@ -625,7 +777,7 @@ func (r *Reader) readSegmentWithAll(
 		case RecordTypeSpan:
 			if spanCallback != nil {
 				var s span.Span
-				if err := json.Unmarshal(data, &s); err != nil {
+				if err := s.UnmarshalBinary(data); err != nil {
 					return fmt.Errorf("failed to unmarshal span: %w", err)
 				}
 
@@ -636,7 +788,7 @@ func (r *Reader) readSegmentWithAll(
 		case RecordTypeEvent:
 			if eventCallback != nil {
 				var e span.SpanEvent
-				if err := json.Unmarshal(data, &e); err != nil {
+				if err := e.UnmarshalBinary(data); err != nil {
 					return fmt.Errorf("failed to unmarshal event: %w", err)
 				}
 
@@ -647,7 +799,7 @@ func (r *Reader) readSegmentWithAll(
 		case RecordTypeLink:
 			if linkCallback != nil {
 				var l span.SpanLink
-				if err := json.Unmarshal(data, &l); err != nil {
+				if err := l.UnmarshalBinary(data); err != nil {
 					return fmt.Errorf("failed to unmarshal link: %w", err)
 				}
 
@@ -661,46 +813,3 @@ func (r *Reader) readSegmentWithAll(
 	}
 }
 
-// verifyCRC verifies the CRC checksum
-func verifyCRC(crc uint32, data []byte) bool {
-	return crc32.ChecksumIEEE(data) == crc
-}
-
-func unmarshalSpan(data []byte) (*span.Span, error) {
-	var s span.Span
-	if err := json.Unmarshal(data, &s); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal span: %w", err)
-	}
-	return &s, nil
-}
-
-// readRecordFull reads a record and returns additional metadata including offset
-func readRecordFull(reader *bufio.Reader) (crc uint32, length uint32, recordType byte, data []byte, offset int64, err error) {
-	// Note: We can't track exact offset without seeking, so we'll use 0
-	// TODO: Track this more precisely
-	offset = 0
-
-	// Read CRC (4 bytes)
-	if err = binary.Read(reader, binary.BigEndian, &crc); err != nil {
-		if err == io.EOF {
-			err = fmt.Errorf("EOF")
-		}
-		return
-	}
-
-	// Read length (4 bytes)
-	if err = binary.Read(reader, binary.BigEndian, &length); err != nil {
-		return
-	}
-
-	// Read type (1 byte)
-	recordType, err = reader.ReadByte()
-	if err != nil {
-		return
-	}
-
-	// Read data
-	data = make([]byte, length)
-	_, err = io.ReadFull(reader, data)
-	return
-}

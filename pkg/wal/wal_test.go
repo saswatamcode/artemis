@@ -20,8 +20,8 @@ func TestWAL_WriteAndRead(t *testing.T) {
 	defer w.Close()
 
 	sp := &span.Span{
-		TraceID:     "trace-1",
-		SpanID:      "span-1",
+		TraceID:     "0123456789abcdef0123456789abcdef",
+		SpanID:      "fedcba9876543210",
 		Name:        "operation",
 		StartTime:   time.Now(),
 		EndTime:     time.Now().Add(time.Millisecond),
@@ -54,8 +54,8 @@ func TestWAL_WriteAndRead(t *testing.T) {
 		t.Errorf("Replay() returned %d spans, want 1", len(spans))
 	}
 
-	if spans[0].SpanID != "span-1" {
-		t.Errorf("Replayed span ID = %s, want span-1", spans[0].SpanID)
+	if spans[0].SpanID != "fedcba9876543210" {
+		t.Errorf("Replayed span ID = %s, want fedcba9876543210", spans[0].SpanID)
 	}
 }
 
@@ -69,8 +69,8 @@ func TestWAL_MultipleSpans(t *testing.T) {
 
 	for i := range 100 {
 		sp := &span.Span{
-			TraceID:     "trace-1",
-			SpanID:      fmt.Sprintf("span-%d", i),
+			TraceID:     "0123456789abcdef0123456789abcdef",
+			SpanID:      fmt.Sprintf("%016d", i), // 16 char hex-like ID
 			Name:        "operation",
 			StartTime:   time.Now(),
 			EndTime:     time.Now().Add(time.Millisecond),
@@ -111,8 +111,8 @@ func TestWAL_SegmentRotation(t *testing.T) {
 	// (though in practice the segment size is large)
 	for i := range 1000 {
 		sp := &span.Span{
-			TraceID:     "trace-1",
-			SpanID:      fmt.Sprintf("span-%d", i),
+			TraceID:     "0123456789abcdef0123456789abcdef",
+			SpanID:      fmt.Sprintf("%016d", i), // 16 char hex-like ID
 			Name:        "operation-with-long-name-to-increase-size",
 			StartTime:   time.Now(),
 			EndTime:     time.Now().Add(time.Millisecond),
@@ -181,7 +181,8 @@ func TestWAL_CorruptionHandling(t *testing.T) {
 
 	for i := range 10 {
 		sp := &span.Span{
-			SpanID:      fmt.Sprintf("span-%d", i),
+			TraceID:     "0123456789abcdef0123456789abcdef",
+			SpanID:      fmt.Sprintf("%016d", i), // 16 char hex-like ID
 			StartTime:   time.Now(),
 			EndTime:     time.Now().Add(time.Millisecond),
 			ServiceName: "service",
@@ -191,14 +192,21 @@ func TestWAL_CorruptionHandling(t *testing.T) {
 
 	w.Close()
 
-	// Corrupt the WAL file by appending garbage
+	// Corrupt the WAL file by flipping some bytes in the middle
+	// This will corrupt a CRC checksum
 	segmentPath := filepath.Join(tmpDir, "000000.wal")
-	f, err := os.OpenFile(segmentPath, os.O_APPEND|os.O_WRONLY, 0644)
+	data, err := os.ReadFile(segmentPath)
 	if err != nil {
-		t.Fatalf("Failed to open segment: %v", err)
+		t.Fatalf("Failed to read segment: %v", err)
 	}
-	f.Write([]byte("CORRUPT DATA"))
-	f.Close()
+
+	// Corrupt a byte in the middle of the file (flip a bit in record data)
+	if len(data) > 100 {
+		data[100] ^= 0xFF // Flip all bits
+		if err := os.WriteFile(segmentPath, data, 0644); err != nil {
+			t.Fatalf("Failed to write corrupted segment: %v", err)
+		}
+	}
 
 	// Try to replay with skip corrupted option
 	reader := NewReader(tmpDir, nil)
@@ -238,7 +246,8 @@ func TestWAL_SegmentIndexContinuesAfterRestart(t *testing.T) {
 	// Write some spans
 	for i := range 10 {
 		sp := &span.Span{
-			SpanID:      fmt.Sprintf("span-%d", i),
+			TraceID:     "0123456789abcdef0123456789abcdef",
+			SpanID:      fmt.Sprintf("%016d", i), // 16 char hex-like ID
 			StartTime:   time.Now(),
 			EndTime:     time.Now().Add(time.Millisecond),
 			ServiceName: "service",
@@ -339,7 +348,8 @@ func TestReplay_WithCheckpointMetadata(t *testing.T) {
 	// Write spans to segment 0
 	for i := range 10 {
 		sp := &span.Span{
-			SpanID:      fmt.Sprintf("segment0-span-%d", i),
+			TraceID:     "0123456789abcdef0123456789abcdef",
+			SpanID:      fmt.Sprintf("0000000000000%03d", i), // 16 char hex-like ID
 			StartTime:   time.Now(),
 			EndTime:     time.Now().Add(time.Millisecond),
 			ServiceName: "service",
@@ -355,12 +365,15 @@ func TestReplay_WithCheckpointMetadata(t *testing.T) {
 		w, _ = NewWAL(tmpDir, nil)
 		for i := range 10 {
 			sp := &span.Span{
-				SpanID:      fmt.Sprintf("segment%d-span-%d", seg, i),
+				TraceID:     "0123456789abcdef0123456789abcdef",
+				SpanID:      fmt.Sprintf("%016d", seg*1000+i), // 16 char hex-like ID
 				StartTime:   time.Now(),
 				EndTime:     time.Now().Add(time.Millisecond),
 				ServiceName: "service",
 			}
-			w.WriteSpan(sp) // Ignore errors and segment index for this test
+			if _, err := w.WriteSpan(sp); err != nil {
+				t.Fatalf("WriteSpan() for segment %d error = %v", seg, err)
+			}
 		}
 		w.Close()
 	}
@@ -407,20 +420,20 @@ func TestReplay_WithCheckpointMetadata(t *testing.T) {
 
 	// Verify we didn't see spans from deleted segments
 	for i := range 10 {
-		if seenSpans[fmt.Sprintf("segment0-span-%d", i)] {
+		if seenSpans[fmt.Sprintf("0000000000000%03d", i)] {
 			t.Errorf("Should not have replayed span from deleted segment 0")
 		}
-		if seenSpans[fmt.Sprintf("segment1-span-%d", i)] {
+		if seenSpans[fmt.Sprintf("%016d", 1*1000+i)] {
 			t.Errorf("Should not have replayed span from deleted segment 1")
 		}
 	}
 
 	// Verify we did see spans from remaining segments
 	for i := range 10 {
-		if !seenSpans[fmt.Sprintf("segment2-span-%d", i)] {
+		if !seenSpans[fmt.Sprintf("%016d", 2*1000+i)] {
 			t.Errorf("Should have replayed span from segment 2")
 		}
-		if !seenSpans[fmt.Sprintf("segment3-span-%d", i)] {
+		if !seenSpans[fmt.Sprintf("%016d", 3*1000+i)] {
 			t.Errorf("Should have replayed span from segment 3")
 		}
 	}
@@ -438,8 +451,8 @@ func BenchmarkWAL_WriteSpan(b *testing.B) {
 	defer w.Close()
 
 	sp := &span.Span{
-		TraceID:     "trace-1",
-		SpanID:      "span-1",
+		TraceID:     "0123456789abcdef0123456789abcdef",
+		SpanID:      "fedcba9876543210",
 		Name:        "operation",
 		StartTime:   time.Now(),
 		EndTime:     time.Now().Add(time.Millisecond),

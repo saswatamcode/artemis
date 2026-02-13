@@ -673,6 +673,13 @@ func (db *DB) createCheckpoint() error {
 	// This is what the checkpoint metadata validation expects
 	deleteCountTotal := deleteTo + 1
 
+	// CRITICAL: Flush current WAL page to ensure all data is on disk
+	// This must happen BEFORE writing checkpoint metadata to prevent data loss
+	// If we checkpoint without flushing, a crash could lose unflushed data
+	if err := db.wal.Flush(); err != nil {
+		return fmt.Errorf("failed to flush WAL before checkpoint: %w", err)
+	}
+
 	// CRITICAL: Write checkpoint metadata FIRST, THEN delete segments
 	// This ensures if system crashes during deletion, checkpoint metadata
 	// correctly reflects what should be deleted (next checkpoint can retry)
