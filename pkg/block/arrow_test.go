@@ -214,6 +214,9 @@ func TestArrowBlock_Schema(t *testing.T) {
 		"duration",
 		"service_name",
 		"tags",
+		"bucket1s",
+		"duration_ns",
+		"duration_bucket",
 	}
 
 	if schema.NumFields() != len(expectedFields) {

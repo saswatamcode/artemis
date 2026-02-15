@@ -383,7 +383,10 @@ func extractSpanFromArrowRecord(record arrow.RecordBatch, rowIndex int) (*span.S
 	}
 
 	// Validate schema has expected number of columns
-	expectedColumns := 10 // trace_id_hi, trace_id_lo, span_id, parent_span_id, name, start_time, end_time, duration, service_name, tags
+	// Note: We have 13 columns now (10 original + 3 new indexing fields)
+	// but the new fields (bucket1s, duration_ns, duration_bucket) don't need to be extracted
+	// into the Span struct as they're derived for indexing purposes
+	expectedColumns := 13
 	if record.NumCols() < int64(expectedColumns) {
 		return nil, fmt.Errorf("invalid schema: expected at least %d columns, got %d", expectedColumns, record.NumCols())
 	}

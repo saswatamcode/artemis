@@ -18,28 +18,57 @@ const (
 
 // ParquetSpanLink is the Parquet-optimized representation of a span link
 type ParquetSpanLink struct {
-	SpanID        string            `parquet:"span_id,dict"`
-	LinkedTraceID string            `parquet:"linked_trace_id,dict"`
-	LinkedSpanID  string            `parquet:"linked_span_id,dict"`
-	Attributes    map[string]string `parquet:"attributes,optional" parquet-key:"dict" parquet-value:"dict"`
+	SpanID          uint64            `parquet:"span_id"`
+	LinkedTraceIDHi uint64            `parquet:"linked_trace_id_hi"`
+	LinkedTraceIDLo uint64            `parquet:"linked_trace_id_lo"`
+	LinkedSpanID    uint64            `parquet:"linked_span_id"`
+	Attributes      map[string]string `parquet:"attributes,optional" parquet-key:"dict" parquet-value:"dict"`
 }
 
 // spanLinkToParquetLink converts a SpanLink to ParquetSpanLink
 func spanLinkToParquetLink(l *span.SpanLink) *ParquetSpanLink {
+	// Parse span ID
+	spanID, err := span.ParseSpanID(l.SpanID)
+	if err != nil {
+		spanID = 0
+	}
+
+	// Parse linked trace ID into hi/lo components
+	linkedTraceIDHi, linkedTraceIDLo, err := span.ParseTraceID(l.LinkedTraceID)
+	if err != nil {
+		linkedTraceIDHi, linkedTraceIDLo = 0, 0
+	}
+
+	// Parse linked span ID
+	linkedSpanID, err := span.ParseSpanID(l.LinkedSpanID)
+	if err != nil {
+		linkedSpanID = 0
+	}
+
 	return &ParquetSpanLink{
-		SpanID:        l.SpanID,
-		LinkedTraceID: l.LinkedTraceID,
-		LinkedSpanID:  l.LinkedSpanID,
-		Attributes:    l.Attributes,
+		SpanID:          spanID,
+		LinkedTraceIDHi: linkedTraceIDHi,
+		LinkedTraceIDLo: linkedTraceIDLo,
+		LinkedSpanID:    linkedSpanID,
+		Attributes:      l.Attributes,
 	}
 }
 
 // parquetLinkToSpanLink converts a ParquetSpanLink to SpanLink
 func parquetLinkToSpanLink(pl *ParquetSpanLink) *span.SpanLink {
+	// Convert span ID to hex string
+	spanID := fmt.Sprintf("%016x", pl.SpanID)
+
+	// Convert linked trace ID from hi/lo to hex string
+	linkedTraceID := fmt.Sprintf("%016x%016x", pl.LinkedTraceIDHi, pl.LinkedTraceIDLo)
+
+	// Convert linked span ID to hex string
+	linkedSpanID := fmt.Sprintf("%016x", pl.LinkedSpanID)
+
 	return &span.SpanLink{
-		SpanID:        pl.SpanID,
-		LinkedTraceID: pl.LinkedTraceID,
-		LinkedSpanID:  pl.LinkedSpanID,
+		SpanID:        spanID,
+		LinkedTraceID: linkedTraceID,
+		LinkedSpanID:  linkedSpanID,
 		Attributes:    pl.Attributes,
 	}
 }
@@ -146,6 +175,12 @@ func GetLinksBySpanIDFromParquet(dir string, spanID string) ([]*span.SpanLink, e
 		return nil, nil // No links file
 	}
 
+	// Parse the input span ID to int64 for comparison
+	spanIDInt, err := span.ParseSpanID(spanID)
+	if err != nil {
+		return nil, fmt.Errorf("invalid span ID: %w", err)
+	}
+
 	f, err := os.Open(linksPath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open links parquet file: %w", err)
@@ -175,7 +210,7 @@ func GetLinksBySpanIDFromParquet(dir string, spanID string) ([]*span.SpanLink, e
 		}
 
 		for i := range n {
-			if batch[i].SpanID == spanID {
+			if batch[i].SpanID == spanIDInt {
 				result = append(result, parquetLinkToSpanLink(&batch[i]))
 			}
 		}

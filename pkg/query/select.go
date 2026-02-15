@@ -265,14 +265,22 @@ func createMetadataFilter(ms Matchers, timeRange *TimeRange) func(*block.Parquet
 
 			switch m.Name {
 			case "trace_id":
-				val = meta.TraceID
+				// Convert uint64 hi/lo to hex string
+				val = fmt.Sprintf("%016x%016x", meta.TraceIDHi, meta.TraceIDLo)
 				ok = val != ""
 			case "span_id":
-				val = meta.SpanID
+				// Convert uint64 to hex string
+				val = fmt.Sprintf("%016x", meta.SpanID)
 				ok = val != ""
 			case "parent_span_id":
-				val = meta.ParentSpanID
-				ok = val != ""
+				// Convert uint64 to hex string (0 means no parent)
+				if meta.ParentSpanID != 0 {
+					val = fmt.Sprintf("%016x", meta.ParentSpanID)
+					ok = true
+				} else {
+					val = ""
+					ok = false
+				}
 			case "name":
 				val = meta.Name
 				ok = val != ""

@@ -19,7 +19,7 @@ const (
 
 // ParquetSpanEvent is the Parquet-optimized representation of a span event
 type ParquetSpanEvent struct {
-	SpanID     string            `parquet:"span_id,dict"`
+	SpanID     uint64            `parquet:"span_id"`
 	Name       string            `parquet:"name,dict"`
 	Timestamp  int64             `parquet:"timestamp"`
 	Attributes map[string]string `parquet:"attributes,optional" parquet-key:"dict" parquet-value:"dict"`
@@ -27,8 +27,14 @@ type ParquetSpanEvent struct {
 
 // spanEventToParquetEvent converts a SpanEvent to ParquetSpanEvent
 func spanEventToParquetEvent(e *span.SpanEvent) *ParquetSpanEvent {
+	// Parse span ID
+	spanID, err := span.ParseSpanID(e.SpanID)
+	if err != nil {
+		spanID = 0
+	}
+
 	return &ParquetSpanEvent{
-		SpanID:     e.SpanID,
+		SpanID:     spanID,
 		Name:       e.Name,
 		Timestamp:  e.Timestamp.UnixNano(),
 		Attributes: e.Attributes,
@@ -37,8 +43,11 @@ func spanEventToParquetEvent(e *span.SpanEvent) *ParquetSpanEvent {
 
 // parquetEventToSpanEvent converts a ParquetSpanEvent to SpanEvent
 func parquetEventToSpanEvent(pe *ParquetSpanEvent) *span.SpanEvent {
+	// Convert span ID to hex string
+	spanID := fmt.Sprintf("%016x", pe.SpanID)
+
 	return &span.SpanEvent{
-		SpanID:     pe.SpanID,
+		SpanID:     spanID,
 		Name:       pe.Name,
 		Timestamp:  time.Unix(0, pe.Timestamp),
 		Attributes: pe.Attributes,
@@ -147,6 +156,12 @@ func GetEventsBySpanIDFromParquet(dir string, spanID string) ([]*span.SpanEvent,
 		return nil, nil // No events file
 	}
 
+	// Parse the input span ID to int64 for comparison
+	spanIDInt, err := span.ParseSpanID(spanID)
+	if err != nil {
+		return nil, fmt.Errorf("invalid span ID: %w", err)
+	}
+
 	f, err := os.Open(eventsPath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open events parquet file: %w", err)
@@ -176,7 +191,7 @@ func GetEventsBySpanIDFromParquet(dir string, spanID string) ([]*span.SpanEvent,
 		}
 
 		for i := range n {
-			if batch[i].SpanID == spanID {
+			if batch[i].SpanID == spanIDInt {
 				result = append(result, parquetEventToSpanEvent(&batch[i]))
 			}
 		}

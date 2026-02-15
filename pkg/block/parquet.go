@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math/bits"
 	"os"
 	"path/filepath"
 	"sort"
@@ -25,28 +26,36 @@ const (
 // Using struct tags to configure Parquet encoding
 // Compression is configured at the writer level, not per-field
 type ParquetSpan struct {
-	TraceID      string            `parquet:"trace_id,dict"`
-	SpanID       string            `parquet:"span_id"`
-	ParentSpanID string            `parquet:"parent_span_id,optional,dict"`
-	Name         string            `parquet:"name,dict"`
-	StartTime    int64             `parquet:"start_time,delta"` // nanoseconds since epoch
-	EndTime      int64             `parquet:"end_time,delta"`   // nanoseconds since epoch
-	Duration     int64             `parquet:"duration,delta"`   // nanoseconds
-	ServiceName  string            `parquet:"service_name,dict"`
-	Tags         map[string]string `parquet:"tags,optional" parquet-key:"dict" parquet-value:"dict"`
+	TraceIDHi      uint64            `parquet:"trace_id_hi"`
+	TraceIDLo      uint64            `parquet:"trace_id_lo"`
+	SpanID         uint64            `parquet:"span_id"`
+	ParentSpanID   uint64            `parquet:"parent_span_id,optional"`
+	Name           string            `parquet:"name,dict"`
+	StartTime      int64             `parquet:"start_time,delta"` // nanoseconds since epoch
+	EndTime        int64             `parquet:"end_time,delta"`   // nanoseconds since epoch
+	Duration       int64             `parquet:"duration,delta"`   // nanoseconds
+	ServiceName    string            `parquet:"service_name,dict"`
+	Tags           map[string]string `parquet:"tags,optional" parquet-key:"dict" parquet-value:"dict"`
+	Bucket1s       int64             `parquet:"bucket1s"`        // per-second bucket of start time
+	DurationNs     int64             `parquet:"duration_ns"`     // duration in nanoseconds
+	DurationBucket int32             `parquet:"duration_bucket"` // exponential duration bucket
 }
 
 // ParquetSpanMetadata is a metadata-only projection
 // Useful for queries that only need span metadata without tags
 type ParquetSpanMetadata struct {
-	TraceID      string `parquet:"trace_id,dict"`
-	SpanID       string `parquet:"span_id"`
-	ParentSpanID string `parquet:"parent_span_id,optional,dict"`
-	Name         string `parquet:"name,dict"`
-	StartTime    int64  `parquet:"start_time,delta"`
-	EndTime      int64  `parquet:"end_time,delta"`
-	Duration     int64  `parquet:"duration,delta"`
-	ServiceName  string `parquet:"service_name,dict"`
+	TraceIDHi      uint64 `parquet:"trace_id_hi"`
+	TraceIDLo      uint64 `parquet:"trace_id_lo"`
+	SpanID         uint64 `parquet:"span_id"`
+	ParentSpanID   uint64 `parquet:"parent_span_id,optional"`
+	Name           string `parquet:"name,dict"`
+	StartTime      int64  `parquet:"start_time,delta"`
+	EndTime        int64  `parquet:"end_time,delta"`
+	Duration       int64  `parquet:"duration,delta"`
+	ServiceName    string `parquet:"service_name,dict"`
+	Bucket1s       int64  `parquet:"bucket1s"`
+	DurationNs     int64  `parquet:"duration_ns"`
+	DurationBucket int32  `parquet:"duration_bucket"`
 }
 
 // ParquetBlock represents a block stored as Parquet (compacted data)
@@ -508,8 +517,14 @@ func (pb *ParquetBlock) GetSpansByTag(tagKey, tagValue string) ([]*span.Span, er
 
 // scanByTraceID is a fallback metadata scan when no index is available
 func (pb *ParquetBlock) scanByTraceID(traceID string) ([]*span.Span, error) {
+	// Parse the trace ID into hi/lo components
+	traceIDHi, traceIDLo, err := span.ParseTraceID(traceID)
+	if err != nil {
+		return nil, fmt.Errorf("invalid trace ID: %w", err)
+	}
+
 	filterFunc := func(meta *ParquetSpanMetadata) bool {
-		return meta.TraceID == traceID
+		return meta.TraceIDHi == traceIDHi && meta.TraceIDLo == traceIDLo
 	}
 
 	refs, err := pb.ScanMetadata(filterFunc)
@@ -540,25 +555,78 @@ func (pb *ParquetBlock) scanByTag(tagKey, tagValue string) ([]*span.Span, error)
 
 // spanToParquetSpan converts a Span to ParquetSpan
 func spanToParquetSpan(s *span.Span) *ParquetSpan {
+	// Parse trace ID into hi/lo components
+	traceIDHi, traceIDLo, err := span.ParseTraceID(s.TraceID)
+	if err != nil {
+		// If parsing fails, use 0 values
+		traceIDHi, traceIDLo = 0, 0
+	}
+
+	// Parse span ID
+	spanID, err := span.ParseSpanID(s.SpanID)
+	if err != nil {
+		spanID = 0
+	}
+
+	// Parse parent span ID (0 if empty)
+	parentSpanID := uint64(0)
+	if s.ParentSpanID != "" {
+		parentSpanID, err = span.ParseSpanID(s.ParentSpanID)
+		if err != nil {
+			parentSpanID = 0
+		}
+	}
+
+	startUnixNano := s.StartTime.UnixNano()
+	durationNs := s.GetDuration()
+
+	// Calculate bucket1s: round down start time to the second
+	const sec = int64(1_000_000_000)
+	bucket := startUnixNano - (startUnixNano % sec)
+
+	// Calculate duration bucket using exponential bucketing
+	var durationBucketVal int32
+	if durationNs <= 0 {
+		durationBucketVal = 0
+	} else {
+		durationBucketVal = int32(bits.Len64(uint64(durationNs)) - 1)
+	}
+
 	return &ParquetSpan{
-		TraceID:      s.TraceID,
-		SpanID:       s.SpanID,
-		ParentSpanID: s.ParentSpanID,
-		Name:         s.Name,
-		StartTime:    s.StartTime.UnixNano(),
-		EndTime:      s.EndTime.UnixNano(),
-		Duration:     s.GetDuration(),
-		ServiceName:  s.ServiceName,
-		Tags:         s.Tags,
+		TraceIDHi:      traceIDHi,
+		TraceIDLo:      traceIDLo,
+		SpanID:         spanID,
+		ParentSpanID:   parentSpanID,
+		Name:           s.Name,
+		StartTime:      startUnixNano,
+		EndTime:        s.EndTime.UnixNano(),
+		Duration:       durationNs,
+		ServiceName:    s.ServiceName,
+		Tags:           s.Tags,
+		Bucket1s:       bucket,
+		DurationNs:     durationNs,
+		DurationBucket: durationBucketVal,
 	}
 }
 
 // parquetSpanToSpan converts a ParquetSpan to Span
 func parquetSpanToSpan(ps *ParquetSpan) *span.Span {
+	// Convert trace ID from hi/lo to hex string
+	traceID := fmt.Sprintf("%016x%016x", ps.TraceIDHi, ps.TraceIDLo)
+
+	// Convert span ID to hex string
+	spanID := fmt.Sprintf("%016x", ps.SpanID)
+
+	// Convert parent span ID to hex string (empty if 0)
+	parentSpanID := ""
+	if ps.ParentSpanID != 0 {
+		parentSpanID = fmt.Sprintf("%016x", ps.ParentSpanID)
+	}
+
 	return &span.Span{
-		TraceID:      ps.TraceID,
-		SpanID:       ps.SpanID,
-		ParentSpanID: ps.ParentSpanID,
+		TraceID:      traceID,
+		SpanID:       spanID,
+		ParentSpanID: parentSpanID,
 		Name:         ps.Name,
 		StartTime:    time.Unix(0, ps.StartTime),
 		EndTime:      time.Unix(0, ps.EndTime),
