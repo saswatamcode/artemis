@@ -27,8 +27,8 @@ func TestIndexLookupPaths(t *testing.T) {
 	// Create test data with relationships
 	testSpans := []*span.Span{
 		{
-			TraceID:      "trace-123",
-			SpanID:       "span-parent",
+			TraceID:      "00000000000001230000000000000abc",
+			SpanID:       "0000000000000001",
 			ParentSpanID: "",
 			Name:         "GET /api/users",
 			ServiceName:  "api-gateway",
@@ -42,9 +42,9 @@ func TestIndexLookupPaths(t *testing.T) {
 			},
 		},
 		{
-			TraceID:      "trace-123",
-			SpanID:       "span-child-1",
-			ParentSpanID: "span-parent",
+			TraceID:      "00000000000001230000000000000abc",
+			SpanID:       "0000000000000002",
+			ParentSpanID: "0000000000000001",
 			Name:         "SELECT * FROM users",
 			ServiceName:  "database",
 			StartTime:    baseTime.Add(10 * time.Millisecond),
@@ -52,14 +52,14 @@ func TestIndexLookupPaths(t *testing.T) {
 			Duration:     40_000_000,
 			Tags: map[string]string{
 				"db.system":      "postgres",
-				"parent_span_id": "span-parent",
+				"parent_span_id": "0000000000000001",
 				"name":           "SELECT * FROM users",
 			},
 		},
 		{
-			TraceID:      "trace-123",
-			SpanID:       "span-child-2",
-			ParentSpanID: "span-parent",
+			TraceID:      "00000000000001230000000000000abc",
+			SpanID:       "0000000000000003",
+			ParentSpanID: "0000000000000001",
 			Name:         "Cache lookup",
 			ServiceName:  "redis",
 			StartTime:    baseTime.Add(5 * time.Millisecond),
@@ -67,13 +67,13 @@ func TestIndexLookupPaths(t *testing.T) {
 			Duration:     3_000_000,
 			Tags: map[string]string{
 				"cache.hit":      "true",
-				"parent_span_id": "span-parent",
+				"parent_span_id": "0000000000000001",
 				"name":           "Cache lookup",
 			},
 		},
 		{
-			TraceID:      "trace-456",
-			SpanID:       "span-other",
+			TraceID:      "00000000000004560000000000000def",
+			SpanID:       "0000000000000004",
 			ParentSpanID: "",
 			Name:         "POST /api/orders",
 			ServiceName:  "api-gateway",
@@ -115,20 +115,20 @@ func TestIndexLookupPaths(t *testing.T) {
 		{
 			name: "trace_id query (3-hop: traceIndex → spanIndex → storage)",
 			matcher: func() *Matcher {
-				m, _ := NewMatcher(MatchEqual, "trace_id", "trace-123")
+				m, _ := NewMatcher(MatchEqual, "trace_id", "00000000000001230000000000000abc")
 				return m
 			},
 			expectedCount: 3,
-			description:   "Should use traceIndex to get all spans in trace-123",
+			description:   "Should use traceIndex to get all spans in trace",
 		},
 		{
 			name: "span_id query (2-hop: spanIndex → storage, FASTEST)",
 			matcher: func() *Matcher {
-				m, _ := NewMatcher(MatchEqual, "span_id", "span-child-1")
+				m, _ := NewMatcher(MatchEqual, "span_id", "0000000000000002")
 				return m
 			},
 			expectedCount:  1,
-			expectedSpanID: "span-child-1",
+			expectedSpanID: "0000000000000002",
 			description:    "Should use spanIndex directly (no intermediate lookup)",
 		},
 		{
@@ -143,7 +143,7 @@ func TestIndexLookupPaths(t *testing.T) {
 		{
 			name: "parent_span_id query (3-hop: tagIndex → spanIndex → storage)",
 			matcher: func() *Matcher {
-				m, _ := NewMatcher(MatchEqual, "parent_span_id", "span-parent")
+				m, _ := NewMatcher(MatchEqual, "parent_span_id", "0000000000000001")
 				return m
 			},
 			expectedCount: 2,
@@ -156,7 +156,7 @@ func TestIndexLookupPaths(t *testing.T) {
 				return m
 			},
 			expectedCount:  1,
-			expectedSpanID: "span-parent",
+			expectedSpanID: "0000000000000001",
 			description:    "Should use tagIndex for operation name",
 		},
 	}
@@ -227,8 +227,8 @@ func TestTraceIDIndexPath(t *testing.T) {
 	// Create a multi-span trace
 	traceSpans := []*span.Span{
 		{
-			TraceID:     "trace-multi",
-			SpanID:      "root",
+			TraceID:     "00000000000ab12300000000000ab123",
+			SpanID:      "0000000000000005",
 			Name:        "root operation",
 			ServiceName: "frontend",
 			StartTime:   baseTime,
@@ -237,30 +237,30 @@ func TestTraceIDIndexPath(t *testing.T) {
 			Tags:        map[string]string{"name": "root operation"},
 		},
 		{
-			TraceID:      "trace-multi",
-			SpanID:       "child-1",
-			ParentSpanID: "root",
+			TraceID:      "00000000000ab12300000000000ab123",
+			SpanID:       "0000000000000006",
+			ParentSpanID: "0000000000000005",
 			Name:         "auth check",
 			ServiceName:  "auth-service",
 			StartTime:    baseTime.Add(5 * time.Millisecond),
 			EndTime:      baseTime.Add(10 * time.Millisecond),
 			Duration:     5_000_000,
 			Tags: map[string]string{
-				"parent_span_id": "root",
+				"parent_span_id": "0000000000000005",
 				"name":           "auth check",
 			},
 		},
 		{
-			TraceID:      "trace-multi",
-			SpanID:       "child-2",
-			ParentSpanID: "root",
+			TraceID:      "00000000000ab12300000000000ab123",
+			SpanID:       "0000000000000007",
+			ParentSpanID: "0000000000000005",
 			Name:         "db query",
 			ServiceName:  "database",
 			StartTime:    baseTime.Add(15 * time.Millisecond),
 			EndTime:      baseTime.Add(90 * time.Millisecond),
 			Duration:     75_000_000,
 			Tags: map[string]string{
-				"parent_span_id": "root",
+				"parent_span_id": "0000000000000005",
 				"name":           "db query",
 			},
 		},
@@ -281,13 +281,13 @@ func TestTraceIDIndexPath(t *testing.T) {
 			t.Fatal("Head block should have index")
 		}
 
-		spanIDs := headStorage.GetIndex().LookupByTraceID("trace-multi")
+		spanIDs := headStorage.GetIndex().LookupByTraceID("00000000000ab12300000000000ab123")
 		if len(spanIDs) != 3 {
 			t.Errorf("traceIndex should return 3 span IDs, got %d", len(spanIDs))
 		}
 
 		// Query by trace_id
-		matcher, _ := NewMatcher(MatchEqual, "trace_id", "trace-multi")
+		matcher, _ := NewMatcher(MatchEqual, "trace_id", "00000000000ab12300000000000ab123")
 		results, err := Select(headStorage, matcher)
 		if err != nil {
 			t.Fatalf("Select error: %v", err)
@@ -299,8 +299,8 @@ func TestTraceIDIndexPath(t *testing.T) {
 
 		// Verify all spans belong to the same trace
 		for _, sp := range results.Spans {
-			if sp.TraceID != "trace-multi" {
-				t.Errorf("Got span from trace %s, want trace-multi", sp.TraceID)
+			if sp.TraceID != "00000000000ab12300000000000ab123" {
+				t.Errorf("Got span from trace %s, want 00000000000ab12300000000000ab123", sp.TraceID)
 			}
 		}
 	})
@@ -315,13 +315,13 @@ func TestTraceIDIndexPath(t *testing.T) {
 			t.Fatal("Parquet block should have index")
 		}
 
-		spanIDs := l1Block.Index().LookupByTraceID("trace-multi")
+		spanIDs := l1Block.Index().LookupByTraceID("00000000000ab12300000000000ab123")
 		if len(spanIDs) != 3 {
 			t.Errorf("traceIndex should return 3 span IDs, got %d", len(spanIDs))
 		}
 
 		// Query by trace_id
-		matcher, _ := NewMatcher(MatchEqual, "trace_id", "trace-multi")
+		matcher, _ := NewMatcher(MatchEqual, "trace_id", "00000000000ab12300000000000ab123")
 		emptyHead := storage.NewArrowStorage()
 		defer emptyHead.Release()
 		emptyHead.Flush()
@@ -345,8 +345,8 @@ func TestParentSpanIDReverseLookup(t *testing.T) {
 	// Create parent with multiple children
 	spans := []*span.Span{
 		{
-			TraceID:     "trace-1",
-			SpanID:      "parent-span",
+			TraceID:     "00000000000000010000000000000001",
+			SpanID:      "0000000000000008",
 			Name:        "parent operation",
 			ServiceName: "service-a",
 			StartTime:   baseTime,
@@ -355,44 +355,44 @@ func TestParentSpanIDReverseLookup(t *testing.T) {
 			Tags:        map[string]string{"name": "parent operation"},
 		},
 		{
-			TraceID:      "trace-1",
-			SpanID:       "child-a",
-			ParentSpanID: "parent-span",
+			TraceID:      "00000000000000010000000000000001",
+			SpanID:       "0000000000000009",
+			ParentSpanID: "0000000000000008",
 			Name:         "child A",
 			ServiceName:  "service-b",
 			StartTime:    baseTime.Add(10 * time.Millisecond),
 			EndTime:      baseTime.Add(30 * time.Millisecond),
 			Duration:     20_000_000,
 			Tags: map[string]string{
-				"parent_span_id": "parent-span",
+				"parent_span_id": "0000000000000008",
 				"name":           "child A",
 			},
 		},
 		{
-			TraceID:      "trace-1",
-			SpanID:       "child-b",
-			ParentSpanID: "parent-span",
+			TraceID:      "00000000000000010000000000000001",
+			SpanID:       "000000000000000a",
+			ParentSpanID: "0000000000000008",
 			Name:         "child B",
 			ServiceName:  "service-c",
 			StartTime:    baseTime.Add(40 * time.Millisecond),
 			EndTime:      baseTime.Add(80 * time.Millisecond),
 			Duration:     40_000_000,
 			Tags: map[string]string{
-				"parent_span_id": "parent-span",
+				"parent_span_id": "0000000000000008",
 				"name":           "child B",
 			},
 		},
 		{
-			TraceID:      "trace-1",
-			SpanID:       "child-c",
-			ParentSpanID: "parent-span",
+			TraceID:      "00000000000000010000000000000001",
+			SpanID:       "000000000000000b",
+			ParentSpanID: "0000000000000008",
 			Name:         "child C",
 			ServiceName:  "service-d",
 			StartTime:    baseTime.Add(35 * time.Millisecond),
 			EndTime:      baseTime.Add(60 * time.Millisecond),
 			Duration:     25_000_000,
 			Tags: map[string]string{
-				"parent_span_id": "parent-span",
+				"parent_span_id": "0000000000000008",
 				"name":           "child C",
 			},
 		},
@@ -408,7 +408,7 @@ func TestParentSpanIDReverseLookup(t *testing.T) {
 		headStorage.Flush()
 
 		// Query for all children of parent-span
-		matcher, _ := NewMatcher(MatchEqual, "parent_span_id", "parent-span")
+		matcher, _ := NewMatcher(MatchEqual, "parent_span_id", "0000000000000008")
 		results, err := Select(headStorage, matcher)
 		if err != nil {
 			t.Fatalf("Select error: %v", err)
@@ -421,10 +421,10 @@ func TestParentSpanIDReverseLookup(t *testing.T) {
 
 		// Verify none of the results is the parent
 		for _, sp := range results.Spans {
-			if sp.SpanID == "parent-span" {
+			if sp.SpanID == "0000000000000008" {
 				t.Error("Should not return the parent span itself")
 			}
-			if sp.ParentSpanID != "parent-span" {
+			if sp.ParentSpanID != "0000000000000008" {
 				t.Errorf("Span %s has wrong parent %s", sp.SpanID, sp.ParentSpanID)
 			}
 		}
@@ -435,7 +435,7 @@ func TestParentSpanIDReverseLookup(t *testing.T) {
 			childIDs[sp.SpanID] = true
 		}
 
-		expectedChildren := []string{"child-a", "child-b", "child-c"}
+		expectedChildren := []string{"0000000000000009", "000000000000000a", "000000000000000b"}
 		for _, childID := range expectedChildren {
 			if !childIDs[childID] {
 				t.Errorf("Missing expected child %s", childID)
@@ -452,13 +452,13 @@ func TestParentSpanIDReverseLookup(t *testing.T) {
 			t.Fatal("Parquet block should have index")
 		}
 
-		childSpanIDs := l1Block.Index().LookupByTag("parent_span_id", "parent-span")
+		childSpanIDs := l1Block.Index().LookupByTag("parent_span_id", "0000000000000008")
 		if len(childSpanIDs) != 3 {
 			t.Errorf("tagIndex should return 3 child span IDs, got %d", len(childSpanIDs))
 		}
 
 		// Query via SelectFromBlocks
-		matcher, _ := NewMatcher(MatchEqual, "parent_span_id", "parent-span")
+		matcher, _ := NewMatcher(MatchEqual, "parent_span_id", "0000000000000008")
 		emptyHead := storage.NewArrowStorage()
 		defer emptyHead.Release()
 		emptyHead.Flush()
@@ -482,8 +482,8 @@ func TestNameQueryIndexPath(t *testing.T) {
 	// Create spans with different names
 	spans := []*span.Span{
 		{
-			TraceID:     "trace-1",
-			SpanID:      "span-1",
+			TraceID:     "00000000000000010000000000000001",
+			SpanID:      "000000000000000c",
 			Name:        "GET /api/users",
 			ServiceName: "api",
 			StartTime:   baseTime,
@@ -495,8 +495,8 @@ func TestNameQueryIndexPath(t *testing.T) {
 			},
 		},
 		{
-			TraceID:     "trace-2",
-			SpanID:      "span-2",
+			TraceID:     "00000000000000020000000000000002",
+			SpanID:      "000000000000000d",
 			Name:        "GET /api/users",
 			ServiceName: "api",
 			StartTime:   baseTime.Add(100 * time.Millisecond),
@@ -508,8 +508,8 @@ func TestNameQueryIndexPath(t *testing.T) {
 			},
 		},
 		{
-			TraceID:     "trace-3",
-			SpanID:      "span-3",
+			TraceID:     "00000000000000030000000000000003",
+			SpanID:      "000000000000000e",
 			Name:        "POST /api/orders",
 			ServiceName: "api",
 			StartTime:   baseTime.Add(200 * time.Millisecond),
@@ -587,8 +587,8 @@ func TestSpanIDDirectLookup(t *testing.T) {
 
 	spans := []*span.Span{
 		{
-			TraceID:     "trace-1",
-			SpanID:      "target-span",
+			TraceID:     "00000000000000010000000000000001",
+			SpanID:      "000000000000000f",
 			Name:        "operation",
 			ServiceName: "service",
 			StartTime:   baseTime,
@@ -597,8 +597,8 @@ func TestSpanIDDirectLookup(t *testing.T) {
 			Tags:        map[string]string{"name": "operation"},
 		},
 		{
-			TraceID:     "trace-1",
-			SpanID:      "other-span-1",
+			TraceID:     "00000000000000010000000000000001",
+			SpanID:      "0000000000000010",
 			Name:        "operation",
 			ServiceName: "service",
 			StartTime:   baseTime.Add(20 * time.Millisecond),
@@ -607,8 +607,8 @@ func TestSpanIDDirectLookup(t *testing.T) {
 			Tags:        map[string]string{"name": "operation"},
 		},
 		{
-			TraceID:     "trace-1",
-			SpanID:      "other-span-2",
+			TraceID:     "00000000000000010000000000000001",
+			SpanID:      "0000000000000011",
 			Name:        "operation",
 			ServiceName: "service",
 			StartTime:   baseTime.Add(40 * time.Millisecond),
@@ -632,7 +632,7 @@ func TestSpanIDDirectLookup(t *testing.T) {
 			t.Fatal("Head should have index")
 		}
 
-		ref, ok := headStorage.GetIndex().LookupSpanID("target-span")
+		ref, ok := headStorage.GetIndex().LookupSpanID("000000000000000f")
 		if !ok {
 			t.Fatal("spanIndex should have target-span")
 		}
@@ -641,7 +641,7 @@ func TestSpanIDDirectLookup(t *testing.T) {
 		}
 
 		// Query by span_id (should be fastest - 2-hop lookup)
-		matcher, _ := NewMatcher(MatchEqual, "span_id", "target-span")
+		matcher, _ := NewMatcher(MatchEqual, "span_id", "000000000000000f")
 		results, err := Select(headStorage, matcher)
 		if err != nil {
 			t.Fatalf("Select error: %v", err)
@@ -651,8 +651,8 @@ func TestSpanIDDirectLookup(t *testing.T) {
 			t.Errorf("Should get exactly 1 span, got %d", len(results.Spans))
 		}
 
-		if results.Spans[0].SpanID != "target-span" {
-			t.Errorf("Got span %s, want target-span", results.Spans[0].SpanID)
+		if results.Spans[0].SpanID != "000000000000000f" {
+			t.Errorf("Got span %s, want 000000000000000f", results.Spans[0].SpanID)
 		}
 	})
 
@@ -665,7 +665,7 @@ func TestSpanIDDirectLookup(t *testing.T) {
 			t.Fatal("Parquet block should have index")
 		}
 
-		ref, ok := l1Block.Index().LookupSpanID("target-span")
+		ref, ok := l1Block.Index().LookupSpanID("000000000000000f")
 		if !ok {
 			t.Fatal("spanIndex should have target-span")
 		}
@@ -674,7 +674,7 @@ func TestSpanIDDirectLookup(t *testing.T) {
 		}
 
 		// Query by span_id
-		matcher, _ := NewMatcher(MatchEqual, "span_id", "target-span")
+		matcher, _ := NewMatcher(MatchEqual, "span_id", "000000000000000f")
 		emptyHead := storage.NewArrowStorage()
 		defer emptyHead.Release()
 		emptyHead.Flush()
@@ -688,8 +688,8 @@ func TestSpanIDDirectLookup(t *testing.T) {
 			t.Errorf("Should get exactly 1 span from Parquet, got %d", len(results.Spans))
 		}
 
-		if results.Spans[0].SpanID != "target-span" {
-			t.Errorf("Got span %s, want target-span", results.Spans[0].SpanID)
+		if results.Spans[0].SpanID != "000000000000000f" {
+			t.Errorf("Got span %s, want 000000000000000f", results.Spans[0].SpanID)
 		}
 	})
 }

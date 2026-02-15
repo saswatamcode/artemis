@@ -26,7 +26,7 @@ type ArrowEventStorage struct {
 type EventRecordBuilder struct {
 	mem             memory.Allocator
 	schema          *arrow.Schema
-	spanID          *array.StringBuilder
+	spanID          *array.Uint64Builder
 	name            *array.StringBuilder
 	timestamp       *array.Int64Builder
 	attributes      *array.MapBuilder
@@ -52,7 +52,7 @@ func NewArrowEventStorage() *ArrowEventStorage {
 func createEventSchema() *arrow.Schema {
 	return arrow.NewSchema(
 		[]arrow.Field{
-			{Name: "span_id", Type: arrow.BinaryTypes.String, Nullable: false},
+			{Name: "span_id", Type: arrow.PrimitiveTypes.Uint64, Nullable: false},
 			{Name: "name", Type: arrow.BinaryTypes.String, Nullable: false},
 			{Name: "timestamp", Type: arrow.PrimitiveTypes.Int64, Nullable: false},
 			{Name: "attributes", Type: arrow.MapOf(arrow.BinaryTypes.String, arrow.BinaryTypes.String), Nullable: true},
@@ -63,7 +63,7 @@ func createEventSchema() *arrow.Schema {
 
 // NewEventRecordBuilder creates a new record builder for span events
 func NewEventRecordBuilder(mem memory.Allocator, schema *arrow.Schema) *EventRecordBuilder {
-	spanID := array.NewStringBuilder(mem)
+	spanID := array.NewUint64Builder(mem)
 	spanID.Reserve(eventBatchSize)
 
 	name := array.NewStringBuilder(mem)
@@ -87,7 +87,13 @@ func NewEventRecordBuilder(mem memory.Allocator, schema *arrow.Schema) *EventRec
 
 // Append adds a span event to the builder
 func (b *EventRecordBuilder) Append(e *span.SpanEvent) {
-	b.spanID.Append(e.SpanID)
+	// Parse span ID
+	spanIDVal, err := span.ParseSpanID(e.SpanID)
+	if err != nil {
+		spanIDVal = 0
+	}
+	b.spanID.Append(spanIDVal)
+
 	b.name.Append(e.Name)
 	b.timestamp.Append(e.Timestamp.UnixNano())
 
@@ -114,7 +120,7 @@ func (b *EventRecordBuilder) NewRecord() arrow.RecordBatch {
 	}
 
 	columns := []arrow.Array{
-		b.spanID.NewStringArray(),
+		b.spanID.NewUint64Array(),
 		b.name.NewStringArray(),
 		b.timestamp.NewInt64Array(),
 		b.attributes.NewMapArray(),
@@ -262,7 +268,10 @@ func (s *ArrowEventStorage) extractEvent(record arrow.RecordBatch, rowIndex int)
 
 	e := &span.SpanEvent{}
 
-	e.SpanID = record.Column(0).(*array.String).Value(rowIndex)
+	// Read span_id and format as hex string
+	spanIDVal := record.Column(0).(*array.Uint64).Value(rowIndex)
+	e.SpanID = fmt.Sprintf("%016x", spanIDVal)
+
 	e.Name = record.Column(1).(*array.String).Value(rowIndex)
 	e.Timestamp = time.Unix(0, record.Column(2).(*array.Int64).Value(rowIndex))
 

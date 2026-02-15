@@ -20,8 +20,8 @@ func TestArrowBlock_RecordsIteration(t *testing.T) {
 	now := time.Now()
 	spans := []*span.Span{
 		{
-			TraceID:      "trace-1",
-			SpanID:       "span-1",
+			TraceID:      "00000000000000010000000000000001", // Valid 32-char hex
+			SpanID:       "0000000000000001",                 // Valid 16-char hex
 			ParentSpanID: "",
 			Name:         "root-span",
 			StartTime:    now,
@@ -34,9 +34,9 @@ func TestArrowBlock_RecordsIteration(t *testing.T) {
 			},
 		},
 		{
-			TraceID:      "trace-1",
-			SpanID:       "span-2",
-			ParentSpanID: "span-1",
+			TraceID:      "00000000000000010000000000000001", // Same trace ID
+			SpanID:       "0000000000000002",                 // Different span ID
+			ParentSpanID: "0000000000000001",
 			Name:         "db-query",
 			StartTime:    now.Add(2 * time.Millisecond),
 			EndTime:      now.Add(8 * time.Millisecond),
@@ -48,8 +48,8 @@ func TestArrowBlock_RecordsIteration(t *testing.T) {
 			},
 		},
 		{
-			TraceID:      "trace-2",
-			SpanID:       "span-3",
+			TraceID:      "00000000000000020000000000000002", // Different trace ID
+			SpanID:       "0000000000000003",                 // Different span ID
 			ParentSpanID: "",
 			Name:         "cache-lookup",
 			StartTime:    now.Add(15 * time.Millisecond),
@@ -160,8 +160,8 @@ func TestArrowBlock_Schema(t *testing.T) {
 	now := time.Now()
 	spans := []*span.Span{
 		{
-			TraceID:     "trace-1",
-			SpanID:      "span-1",
+			TraceID:     "00000000000000010000000000000001",
+			SpanID:      "0000000000000001",
 			Name:        "test-op",
 			StartTime:   now,
 			EndTime:     now.Add(time.Millisecond),
@@ -204,7 +204,8 @@ func TestArrowBlock_Schema(t *testing.T) {
 
 	// Verify schema has expected fields
 	expectedFields := []string{
-		"trace_id",
+		"trace_id_hi",
+		"trace_id_lo",
 		"span_id",
 		"parent_span_id",
 		"name",
@@ -235,8 +236,8 @@ func TestArrowBlock_IndexLookup(t *testing.T) {
 	now := time.Now()
 	spans := []*span.Span{
 		{
-			TraceID:     "trace-alpha",
-			SpanID:      "span-a1",
+			TraceID:     "0000000000000a1f0000000000000a1f", // trace-alpha as hex
+			SpanID:      "00000000000000a1",                 // span-a1 as hex
 			Name:        "operation-1",
 			StartTime:   now,
 			EndTime:     now.Add(time.Millisecond),
@@ -245,8 +246,8 @@ func TestArrowBlock_IndexLookup(t *testing.T) {
 			Tags:        map[string]string{"env": "prod"},
 		},
 		{
-			TraceID:     "trace-alpha",
-			SpanID:      "span-a2",
+			TraceID:     "0000000000000a1f0000000000000a1f", // Same trace-alpha
+			SpanID:      "00000000000000a2",                 // span-a2 as hex
 			Name:        "operation-2",
 			StartTime:   now.Add(time.Millisecond),
 			EndTime:     now.Add(2 * time.Millisecond),
@@ -255,8 +256,8 @@ func TestArrowBlock_IndexLookup(t *testing.T) {
 			Tags:        map[string]string{"env": "prod"},
 		},
 		{
-			TraceID:     "trace-beta",
-			SpanID:      "span-b1",
+			TraceID:     "0000000000000be70000000000000be7", // trace-beta as hex
+			SpanID:      "00000000000000b1",                 // span-b1 as hex
 			Name:        "operation-3",
 			StartTime:   now.Add(2 * time.Millisecond),
 			EndTime:     now.Add(3 * time.Millisecond),
@@ -330,12 +331,12 @@ func TestArrowBlock_IndexLookup(t *testing.T) {
 	}
 
 	// Test trace ID lookup
-	traceAlphaSpans := idx.LookupByTraceID("trace-alpha")
+	traceAlphaSpans := idx.LookupByTraceID("0000000000000a1f0000000000000a1f")
 	if len(traceAlphaSpans) != 2 {
 		t.Errorf("LookupByTraceID(trace-alpha) returned %d spans, want 2", len(traceAlphaSpans))
 	}
 
-	traceBetaSpans := idx.LookupByTraceID("trace-beta")
+	traceBetaSpans := idx.LookupByTraceID("0000000000000be70000000000000be7")
 	if len(traceBetaSpans) != 1 {
 		t.Errorf("LookupByTraceID(trace-beta) returned %d spans, want 1", len(traceBetaSpans))
 	}
@@ -364,7 +365,7 @@ func TestArrowBlock_MultipleRecords(t *testing.T) {
 
 	for i := range numSpans {
 		spans[i] = &span.Span{
-			TraceID:     "trace-bulk",
+			TraceID:     "00000000000000010000000000000001", // Valid hex trace ID
 			SpanID:      ulid.Make().String(),
 			Name:        "bulk-operation",
 			StartTime:   now.Add(time.Duration(i) * time.Microsecond),
@@ -443,8 +444,8 @@ func TestArrowBlock_EmptyTags(t *testing.T) {
 	now := time.Now()
 	spans := []*span.Span{
 		{
-			TraceID:     "trace-1",
-			SpanID:      "span-1",
+			TraceID:     "00000000000000010000000000000001",
+			SpanID:      "0000000000000001",
 			Name:        "no-tags",
 			StartTime:   now,
 			EndTime:     now.Add(time.Millisecond),
@@ -453,8 +454,8 @@ func TestArrowBlock_EmptyTags(t *testing.T) {
 			Tags:        map[string]string{}, // Empty tags
 		},
 		{
-			TraceID:     "trace-1",
-			SpanID:      "span-2",
+			TraceID:     "00000000000000010000000000000001",
+			SpanID:      "0000000000000002",
 			Name:        "nil-tags",
 			StartTime:   now,
 			EndTime:     now.Add(time.Millisecond),
@@ -463,8 +464,8 @@ func TestArrowBlock_EmptyTags(t *testing.T) {
 			Tags:        nil, // Nil tags
 		},
 		{
-			TraceID:     "trace-1",
-			SpanID:      "span-3",
+			TraceID:     "00000000000000010000000000000001",
+			SpanID:      "0000000000000003",
 			Name:        "with-tags",
 			StartTime:   now,
 			EndTime:     now.Add(time.Millisecond),
@@ -542,8 +543,8 @@ func TestArrowBlock_Close(t *testing.T) {
 	now := time.Now()
 	spans := []*span.Span{
 		{
-			TraceID:     "trace-1",
-			SpanID:      "span-1",
+			TraceID:     "00000000000000010000000000000001",
+			SpanID:      "0000000000000001",
 			Name:        "test",
 			StartTime:   now,
 			EndTime:     now.Add(time.Millisecond),
@@ -604,8 +605,8 @@ func TestArrowBlock_Metadata(t *testing.T) {
 	blockID := ulid.Make()
 	spans := []*span.Span{
 		{
-			TraceID:     "trace-1",
-			SpanID:      "span-1",
+			TraceID:     "00000000000000010000000000000001",
+			SpanID:      "0000000000000001",
 			Name:        "test",
 			StartTime:   now,
 			EndTime:     now.Add(5 * time.Millisecond),

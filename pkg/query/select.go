@@ -517,10 +517,11 @@ func buildSelectionBitmap(record arrow.RecordBatch, ms Matchers, timeRange *Time
 	}
 
 	// Validate schema has enough columns for time range filtering
-	if timeRange != nil && record.NumCols() >= 6 {
+	if timeRange != nil && record.NumCols() >= 7 {
 		// Phase 1: Filter by time range using columnar access (very fast, SIMD-friendly)
-		startTimeCol := record.Column(4).(*array.Int64)
-		endTimeCol := record.Column(5).(*array.Int64)
+		// New schema: trace_id_hi(0), trace_id_lo(1), span_id(2), parent_span_id(3), name(4), start_time(5), end_time(6)
+		startTimeCol := record.Column(5).(*array.Int64)
+		endTimeCol := record.Column(6).(*array.Int64)
 		startNano := timeRange.Start.UnixNano()
 		endNano := timeRange.End.UnixNano()
 
@@ -561,40 +562,46 @@ func applyMatcherColumnar(record arrow.RecordBatch, m *Matcher, selection []bool
 	numCols := int(record.NumCols())
 
 	// Validate schema before accessing columns
+	// New schema: trace_id_hi(0), trace_id_lo(1), span_id(2), parent_span_id(3), name(4),
+	//             start_time(5), end_time(6), duration(7), service_name(8), tags(9)
 	switch m.Name {
 	case "trace_id":
-		if numCols < 1 {
+		if numCols < 2 {
 			return
 		}
-		col := record.Column(0).(*array.String)
+		hiCol := record.Column(0).(*array.Uint64)
+		loCol := record.Column(1).(*array.Uint64)
 		for row := 0; row < numRows; row++ {
 			if !selection[row] {
 				continue
 			}
-			if !m.MatchesValue(col.Value(row), true) {
+			// Format as hex string: "%016x%016x"
+			traceID := fmt.Sprintf("%016x%016x", hiCol.Value(row), loCol.Value(row))
+			if !m.MatchesValue(traceID, true) {
 				selection[row] = false
 			}
 		}
 
 	case "span_id":
-		if numCols < 2 {
+		if numCols < 3 {
 			return
 		}
-		col := record.Column(1).(*array.String)
+		col := record.Column(2).(*array.Uint64)
 		for row := 0; row < numRows; row++ {
 			if !selection[row] {
 				continue
 			}
-			if !m.MatchesValue(col.Value(row), true) {
+			spanID := fmt.Sprintf("%016x", col.Value(row))
+			if !m.MatchesValue(spanID, true) {
 				selection[row] = false
 			}
 		}
 
 	case "parent_span_id":
-		if numCols < 3 {
+		if numCols < 4 {
 			return
 		}
-		col := record.Column(2).(*array.String)
+		col := record.Column(3).(*array.Uint64)
 		for row := 0; row < numRows; row++ {
 			if !selection[row] {
 				continue
@@ -602,7 +609,7 @@ func applyMatcherColumnar(record arrow.RecordBatch, m *Matcher, selection []bool
 			isNull := col.IsNull(row)
 			val := ""
 			if !isNull {
-				val = col.Value(row)
+				val = fmt.Sprintf("%016x", col.Value(row))
 			}
 			if !m.MatchesValue(val, !isNull) {
 				selection[row] = false
@@ -610,10 +617,10 @@ func applyMatcherColumnar(record arrow.RecordBatch, m *Matcher, selection []bool
 		}
 
 	case "name":
-		if numCols < 4 {
+		if numCols < 5 {
 			return
 		}
-		col := record.Column(3).(*array.String)
+		col := record.Column(4).(*array.String)
 		for row := 0; row < numRows; row++ {
 			if !selection[row] {
 				continue
@@ -624,10 +631,10 @@ func applyMatcherColumnar(record arrow.RecordBatch, m *Matcher, selection []bool
 		}
 
 	case "service.name", "service_name":
-		if numCols < 8 {
+		if numCols < 9 {
 			return
 		}
-		col := record.Column(7).(*array.String)
+		col := record.Column(8).(*array.String)
 		for row := 0; row < numRows; row++ {
 			if !selection[row] {
 				continue

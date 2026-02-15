@@ -1,6 +1,7 @@
 package tempo
 
 import (
+	"strconv"
 	"time"
 
 	commonv1 "go.opentelemetry.io/proto/otlp/common/v1"
@@ -21,7 +22,7 @@ type TraceSearchMetadata struct {
 	TraceID           string                 `json:"traceID"`
 	RootServiceName   string                 `json:"rootServiceName"`
 	RootTraceName     string                 `json:"rootTraceName"`
-	StartTimeUnixNano uint64                 `json:"startTimeUnixNano"`
+	StartTimeUnixNano string                 `json:"startTimeUnixNano"`
 	DurationMs        uint64                 `json:"durationMs"`
 	SpanSets          []SpanSet              `json:"spanSets,omitempty"`
 	ServiceStats      map[string]ServiceStat `json:"serviceStats,omitempty"`
@@ -35,11 +36,22 @@ type SpanSet struct {
 
 // SpanMetadata represents span metadata
 type SpanMetadata struct {
-	SpanID            string            `json:"spanID"`
-	Name              string            `json:"name"`
-	StartTimeUnixNano uint64            `json:"startTimeUnixNano"`
-	DurationNanos     uint64            `json:"durationNanos"`
-	Attributes        map[string]string `json:"attributes,omitempty"`
+	SpanID            string      `json:"spanID"`
+	Name              string      `json:"name"`
+	StartTimeUnixNano string      `json:"startTimeUnixNano"`
+	DurationNanos     string      `json:"durationNanos"`
+	Attributes        []Attribute `json:"attributes,omitempty"`
+}
+
+// Attribute represents a span attribute
+type Attribute struct {
+	Key   string         `json:"key"`
+	Value AttributeValue `json:"value"`
+}
+
+// AttributeValue represents an attribute value
+type AttributeValue struct {
+	StringValue string `json:"stringValue,omitempty"`
 }
 
 // ServiceStat represents service statistics
@@ -320,12 +332,44 @@ func ConvertSpansToSearchMetadata(traceSpans map[string][]*span.Span) []TraceSea
 			svcStats[svc] = *stats
 		}
 
+		// Create span metadata for the trace
+		spanMetadata := make([]SpanMetadata, 0, len(spans))
+		for _, s := range spans {
+			// Convert tags to attribute array format
+			attrs := make([]Attribute, 0, len(s.Tags))
+			for k, v := range s.Tags {
+				attrs = append(attrs, Attribute{
+					Key: k,
+					Value: AttributeValue{
+						StringValue: v,
+					},
+				})
+			}
+
+			spanMetadata = append(spanMetadata, SpanMetadata{
+				SpanID:            s.SpanID,
+				Name:              s.Name,
+				StartTimeUnixNano: strconv.FormatUint(uint64(s.StartTime.UnixNano()), 10),
+				DurationNanos:     strconv.FormatUint(uint64(s.EndTime.Sub(s.StartTime).Nanoseconds()), 10),
+				Attributes:        attrs,
+			})
+		}
+
+		// Create a single SpanSet containing all spans in the trace
+		spanSets := []SpanSet{
+			{
+				Spans:   spanMetadata,
+				Matched: len(spanMetadata),
+			},
+		}
+
 		results = append(results, TraceSearchMetadata{
 			TraceID:           traceID,
 			RootServiceName:   rootServiceName,
 			RootTraceName:     rootTraceName,
-			StartTimeUnixNano: uint64(minStartTime.UnixNano()),
+			StartTimeUnixNano: strconv.FormatUint(uint64(minStartTime.UnixNano()), 10),
 			DurationMs:        uint64(duration.Milliseconds()),
+			SpanSets:          spanSets,
 			ServiceStats:      svcStats,
 		})
 	}

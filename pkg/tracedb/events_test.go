@@ -22,8 +22,8 @@ func TestDB_WriteAndReadEvents(t *testing.T) {
 
 	// Write a span first
 	sp := &span.Span{
-		TraceID:     "trace-1",
-		SpanID:      "span-1",
+		TraceID:     "00000000000000000000000000000001",
+		SpanID:      "0000000000000001",
 		Name:        "operation",
 		StartTime:   time.Now(),
 		EndTime:     time.Now().Add(time.Millisecond),
@@ -36,7 +36,7 @@ func TestDB_WriteAndReadEvents(t *testing.T) {
 
 	// Write events for the span
 	evt := &span.SpanEvent{
-		SpanID:    "span-1",
+		SpanID:    "0000000000000001",
 		Name:      "cache.hit",
 		Timestamp: time.Now(),
 		Attributes: map[string]string{
@@ -50,7 +50,7 @@ func TestDB_WriteAndReadEvents(t *testing.T) {
 	}
 
 	// Read events back
-	events, err := db.GetEventsForSpan("span-1")
+	events, err := db.GetEventsForSpan("0000000000000001")
 	if err != nil {
 		t.Fatalf("GetEventsForSpan() error = %v", err)
 	}
@@ -80,8 +80,8 @@ func TestDB_WriteEventsBatch(t *testing.T) {
 
 	// Write a span
 	sp := &span.Span{
-		TraceID:     "trace-1",
-		SpanID:      "span-1",
+		TraceID:     "00000000000000000000000000000001",
+		SpanID:      "0000000000000001",
 		Name:        "operation",
 		StartTime:   time.Now(),
 		EndTime:     time.Now().Add(time.Millisecond),
@@ -96,7 +96,7 @@ func TestDB_WriteEventsBatch(t *testing.T) {
 	events := make([]*span.SpanEvent, 10)
 	for i := range 10 {
 		events[i] = &span.SpanEvent{
-			SpanID:    "span-1",
+			SpanID:    "0000000000000001",
 			Name:      fmt.Sprintf("event-%d", i),
 			Timestamp: time.Now().Add(time.Duration(i) * time.Millisecond),
 			Attributes: map[string]string{
@@ -110,7 +110,7 @@ func TestDB_WriteEventsBatch(t *testing.T) {
 	}
 
 	// Read events back
-	readEvents, err := db.GetEventsForSpan("span-1")
+	readEvents, err := db.GetEventsForSpan("0000000000000001")
 	if err != nil {
 		t.Fatalf("GetEventsForSpan() error = %v", err)
 	}
@@ -133,8 +133,8 @@ func TestDB_GetEventsForTrace(t *testing.T) {
 	// Write multiple spans in same trace
 	for i := range 5 {
 		sp := &span.Span{
-			TraceID:     "trace-1",
-			SpanID:      fmt.Sprintf("span-%d", i),
+			TraceID:     "00000000000000000000000000000001",
+			SpanID:      fmt.Sprintf("%016x", i+1),
 			Name:        "operation",
 			StartTime:   time.Now(),
 			EndTime:     time.Now().Add(time.Millisecond),
@@ -147,7 +147,7 @@ func TestDB_GetEventsForTrace(t *testing.T) {
 		// Write events for each span
 		for j := range 3 {
 			evt := &span.SpanEvent{
-				SpanID:    fmt.Sprintf("span-%d", i),
+				SpanID:    fmt.Sprintf("%016x", i+1),
 				Name:      fmt.Sprintf("event-%d", j),
 				Timestamp: time.Now(),
 				Attributes: map[string]string{
@@ -162,7 +162,7 @@ func TestDB_GetEventsForTrace(t *testing.T) {
 	}
 
 	// Get all events for the trace
-	eventsMap, err := db.GetEventsForTrace("trace-1")
+	eventsMap, err := db.GetEventsForTrace("00000000000000000000000000000001")
 	if err != nil {
 		t.Fatalf("GetEventsForTrace() error = %v", err)
 	}
@@ -174,7 +174,7 @@ func TestDB_GetEventsForTrace(t *testing.T) {
 
 	// Each span should have 3 events
 	for i := range 5 {
-		spanID := fmt.Sprintf("span-%d", i)
+		spanID := fmt.Sprintf("%016x", i+1)
 		events, exists := eventsMap[spanID]
 		if !exists {
 			t.Errorf("No events found for %s", spanID)
@@ -199,8 +199,8 @@ func TestDB_QuerySpansWithEvents(t *testing.T) {
 	// Write spans with events
 	for i := range 3 {
 		sp := &span.Span{
-			TraceID:     "trace-1",
-			SpanID:      fmt.Sprintf("span-%d", i),
+			TraceID:     "00000000000000000000000000000001",
+			SpanID:      fmt.Sprintf("%016x", i+1),
 			Name:        "operation",
 			StartTime:   time.Now(),
 			EndTime:     time.Now().Add(time.Millisecond),
@@ -213,7 +213,7 @@ func TestDB_QuerySpansWithEvents(t *testing.T) {
 		// Write events
 		for j := range 2 {
 			evt := &span.SpanEvent{
-				SpanID:    fmt.Sprintf("span-%d", i),
+				SpanID:    fmt.Sprintf("%016x", i+1),
 				Name:      fmt.Sprintf("event-%d", j),
 				Timestamp: time.Now(),
 			}
@@ -224,7 +224,7 @@ func TestDB_QuerySpansWithEvents(t *testing.T) {
 	}
 
 	// Query spans without events
-	matcher, _ := query.NewMatcher(query.MatchEqual, "trace_id", "trace-1")
+	matcher, _ := query.NewMatcher(query.MatchEqual, "trace_id", "00000000000000000000000000000001")
 	spansWithoutEvents, err := db.QuerySpansWithEvents(false, matcher)
 	if err != nil {
 		t.Fatalf("QuerySpansWithEvents(false) error = %v", err)
@@ -277,8 +277,8 @@ func TestDB_EventsWithPersistence(t *testing.T) {
 	// Write spans and events
 	for i := range 5 {
 		sp := &span.Span{
-			TraceID:     "trace-1",
-			SpanID:      fmt.Sprintf("span-%d", i),
+			TraceID:     "00000000000000000000000000000001",
+			SpanID:      fmt.Sprintf("%016x", i+1),
 			Name:        "operation",
 			StartTime:   time.Now(),
 			EndTime:     time.Now().Add(time.Millisecond),
@@ -290,7 +290,7 @@ func TestDB_EventsWithPersistence(t *testing.T) {
 
 		// Write events
 		evt := &span.SpanEvent{
-			SpanID:    fmt.Sprintf("span-%d", i),
+			SpanID:    fmt.Sprintf("%016x", i+1),
 			Name:      "test-event",
 			Timestamp: time.Now(),
 			Attributes: map[string]string{
@@ -325,7 +325,7 @@ func TestDB_EventsWithPersistence(t *testing.T) {
 	// Note: Events may appear twice - once from WAL replay and once from persisted block
 	// This is expected until checkpoint cleanup runs (same as spans)
 	for i := range 5 {
-		spanID := fmt.Sprintf("span-%d", i)
+		spanID := fmt.Sprintf("%016x", i+1)
 		events, err := db2.GetEventsForSpan(spanID)
 		if err != nil {
 			t.Fatalf("GetEventsForSpan(%s) after restart error = %v", spanID, err)
@@ -364,8 +364,8 @@ func TestDB_EventsAcrossMultipleSpans(t *testing.T) {
 	spanEventCount := make(map[string]int)
 	for i := range 100 {
 		sp := &span.Span{
-			TraceID:     fmt.Sprintf("trace-%d", i%10), // 10 different traces
-			SpanID:      fmt.Sprintf("span-%d", i),
+			TraceID:     fmt.Sprintf("%032x", i%10), // 10 different traces
+			SpanID:      fmt.Sprintf("%016x", i+1),
 			Name:        "operation",
 			StartTime:   time.Now(),
 			EndTime:     time.Now().Add(time.Millisecond),
@@ -416,8 +416,8 @@ func TestDB_EmptyEventsQuery(t *testing.T) {
 
 	// Write span without events
 	sp := &span.Span{
-		TraceID:     "trace-1",
-		SpanID:      "span-1",
+		TraceID:     "00000000000000000000000000000001",
+		SpanID:      "0000000000000001",
 		Name:        "operation",
 		StartTime:   time.Now(),
 		EndTime:     time.Now().Add(time.Millisecond),
@@ -429,7 +429,7 @@ func TestDB_EmptyEventsQuery(t *testing.T) {
 	}
 
 	// Query events for span without events
-	events, err := db.GetEventsForSpan("span-1")
+	events, err := db.GetEventsForSpan("0000000000000001")
 	if err != nil {
 		t.Fatalf("GetEventsForSpan() error = %v", err)
 	}
@@ -439,7 +439,7 @@ func TestDB_EmptyEventsQuery(t *testing.T) {
 	}
 
 	// Query events for non-existent span
-	events2, err := db.GetEventsForSpan("span-999")
+	events2, err := db.GetEventsForSpan("0000000000000999")
 	if err != nil {
 		t.Fatalf("GetEventsForSpan(non-existent) error = %v", err)
 	}
@@ -460,7 +460,7 @@ func BenchmarkDB_WriteEvent(b *testing.B) {
 	defer db.Close()
 
 	evt := &span.SpanEvent{
-		SpanID:    "span-1",
+		SpanID:    "0000000000000001",
 		Name:      "cache.hit",
 		Timestamp: time.Now(),
 		Attributes: map[string]string{
@@ -488,7 +488,7 @@ func BenchmarkDB_WriteEvents_Batch100(b *testing.B) {
 	events := make([]*span.SpanEvent, 100)
 	for i := range 100 {
 		events[i] = &span.SpanEvent{
-			SpanID:    "span-1",
+			SpanID:    "0000000000000001",
 			Name:      fmt.Sprintf("event-%d", i),
 			Timestamp: time.Now(),
 			Attributes: map[string]string{
@@ -516,7 +516,7 @@ func BenchmarkDB_GetEventsForSpan(b *testing.B) {
 	// Populate with events
 	for i := range 100 {
 		evt := &span.SpanEvent{
-			SpanID:    "span-1",
+			SpanID:    "0000000000000001",
 			Name:      fmt.Sprintf("event-%d", i),
 			Timestamp: time.Now(),
 		}
@@ -527,6 +527,6 @@ func BenchmarkDB_GetEventsForSpan(b *testing.B) {
 
 	b.ResetTimer()
 	for b.Loop() {
-		db.GetEventsForSpan("span-1")
+		db.GetEventsForSpan("0000000000000001")
 	}
 }

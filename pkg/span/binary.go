@@ -22,10 +22,11 @@ import (
 // svarint  duration_nano
 // uvarint  tags_count
 // repeat:
-//   uvarint key_len
-//   bytes   key
-//   uvarint val_len
-//   bytes   val
+//
+//	uvarint key_len
+//	bytes   key
+//	uvarint val_len
+//	bytes   val
 func (s *Span) MarshalBinary() ([]byte, error) {
 	// Estimate buffer size to reduce allocations
 	estimatedSize := 8*4 + // Fixed u64 fields
@@ -36,7 +37,7 @@ func (s *Span) MarshalBinary() ([]byte, error) {
 	buf := make([]byte, 0, estimatedSize)
 
 	// Parse trace ID (assume 128-bit hex string, split into hi/lo)
-	traceIDHi, traceIDLo, err := parseTraceID(s.TraceID)
+	traceIDHi, traceIDLo, err := ParseTraceID(s.TraceID)
 	if err != nil {
 		return nil, fmt.Errorf("invalid trace ID: %w", err)
 	}
@@ -235,7 +236,7 @@ func readString(data []byte, offset int) (string, int, error) {
 	return str, newOffset + int(length), nil
 }
 
-func parseTraceID(traceID string) (uint64, uint64, error) {
+func ParseTraceID(traceID string) (uint64, uint64, error) {
 	// Handle 128-bit trace ID (32 hex chars) or 64-bit (16 hex chars)
 	if len(traceID) == 32 {
 		// 128-bit: split into hi and lo
@@ -259,12 +260,17 @@ func parseTraceID(traceID string) (uint64, uint64, error) {
 	return 0, 0, fmt.Errorf("invalid trace ID length: %d", len(traceID))
 }
 
-func parseSpanID(spanID string) (uint64, error) {
+func ParseSpanID(spanID string) (uint64, error) {
 	// Expect 16 hex chars (64-bit)
 	if len(spanID) != 16 {
 		return 0, fmt.Errorf("invalid span ID length: %d", len(spanID))
 	}
 	return strconv.ParseUint(spanID, 16, 64)
+}
+
+// Keep private version for backwards compatibility
+func parseSpanID(spanID string) (uint64, error) {
+	return ParseSpanID(spanID)
 }
 
 func unixNanoToTime(nano int64) time.Time {
@@ -278,10 +284,11 @@ func unixNanoToTime(nano int64) time.Time {
 // svarint  timestamp_unix_nano
 // uvarint  attributes_count
 // repeat:
-//   uvarint key_len
-//   bytes   key
-//   uvarint val_len
-//   bytes   val
+//
+//	uvarint key_len
+//	bytes   key
+//	uvarint val_len
+//	bytes   val
 func (e *SpanEvent) MarshalBinary() ([]byte, error) {
 	// Estimate buffer size
 	estimatedSize := 8 + // span_id
@@ -387,10 +394,11 @@ func (e *SpanEvent) UnmarshalBinary(data []byte) error {
 // u64be    linked_span_id
 // uvarint  attributes_count
 // repeat:
-//   uvarint key_len
-//   bytes   key
-//   uvarint val_len
-//   bytes   val
+//
+//	uvarint key_len
+//	bytes   key
+//	uvarint val_len
+//	bytes   val
 func (l *SpanLink) MarshalBinary() ([]byte, error) {
 	// Estimate buffer size
 	estimatedSize := 8*4 + // Fixed u64 fields
@@ -405,7 +413,7 @@ func (l *SpanLink) MarshalBinary() ([]byte, error) {
 	}
 
 	// Parse linked trace ID
-	linkedTraceIDHi, linkedTraceIDLo, err := parseTraceID(l.LinkedTraceID)
+	linkedTraceIDHi, linkedTraceIDLo, err := ParseTraceID(l.LinkedTraceID)
 	if err != nil {
 		return nil, fmt.Errorf("invalid linked trace ID: %w", err)
 	}

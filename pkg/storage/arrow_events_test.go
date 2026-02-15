@@ -13,7 +13,7 @@ func TestArrowEventStorage_AddAndQuery(t *testing.T) {
 	defer storage.Release()
 
 	evt := &span.SpanEvent{
-		SpanID:    "span-1",
+		SpanID:    "0000000000000001",
 		Name:      "cache.hit",
 		Timestamp: time.Now(),
 		Attributes: map[string]string{
@@ -33,7 +33,7 @@ func TestArrowEventStorage_AddAndQuery(t *testing.T) {
 	}
 
 	// Query by span ID
-	events, err := storage.GetEventsBySpanID("span-1")
+	events, err := storage.GetEventsBySpanID("0000000000000001")
 	if err != nil {
 		t.Fatalf("GetEventsBySpanID() error = %v", err)
 	}
@@ -58,7 +58,7 @@ func TestArrowEventStorage_AddMultipleEvents(t *testing.T) {
 	// Add multiple events for same span
 	for i := range 5 {
 		evt := &span.SpanEvent{
-			SpanID:    "span-1",
+			SpanID:    "0000000000000001",
 			Name:      fmt.Sprintf("event-%d", i),
 			Timestamp: time.Now().Add(time.Duration(i) * time.Millisecond),
 			Attributes: map[string]string{
@@ -73,7 +73,7 @@ func TestArrowEventStorage_AddMultipleEvents(t *testing.T) {
 	// Add events for different span
 	for i := range 3 {
 		evt := &span.SpanEvent{
-			SpanID:    "span-2",
+			SpanID:    "0000000000000002",
 			Name:      fmt.Sprintf("event-%d", i),
 			Timestamp: time.Now(),
 			Attributes: map[string]string{
@@ -90,27 +90,27 @@ func TestArrowEventStorage_AddMultipleEvents(t *testing.T) {
 	}
 
 	// Query span-1 events
-	events1, err := storage.GetEventsBySpanID("span-1")
+	events1, err := storage.GetEventsBySpanID("0000000000000001")
 	if err != nil {
-		t.Fatalf("GetEventsBySpanID(span-1) error = %v", err)
+		t.Fatalf("GetEventsBySpanID(0000000000000001) error = %v", err)
 	}
 
 	if len(events1) != 5 {
-		t.Errorf("span-1 has %d events, want 5", len(events1))
+		t.Errorf("0000000000000001 has %d events, want 5", len(events1))
 	}
 
 	// Query span-2 events
-	events2, err := storage.GetEventsBySpanID("span-2")
+	events2, err := storage.GetEventsBySpanID("0000000000000002")
 	if err != nil {
-		t.Fatalf("GetEventsBySpanID(span-2) error = %v", err)
+		t.Fatalf("GetEventsBySpanID(0000000000000002) error = %v", err)
 	}
 
 	if len(events2) != 3 {
-		t.Errorf("span-2 has %d events, want 3", len(events2))
+		t.Errorf("0000000000000002 has %d events, want 3", len(events2))
 	}
 
 	// Query non-existent span
-	events3, err := storage.GetEventsBySpanID("span-999")
+	events3, err := storage.GetEventsBySpanID("0000000000000999")
 	if err != nil {
 		t.Fatalf("GetEventsBySpanID(span-999) error = %v", err)
 	}
@@ -128,7 +128,7 @@ func TestArrowEventStorage_AddEventsBatch(t *testing.T) {
 	events := make([]*span.SpanEvent, 100)
 	for i := range 100 {
 		events[i] = &span.SpanEvent{
-			SpanID:    fmt.Sprintf("span-%d", i%10), // 10 different spans
+			SpanID:    fmt.Sprintf("%016x", (i%10)+1), // 10 different spans
 			Name:      fmt.Sprintf("event-%d", i),
 			Timestamp: time.Now(),
 			Attributes: map[string]string{
@@ -153,7 +153,7 @@ func TestArrowEventStorage_AddEventsBatch(t *testing.T) {
 
 	// Each span should have 10 events
 	for i := range 10 {
-		spanID := fmt.Sprintf("span-%d", i)
+		spanID := fmt.Sprintf("%016x", i+1)
 		events, err := storage.GetEventsBySpanID(spanID)
 		if err != nil {
 			t.Fatalf("GetEventsBySpanID(%s) error = %v", spanID, err)
@@ -171,7 +171,7 @@ func TestArrowEventStorage_Reset(t *testing.T) {
 	// Add some events
 	for i := range 10 {
 		evt := &span.SpanEvent{
-			SpanID:    "span-1",
+			SpanID:    "0000000000000001",
 			Name:      fmt.Sprintf("event-%d", i),
 			Timestamp: time.Now(),
 		}
@@ -197,7 +197,7 @@ func TestArrowEventStorage_Reset(t *testing.T) {
 
 	// Should be able to add new events after reset
 	evt := &span.SpanEvent{
-		SpanID:    "span-2",
+		SpanID:    "0000000000000002",
 		Name:      "new-event",
 		Timestamp: time.Now(),
 	}
@@ -220,7 +220,7 @@ func TestArrowEventStorage_FlushMultipleTimes(t *testing.T) {
 	for batch := range 3 {
 		for i := range 10 {
 			evt := &span.SpanEvent{
-				SpanID:    "span-1",
+				SpanID:    "0000000000000001",
 				Name:      fmt.Sprintf("batch-%d-event-%d", batch, i),
 				Timestamp: time.Now(),
 			}
@@ -243,7 +243,7 @@ func TestArrowEventStorage_FlushMultipleTimes(t *testing.T) {
 	}
 
 	// All events should be queryable
-	events, err := storage.GetEventsBySpanID("span-1")
+	events, err := storage.GetEventsBySpanID("0000000000000001")
 	if err != nil {
 		t.Fatalf("GetEventsBySpanID() error = %v", err)
 	}
@@ -259,7 +259,7 @@ func TestArrowEventStorage_EmptyAttributes(t *testing.T) {
 
 	// Event with no attributes
 	evt := &span.SpanEvent{
-		SpanID:     "span-1",
+		SpanID:     "0000000000000001",
 		Name:       "simple-event",
 		Timestamp:  time.Now(),
 		Attributes: nil,
@@ -272,7 +272,7 @@ func TestArrowEventStorage_EmptyAttributes(t *testing.T) {
 
 	storage.Flush()
 
-	events, err := storage.GetEventsBySpanID("span-1")
+	events, err := storage.GetEventsBySpanID("0000000000000001")
 	if err != nil {
 		t.Fatalf("GetEventsBySpanID() error = %v", err)
 	}
@@ -297,7 +297,7 @@ func TestArrowEventStorage_GetRecordsAndSchema(t *testing.T) {
 	// Add some events
 	for i := range 5 {
 		evt := &span.SpanEvent{
-			SpanID:    "span-1",
+			SpanID:    "0000000000000001",
 			Name:      fmt.Sprintf("event-%d", i),
 			Timestamp: time.Now(),
 		}
@@ -334,7 +334,7 @@ func BenchmarkArrowEventStorage_AddEvent(b *testing.B) {
 	defer storage.Release()
 
 	evt := &span.SpanEvent{
-		SpanID:    "span-1",
+		SpanID:    "0000000000000001",
 		Name:      "cache.hit",
 		Timestamp: time.Now(),
 		Attributes: map[string]string{
@@ -356,7 +356,7 @@ func BenchmarkArrowEventStorage_AddEvents_Batch100(b *testing.B) {
 	events := make([]*span.SpanEvent, 100)
 	for i := range 100 {
 		events[i] = &span.SpanEvent{
-			SpanID:    "span-1",
+			SpanID:    "0000000000000001",
 			Name:      fmt.Sprintf("event-%d", i),
 			Timestamp: time.Now(),
 			Attributes: map[string]string{
@@ -378,7 +378,7 @@ func BenchmarkArrowEventStorage_GetEventsBySpanID(b *testing.B) {
 	// Populate with events
 	for i := range 1000 {
 		evt := &span.SpanEvent{
-			SpanID:    fmt.Sprintf("span-%d", i%100), // 100 different spans
+			SpanID:    fmt.Sprintf("%016x", (i%100)+1), // 100 different spans
 			Name:      fmt.Sprintf("event-%d", i),
 			Timestamp: time.Now(),
 			Attributes: map[string]string{
@@ -391,6 +391,6 @@ func BenchmarkArrowEventStorage_GetEventsBySpanID(b *testing.B) {
 
 	b.ResetTimer()
 	for b.Loop() {
-		storage.GetEventsBySpanID("span-50")
+		storage.GetEventsBySpanID(fmt.Sprintf("%016x", 51))
 	}
 }

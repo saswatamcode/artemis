@@ -1,6 +1,7 @@
 package compactor
 
 import (
+	"fmt"
 	"path/filepath"
 	"testing"
 	"time"
@@ -586,10 +587,12 @@ func createTestBlockWithSpans(t *testing.T, baseDir string, level int, createdAt
 
 	// Add test spans if requested
 	now := time.Now()
+	// Use timestamp to ensure unique span IDs across multiple blocks
+	baseID := uint64(now.UnixNano())
 	for i := range spanCount {
 		sp := &span.Span{
-			TraceID:     "trace-1",
-			SpanID:      ulid.Make().String(),
+			TraceID:     "00000000000000000000000000000001",
+			SpanID:      fmt.Sprintf("%016x", baseID+uint64(i)),
 			Name:        "test-operation",
 			StartTime:   now.Add(time.Duration(i) * time.Millisecond),
 			EndTime:     now.Add(time.Duration(i+1) * time.Millisecond),
@@ -837,10 +840,12 @@ func createTestBlockWithSpansAndEvents(t *testing.T, baseDir string, level int, 
 
 	// Add test spans and events
 	now := time.Now()
+	// Use timestamp to ensure unique span IDs across multiple blocks
+	baseID := uint64(now.UnixNano())
 	for i := range spanCount {
-		spanID := ulid.Make().String()
+		spanID := fmt.Sprintf("%016x", baseID+uint64(i))
 		sp := &span.Span{
-			TraceID:     "trace-1",
+			TraceID:     "00000000000000000000000000000001",
 			SpanID:      spanID,
 			Name:        "test-operation",
 			StartTime:   now.Add(time.Duration(i) * time.Millisecond),
@@ -859,7 +864,7 @@ func createTestBlockWithSpansAndEvents(t *testing.T, baseDir string, level int, 
 				Name:      "test-event",
 				Timestamp: now.Add(time.Duration(i*1000+j) * time.Microsecond),
 				Attributes: map[string]string{
-					"event_index": ulid.Make().String(),
+					"event_index": fmt.Sprintf("%d", j),
 				},
 			}
 			eventStorage.AddEvent(evt)
@@ -929,8 +934,9 @@ func createTestBlockWithSpansAndEvents(t *testing.T, baseDir string, level int, 
 		for _, rec := range eventStorage.GetRecords() {
 			for row := 0; row < int(rec.NumRows()); row++ {
 				// Extract event from Arrow record
+				spanIDVal := rec.Column(0).(*array.Uint64).Value(row)
 				evt := &span.SpanEvent{
-					SpanID:     rec.Column(0).(*array.String).Value(row),
+					SpanID:     fmt.Sprintf("%016x", spanIDVal),
 					Name:       rec.Column(1).(*array.String).Value(row),
 					Timestamp:  time.Unix(0, rec.Column(2).(*array.Int64).Value(row)),
 					Attributes: make(map[string]string),

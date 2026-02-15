@@ -157,14 +157,14 @@ func TestHeadBlockQuerier_WithTimeRangeFilter(t *testing.T) {
 	now := time.Now()
 	spans := []*span.Span{
 		{
-			SpanID:      "span-old",
+			SpanID:      "0000000000000201",
 			StartTime:   now.Add(-2 * time.Hour),
 			EndTime:     now.Add(-2 * time.Hour).Add(time.Millisecond),
 			ServiceName: "service",
 			Tags:        map[string]string{"env": "prod"},
 		},
 		{
-			SpanID:      "span-recent",
+			SpanID:      "0000000000000202",
 			StartTime:   now.Add(-30 * time.Minute),
 			EndTime:     now.Add(-30 * time.Minute).Add(time.Millisecond),
 			ServiceName: "service",
@@ -191,8 +191,8 @@ func TestHeadBlockQuerier_WithTimeRangeFilter(t *testing.T) {
 		if len(result.Spans) != 1 {
 			t.Errorf("Expected 1 span, got %d", len(result.Spans))
 		}
-		if len(result.Spans) > 0 && result.Spans[0].SpanID != "span-recent" {
-			t.Errorf("Expected span-recent, got %s", result.Spans[0].SpanID)
+		if len(result.Spans) > 0 && result.Spans[0].SpanID != "0000000000000202" {
+			t.Errorf("Expected 0000000000000202, got %s", result.Spans[0].SpanID)
 		}
 	})
 
@@ -512,8 +512,8 @@ func TestBlockQuerier_MatcherCombinations(t *testing.T) {
 	// Create diverse spans
 	spans := []*span.Span{
 		{
-			TraceID:     "trace-1",
-			SpanID:      "span-1",
+			TraceID:     "00000000000000010000000000000001",
+			SpanID:      "0000000000000203",
 			Name:        "GET /api/users",
 			StartTime:   baseTime,
 			EndTime:     baseTime.Add(time.Millisecond),
@@ -521,8 +521,8 @@ func TestBlockQuerier_MatcherCombinations(t *testing.T) {
 			Tags:        map[string]string{"env": "prod", "version": "1.0", "status": "200"},
 		},
 		{
-			TraceID:     "trace-1",
-			SpanID:      "span-2",
+			TraceID:     "00000000000000010000000000000001",
+			SpanID:      "0000000000000204",
 			Name:        "POST /api/users",
 			StartTime:   baseTime,
 			EndTime:     baseTime.Add(time.Millisecond),
@@ -530,8 +530,8 @@ func TestBlockQuerier_MatcherCombinations(t *testing.T) {
 			Tags:        map[string]string{"env": "prod", "version": "2.0", "status": "201"},
 		},
 		{
-			TraceID:     "trace-2",
-			SpanID:      "span-3",
+			TraceID:     "00000000000000020000000000000002",
+			SpanID:      "0000000000000205",
 			Name:        "GET /api/orders",
 			StartTime:   baseTime,
 			EndTime:     baseTime.Add(time.Millisecond),
@@ -571,8 +571,8 @@ func TestBlockQuerier_MatcherCombinations(t *testing.T) {
 		if len(result.Spans) != 1 {
 			t.Errorf("Expected 1 span, got %d", len(result.Spans))
 		}
-		if len(result.Spans) > 0 && result.Spans[0].SpanID != "span-2" {
-			t.Errorf("Expected span-2, got %s", result.Spans[0].SpanID)
+		if len(result.Spans) > 0 && result.Spans[0].SpanID != "0000000000000204" {
+			t.Errorf("Expected 0000000000000204, got %s", result.Spans[0].SpanID)
 		}
 	})
 
@@ -601,14 +601,14 @@ func TestBlockQuerier_MatcherCombinations(t *testing.T) {
 	})
 
 	t.Run("trace_id matcher", func(t *testing.T) {
-		matcher, _ := NewMatcher(MatchEqual, "trace_id", "trace-1")
+		matcher, _ := NewMatcher(MatchEqual, "trace_id", "00000000000000010000000000000001")
 		result, err := querier.Select(matcher)
 		if err != nil {
 			t.Fatalf("BlockQuerier.Select() error = %v", err)
 		}
 
 		if len(result.Spans) != 2 {
-			t.Errorf("Expected 2 spans for trace-1, got %d", len(result.Spans))
+			t.Errorf("Expected 2 spans for trace, got %d", len(result.Spans))
 		}
 	})
 }

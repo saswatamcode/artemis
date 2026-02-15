@@ -103,18 +103,27 @@ func extractLinkFromArrowRecord(record arrow.RecordBatch, rowIndex int) (*span.S
 		return nil, fmt.Errorf("invalid row index %d (record has %d rows)", rowIndex, record.NumRows())
 	}
 
-	expectedColumns := 4 // span_id, linked_trace_id, linked_span_id, attributes
+	expectedColumns := 5 // span_id, linked_trace_id_hi, linked_trace_id_lo, linked_span_id, attributes
 	if record.NumCols() < int64(expectedColumns) {
 		return nil, fmt.Errorf("invalid schema: expected at least %d columns, got %d", expectedColumns, record.NumCols())
 	}
 
 	l := &span.SpanLink{}
 
-	l.SpanID = record.Column(0).(*array.String).Value(rowIndex)
-	l.LinkedTraceID = record.Column(1).(*array.String).Value(rowIndex)
-	l.LinkedSpanID = record.Column(2).(*array.String).Value(rowIndex)
+	// Read span_id and format as hex string
+	spanIDVal := record.Column(0).(*array.Uint64).Value(rowIndex)
+	l.SpanID = fmt.Sprintf("%016x", spanIDVal)
 
-	attrsCol := record.Column(3).(*array.Map)
+	// Read linked_trace_id_hi and linked_trace_id_lo and format as hex string
+	linkedTraceIDHi := record.Column(1).(*array.Uint64).Value(rowIndex)
+	linkedTraceIDLo := record.Column(2).(*array.Uint64).Value(rowIndex)
+	l.LinkedTraceID = fmt.Sprintf("%016x%016x", linkedTraceIDHi, linkedTraceIDLo)
+
+	// Read linked_span_id and format as hex string
+	linkedSpanIDVal := record.Column(3).(*array.Uint64).Value(rowIndex)
+	l.LinkedSpanID = fmt.Sprintf("%016x", linkedSpanIDVal)
+
+	attrsCol := record.Column(4).(*array.Map)
 	if !attrsCol.IsNull(rowIndex) {
 		l.Attributes = make(map[string]string)
 

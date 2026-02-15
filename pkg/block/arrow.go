@@ -383,7 +383,7 @@ func extractSpanFromArrowRecord(record arrow.RecordBatch, rowIndex int) (*span.S
 	}
 
 	// Validate schema has expected number of columns
-	expectedColumns := 9 // trace_id, span_id, parent_span_id, name, start_time, end_time, duration, service_name, tags
+	expectedColumns := 10 // trace_id_hi, trace_id_lo, span_id, parent_span_id, name, start_time, end_time, duration, service_name, tags
 	if record.NumCols() < int64(expectedColumns) {
 		return nil, fmt.Errorf("invalid schema: expected at least %d columns, got %d", expectedColumns, record.NumCols())
 	}
@@ -391,26 +391,33 @@ func extractSpanFromArrowRecord(record arrow.RecordBatch, rowIndex int) (*span.S
 	sp := &span.Span{}
 
 	// Extract fields with bounds checking
-	sp.TraceID = record.Column(0).(*array.String).Value(rowIndex)
+	// Read trace_id_hi and trace_id_lo and format as hex string
+	traceIDHi := record.Column(0).(*array.Uint64).Value(rowIndex)
+	traceIDLo := record.Column(1).(*array.Uint64).Value(rowIndex)
+	sp.TraceID = fmt.Sprintf("%016x%016x", traceIDHi, traceIDLo)
 
-	sp.SpanID = record.Column(1).(*array.String).Value(rowIndex)
+	// Read span_id and format as hex string
+	spanIDVal := record.Column(2).(*array.Uint64).Value(rowIndex)
+	sp.SpanID = fmt.Sprintf("%016x", spanIDVal)
 
-	parentCol := record.Column(2).(*array.String)
+	// Read parent_span_id and format as hex string (or empty if null)
+	parentCol := record.Column(3).(*array.Uint64)
 	if !parentCol.IsNull(rowIndex) {
-		sp.ParentSpanID = parentCol.Value(rowIndex)
+		parentSpanIDVal := parentCol.Value(rowIndex)
+		sp.ParentSpanID = fmt.Sprintf("%016x", parentSpanIDVal)
 	}
 
-	sp.Name = record.Column(3).(*array.String).Value(rowIndex)
+	sp.Name = record.Column(4).(*array.String).Value(rowIndex)
 
-	sp.StartTime = time.Unix(0, record.Column(4).(*array.Int64).Value(rowIndex))
+	sp.StartTime = time.Unix(0, record.Column(5).(*array.Int64).Value(rowIndex))
 
-	sp.EndTime = time.Unix(0, record.Column(5).(*array.Int64).Value(rowIndex))
+	sp.EndTime = time.Unix(0, record.Column(6).(*array.Int64).Value(rowIndex))
 
-	sp.Duration = record.Column(6).(*array.Int64).Value(rowIndex)
+	sp.Duration = record.Column(7).(*array.Int64).Value(rowIndex)
 
-	sp.ServiceName = record.Column(7).(*array.String).Value(rowIndex)
+	sp.ServiceName = record.Column(8).(*array.String).Value(rowIndex)
 
-	tagsCol := record.Column(8).(*array.Map)
+	tagsCol := record.Column(9).(*array.Map)
 	if !tagsCol.IsNull(rowIndex) {
 		sp.Tags = make(map[string]string)
 

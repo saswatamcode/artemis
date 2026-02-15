@@ -38,9 +38,10 @@ type ArrowStorage struct {
 type SpanRecordBuilder struct {
 	mem             memory.Allocator
 	schema          *arrow.Schema
-	traceID         *array.StringBuilder
-	spanID          *array.StringBuilder
-	parentSpanID    *array.StringBuilder
+	traceIDHi       *array.Uint64Builder
+	traceIDLo       *array.Uint64Builder
+	spanID          *array.Uint64Builder
+	parentSpanID    *array.Uint64Builder
 	name            *array.StringBuilder
 	startTime       *array.Int64Builder
 	endTime         *array.Int64Builder
@@ -72,9 +73,10 @@ func NewArrowStorage() *ArrowStorage {
 func createSpanSchema() *arrow.Schema {
 	return arrow.NewSchema(
 		[]arrow.Field{
-			{Name: "trace_id", Type: arrow.BinaryTypes.String, Nullable: false},
-			{Name: "span_id", Type: arrow.BinaryTypes.String, Nullable: false},
-			{Name: "parent_span_id", Type: arrow.BinaryTypes.String, Nullable: true},
+			{Name: "trace_id_hi", Type: arrow.PrimitiveTypes.Uint64, Nullable: false},
+			{Name: "trace_id_lo", Type: arrow.PrimitiveTypes.Uint64, Nullable: false},
+			{Name: "span_id", Type: arrow.PrimitiveTypes.Uint64, Nullable: false},
+			{Name: "parent_span_id", Type: arrow.PrimitiveTypes.Uint64, Nullable: true},
 			{Name: "name", Type: arrow.BinaryTypes.String, Nullable: false},
 			{Name: "start_time", Type: arrow.PrimitiveTypes.Int64, Nullable: false},
 			{Name: "end_time", Type: arrow.PrimitiveTypes.Int64, Nullable: false},
@@ -89,13 +91,16 @@ func createSpanSchema() *arrow.Schema {
 // NewSpanRecordBuilder creates a new record builder for spans
 func NewSpanRecordBuilder(mem memory.Allocator, schema *arrow.Schema) *SpanRecordBuilder {
 	// Pre-allocate capacity for batch size to reduce allocations
-	traceID := array.NewStringBuilder(mem)
-	traceID.Reserve(batchSize)
+	traceIDHi := array.NewUint64Builder(mem)
+	traceIDHi.Reserve(batchSize)
 
-	spanID := array.NewStringBuilder(mem)
+	traceIDLo := array.NewUint64Builder(mem)
+	traceIDLo.Reserve(batchSize)
+
+	spanID := array.NewUint64Builder(mem)
 	spanID.Reserve(batchSize)
 
-	parentSpanID := array.NewStringBuilder(mem)
+	parentSpanID := array.NewUint64Builder(mem)
 	parentSpanID.Reserve(batchSize)
 
 	name := array.NewStringBuilder(mem)
@@ -119,7 +124,8 @@ func NewSpanRecordBuilder(mem memory.Allocator, schema *arrow.Schema) *SpanRecor
 	return &SpanRecordBuilder{
 		mem:          mem,
 		schema:       schema,
-		traceID:      traceID,
+		traceIDHi:    traceIDHi,
+		traceIDLo:    traceIDLo,
 		spanID:       spanID,
 		parentSpanID: parentSpanID,
 		name:         name,
@@ -133,13 +139,31 @@ func NewSpanRecordBuilder(mem memory.Allocator, schema *arrow.Schema) *SpanRecor
 
 // Append adds a span to the builder
 func (b *SpanRecordBuilder) Append(s *span.Span) {
-	b.traceID.Append(s.TraceID)
-	b.spanID.Append(s.SpanID)
+	// Parse trace ID into hi and lo parts
+	traceIDHi, traceIDLo, err := span.ParseTraceID(s.TraceID)
+	if err != nil {
+		// If parsing fails, use 0 values (should not happen with valid data)
+		traceIDHi, traceIDLo = 0, 0
+	}
+	b.traceIDHi.Append(traceIDHi)
+	b.traceIDLo.Append(traceIDLo)
 
+	// Parse span ID
+	spanIDVal, err := span.ParseSpanID(s.SpanID)
+	if err != nil {
+		spanIDVal = 0
+	}
+	b.spanID.Append(spanIDVal)
+
+	// Parse parent span ID (or use 0 for null)
 	if s.ParentSpanID == "" {
 		b.parentSpanID.AppendNull()
 	} else {
-		b.parentSpanID.Append(s.ParentSpanID)
+		parentSpanIDVal, err := span.ParseSpanID(s.ParentSpanID)
+		if err != nil {
+			parentSpanIDVal = 0
+		}
+		b.parentSpanID.Append(parentSpanIDVal)
 	}
 
 	b.name.Append(s.Name)
@@ -171,9 +195,10 @@ func (b *SpanRecordBuilder) NewRecord() arrow.RecordBatch {
 	}
 
 	columns := []arrow.Array{
-		b.traceID.NewStringArray(),
-		b.spanID.NewStringArray(),
-		b.parentSpanID.NewStringArray(),
+		b.traceIDHi.NewUint64Array(),
+		b.traceIDLo.NewUint64Array(),
+		b.spanID.NewUint64Array(),
+		b.parentSpanID.NewUint64Array(),
 		b.name.NewStringArray(),
 		b.startTime.NewInt64Array(),
 		b.endTime.NewInt64Array(),
@@ -190,7 +215,8 @@ func (b *SpanRecordBuilder) NewRecord() arrow.RecordBatch {
 
 // Release releases the builder resources
 func (b *SpanRecordBuilder) Release() {
-	b.traceID.Release()
+	b.traceIDHi.Release()
+	b.traceIDLo.Release()
 	b.spanID.Release()
 	b.parentSpanID.Release()
 	b.name.Release()
@@ -387,26 +413,33 @@ func (s *ArrowStorage) extractSpan(record arrow.RecordBatch, rowIndex int) (*spa
 
 	sp := &span.Span{}
 
-	sp.TraceID = record.Column(0).(*array.String).Value(rowIndex)
+	// Read trace_id_hi and trace_id_lo and format as hex string
+	traceIDHi := record.Column(0).(*array.Uint64).Value(rowIndex)
+	traceIDLo := record.Column(1).(*array.Uint64).Value(rowIndex)
+	sp.TraceID = fmt.Sprintf("%016x%016x", traceIDHi, traceIDLo)
 
-	sp.SpanID = record.Column(1).(*array.String).Value(rowIndex)
+	// Read span_id and format as hex string
+	spanIDVal := record.Column(2).(*array.Uint64).Value(rowIndex)
+	sp.SpanID = fmt.Sprintf("%016x", spanIDVal)
 
-	parentCol := record.Column(2).(*array.String)
+	// Read parent_span_id and format as hex string (or empty if null)
+	parentCol := record.Column(3).(*array.Uint64)
 	if !parentCol.IsNull(rowIndex) {
-		sp.ParentSpanID = parentCol.Value(rowIndex)
+		parentSpanIDVal := parentCol.Value(rowIndex)
+		sp.ParentSpanID = fmt.Sprintf("%016x", parentSpanIDVal)
 	}
 
-	sp.Name = record.Column(3).(*array.String).Value(rowIndex)
+	sp.Name = record.Column(4).(*array.String).Value(rowIndex)
 
-	sp.StartTime = time.Unix(0, record.Column(4).(*array.Int64).Value(rowIndex))
+	sp.StartTime = time.Unix(0, record.Column(5).(*array.Int64).Value(rowIndex))
 
-	sp.EndTime = time.Unix(0, record.Column(5).(*array.Int64).Value(rowIndex))
+	sp.EndTime = time.Unix(0, record.Column(6).(*array.Int64).Value(rowIndex))
 
-	sp.Duration = record.Column(6).(*array.Int64).Value(rowIndex)
+	sp.Duration = record.Column(7).(*array.Int64).Value(rowIndex)
 
-	sp.ServiceName = record.Column(7).(*array.String).Value(rowIndex)
+	sp.ServiceName = record.Column(8).(*array.String).Value(rowIndex)
 
-	tagsCol := record.Column(8).(*array.Map)
+	tagsCol := record.Column(9).(*array.Map)
 	if !tagsCol.IsNull(rowIndex) {
 		sp.Tags = make(map[string]string)
 

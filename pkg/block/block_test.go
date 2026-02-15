@@ -283,6 +283,11 @@ func TestManager_FlushHead(t *testing.T) {
 		t.Error("Block directory should exist after flush")
 	}
 
+	// Add the flushed block to the manager
+	if err := mgr.AddFlushedBlock(blockDir); err != nil {
+		t.Fatalf("AddFlushedBlock() error = %v", err)
+	}
+
 	// Verify manager stats updated
 	stats := mgr.Stats()
 	if stats.PersistedBlocks != 1 {
@@ -327,7 +332,16 @@ func TestManager_GetBlocks(t *testing.T) {
 	arrowStorage.Flush()
 
 	mgr.UpdateHeadTimeRange(time.Now().UnixNano(), time.Now().Add(time.Millisecond).UnixNano())
-	mgr.FlushHead(0, 0)
+	meta, err := mgr.FlushHead(0, 0)
+	if err != nil {
+		t.Fatalf("FlushHead() error = %v", err)
+	}
+
+	// Add the flushed block to the manager
+	blockDir := filepath.Join(cfg.Dir, meta.ULID.String())
+	if err := mgr.AddFlushedBlock(blockDir); err != nil {
+		t.Fatalf("AddFlushedBlock() error = %v", err)
+	}
 
 	// Should have one block now
 	blocks = mgr.GetBlocks()

@@ -25,9 +25,10 @@ type ArrowLinkStorage struct {
 type LinkRecordBuilder struct {
 	mem             memory.Allocator
 	schema          *arrow.Schema
-	spanID          *array.StringBuilder
-	linkedTraceID   *array.StringBuilder
-	linkedSpanID    *array.StringBuilder
+	spanID          *array.Uint64Builder
+	linkedTraceIDHi *array.Uint64Builder
+	linkedTraceIDLo *array.Uint64Builder
+	linkedSpanID    *array.Uint64Builder
 	attributes      *array.MapBuilder
 	currentRowCount int
 }
@@ -51,9 +52,10 @@ func NewArrowLinkStorage() *ArrowLinkStorage {
 func createLinkSchema() *arrow.Schema {
 	return arrow.NewSchema(
 		[]arrow.Field{
-			{Name: "span_id", Type: arrow.BinaryTypes.String, Nullable: false},
-			{Name: "linked_trace_id", Type: arrow.BinaryTypes.String, Nullable: false},
-			{Name: "linked_span_id", Type: arrow.BinaryTypes.String, Nullable: false},
+			{Name: "span_id", Type: arrow.PrimitiveTypes.Uint64, Nullable: false},
+			{Name: "linked_trace_id_hi", Type: arrow.PrimitiveTypes.Uint64, Nullable: false},
+			{Name: "linked_trace_id_lo", Type: arrow.PrimitiveTypes.Uint64, Nullable: false},
+			{Name: "linked_span_id", Type: arrow.PrimitiveTypes.Uint64, Nullable: false},
 			{Name: "attributes", Type: arrow.MapOf(arrow.BinaryTypes.String, arrow.BinaryTypes.String), Nullable: true},
 		},
 		nil,
@@ -62,33 +64,55 @@ func createLinkSchema() *arrow.Schema {
 
 // NewLinkRecordBuilder creates a new record builder for span links
 func NewLinkRecordBuilder(mem memory.Allocator, schema *arrow.Schema) *LinkRecordBuilder {
-	spanID := array.NewStringBuilder(mem)
+	spanID := array.NewUint64Builder(mem)
 	spanID.Reserve(linkBatchSize)
 
-	linkedTraceID := array.NewStringBuilder(mem)
-	linkedTraceID.Reserve(linkBatchSize)
+	linkedTraceIDHi := array.NewUint64Builder(mem)
+	linkedTraceIDHi.Reserve(linkBatchSize)
 
-	linkedSpanID := array.NewStringBuilder(mem)
+	linkedTraceIDLo := array.NewUint64Builder(mem)
+	linkedTraceIDLo.Reserve(linkBatchSize)
+
+	linkedSpanID := array.NewUint64Builder(mem)
 	linkedSpanID.Reserve(linkBatchSize)
 
 	attributes := array.NewMapBuilder(mem, arrow.BinaryTypes.String, arrow.BinaryTypes.String, false)
 	attributes.Reserve(linkBatchSize)
 
 	return &LinkRecordBuilder{
-		mem:           mem,
-		schema:        schema,
-		spanID:        spanID,
-		linkedTraceID: linkedTraceID,
-		linkedSpanID:  linkedSpanID,
-		attributes:    attributes,
+		mem:             mem,
+		schema:          schema,
+		spanID:          spanID,
+		linkedTraceIDHi: linkedTraceIDHi,
+		linkedTraceIDLo: linkedTraceIDLo,
+		linkedSpanID:    linkedSpanID,
+		attributes:      attributes,
 	}
 }
 
 // Append adds a span link to the builder
 func (b *LinkRecordBuilder) Append(l *span.SpanLink) {
-	b.spanID.Append(l.SpanID)
-	b.linkedTraceID.Append(l.LinkedTraceID)
-	b.linkedSpanID.Append(l.LinkedSpanID)
+	// Parse span ID
+	spanIDVal, err := span.ParseSpanID(l.SpanID)
+	if err != nil {
+		spanIDVal = 0
+	}
+	b.spanID.Append(spanIDVal)
+
+	// Parse linked trace ID into hi and lo parts
+	linkedTraceIDHi, linkedTraceIDLo, err := span.ParseTraceID(l.LinkedTraceID)
+	if err != nil {
+		linkedTraceIDHi, linkedTraceIDLo = 0, 0
+	}
+	b.linkedTraceIDHi.Append(linkedTraceIDHi)
+	b.linkedTraceIDLo.Append(linkedTraceIDLo)
+
+	// Parse linked span ID
+	linkedSpanIDVal, err := span.ParseSpanID(l.LinkedSpanID)
+	if err != nil {
+		linkedSpanIDVal = 0
+	}
+	b.linkedSpanID.Append(linkedSpanIDVal)
 
 	if len(l.Attributes) > 0 {
 		b.attributes.Append(true)
@@ -113,9 +137,10 @@ func (b *LinkRecordBuilder) NewRecord() arrow.RecordBatch {
 	}
 
 	columns := []arrow.Array{
-		b.spanID.NewStringArray(),
-		b.linkedTraceID.NewStringArray(),
-		b.linkedSpanID.NewStringArray(),
+		b.spanID.NewUint64Array(),
+		b.linkedTraceIDHi.NewUint64Array(),
+		b.linkedTraceIDLo.NewUint64Array(),
+		b.linkedSpanID.NewUint64Array(),
 		b.attributes.NewMapArray(),
 	}
 
@@ -128,7 +153,8 @@ func (b *LinkRecordBuilder) NewRecord() arrow.RecordBatch {
 // Release releases the builder resources
 func (b *LinkRecordBuilder) Release() {
 	b.spanID.Release()
-	b.linkedTraceID.Release()
+	b.linkedTraceIDHi.Release()
+	b.linkedTraceIDLo.Release()
 	b.linkedSpanID.Release()
 	b.attributes.Release()
 }
@@ -261,11 +287,20 @@ func (s *ArrowLinkStorage) extractLink(record arrow.RecordBatch, rowIndex int) (
 
 	l := &span.SpanLink{}
 
-	l.SpanID = record.Column(0).(*array.String).Value(rowIndex)
-	l.LinkedTraceID = record.Column(1).(*array.String).Value(rowIndex)
-	l.LinkedSpanID = record.Column(2).(*array.String).Value(rowIndex)
+	// Read span_id and format as hex string
+	spanIDVal := record.Column(0).(*array.Uint64).Value(rowIndex)
+	l.SpanID = fmt.Sprintf("%016x", spanIDVal)
 
-	attrsCol := record.Column(3).(*array.Map)
+	// Read linked_trace_id_hi and linked_trace_id_lo and format as hex string
+	linkedTraceIDHi := record.Column(1).(*array.Uint64).Value(rowIndex)
+	linkedTraceIDLo := record.Column(2).(*array.Uint64).Value(rowIndex)
+	l.LinkedTraceID = fmt.Sprintf("%016x%016x", linkedTraceIDHi, linkedTraceIDLo)
+
+	// Read linked_span_id and format as hex string
+	linkedSpanIDVal := record.Column(3).(*array.Uint64).Value(rowIndex)
+	l.LinkedSpanID = fmt.Sprintf("%016x", linkedSpanIDVal)
+
+	attrsCol := record.Column(4).(*array.Map)
 	if !attrsCol.IsNull(rowIndex) {
 		l.Attributes = make(map[string]string)
 

@@ -111,7 +111,10 @@ func extractEventFromArrowRecord(record arrow.RecordBatch, rowIndex int) (*span.
 
 	e := &span.SpanEvent{}
 
-	e.SpanID = record.Column(0).(*array.String).Value(rowIndex)
+	// Read span_id and format as hex string
+	spanIDVal := record.Column(0).(*array.Uint64).Value(rowIndex)
+	e.SpanID = fmt.Sprintf("%016x", spanIDVal)
+
 	e.Name = record.Column(1).(*array.String).Value(rowIndex)
 	e.Timestamp = time.Unix(0, record.Column(2).(*array.Int64).Value(rowIndex))
 
