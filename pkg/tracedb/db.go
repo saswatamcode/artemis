@@ -889,7 +889,7 @@ func (db *DB) GetQuerier() query.Querier {
 		blocks = db.blockManager.GetBlocks()
 	}
 
-	headBlock := block.NewHeadBlock(db.storage)
+	headBlock := block.NewHeadBlock(db.storage, db.eventStorage, db.linkStorage)
 	return query.NewBlockQuerier(headBlock, blocks)
 }
 
@@ -1154,6 +1154,10 @@ func (db *DB) QueryWithLock(fn func(head *storage.ArrowStorage, blocks []block.B
 // QuerySpansWithEvents queries spans and optionally loads their events
 // This is a convenience method that wraps GetQuerier() and handles event loading
 // If includeEvents is true, the Events field on each span will be populated
+//
+// NOTE: Events and links are automatically populated by GetSpansBatch for
+// Arrow and Parquet persisted blocks. For in-memory head block spans, we fetch
+// them separately from eventStorage/linkStorage.
 func (db *DB) QuerySpansWithEvents(includeEvents bool, matchers ...*query.Matcher) ([]*span.Span, error) {
 	// Get querier and query spans
 	querier := db.GetQuerier()
@@ -1167,14 +1171,23 @@ func (db *DB) QuerySpansWithEvents(includeEvents bool, matchers ...*query.Matche
 		return result.Spans, nil
 	}
 
-	// Load events for each span
+	// Load events and links for spans that don't already have them
+	// (e.g., spans from in-memory head block)
 	for _, s := range result.Spans {
-		if s != nil {
+		if s != nil && len(s.Events) == 0 && len(s.Links) == 0 {
+			// Fetch events if not already populated
 			events, err := db.GetEventsForSpan(s.SpanID)
 			if err != nil {
 				return nil, fmt.Errorf("failed to load events for span %s: %w", s.SpanID, err)
 			}
 			s.Events = events
+
+			// Fetch links if not already populated
+			links, err := db.GetLinksForSpan(s.SpanID)
+			if err != nil {
+				return nil, fmt.Errorf("failed to load links for span %s: %w", s.SpanID, err)
+			}
+			s.Links = links
 		}
 	}
 

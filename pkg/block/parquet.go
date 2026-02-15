@@ -331,6 +331,33 @@ func (pb *ParquetBlock) GetSpansBatch(spanIDs []string) ([]*span.Span, error) {
 		}()
 	}
 
+	// Batch fetch events and links if they exist
+	eventsMap, _ := pb.GetEventsBatch(spanIDs)
+	if eventsMap != nil {
+		for _, sp := range results {
+			if eventPtrs, found := eventsMap[sp.SpanID]; found {
+				// Convert []*SpanEvent to []SpanEvent
+				sp.Events = make([]span.SpanEvent, len(eventPtrs))
+				for i, e := range eventPtrs {
+					sp.Events[i] = *e
+				}
+			}
+		}
+	}
+
+	linksMap, _ := pb.GetLinksBatch(spanIDs)
+	if linksMap != nil {
+		for _, sp := range results {
+			if linkPtrs, found := linksMap[sp.SpanID]; found {
+				// Convert []*SpanLink to []SpanLink
+				sp.Links = make([]span.SpanLink, len(linkPtrs))
+				for i, l := range linkPtrs {
+					sp.Links[i] = *l
+				}
+			}
+		}
+	}
+
 	return results, nil
 }
 
@@ -610,17 +637,28 @@ func spanToParquetSpan(s *span.Span) *ParquetSpan {
 }
 
 // parquetSpanToSpan converts a ParquetSpan to Span
+// OPTIMIZATION: Uses fast hex encoding instead of fmt.Sprintf
 func parquetSpanToSpan(ps *ParquetSpan) *span.Span {
 	// Convert trace ID from hi/lo to hex string
-	traceID := fmt.Sprintf("%016x%016x", ps.TraceIDHi, ps.TraceIDLo)
+	// OPTIMIZATION: Use fast hex encoding instead of fmt.Sprintf
+	var traceIDBuf [32]byte
+	uint64ToHex(ps.TraceIDHi, traceIDBuf[:16])
+	uint64ToHex(ps.TraceIDLo, traceIDBuf[16:])
+	traceID := string(traceIDBuf[:])
 
 	// Convert span ID to hex string
-	spanID := fmt.Sprintf("%016x", ps.SpanID)
+	// OPTIMIZATION: Use fast hex encoding instead of fmt.Sprintf
+	var spanIDBuf [16]byte
+	uint64ToHex(ps.SpanID, spanIDBuf[:])
+	spanID := string(spanIDBuf[:])
 
 	// Convert parent span ID to hex string (empty if 0)
+	// OPTIMIZATION: Use fast hex encoding instead of fmt.Sprintf
 	parentSpanID := ""
 	if ps.ParentSpanID != 0 {
-		parentSpanID = fmt.Sprintf("%016x", ps.ParentSpanID)
+		var parentIDBuf [16]byte
+		uint64ToHex(ps.ParentSpanID, parentIDBuf[:])
+		parentSpanID = string(parentIDBuf[:])
 	}
 
 	return &span.Span{

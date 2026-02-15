@@ -426,30 +426,13 @@ func queryHeadBlock(hb *block.HeadBlock, ms Matchers, timeRange *TimeRange) []*s
 				}
 
 				if len(candidateSpanIDs) > 0 {
-					records := storage.GetRecords()
-					// Determine if we need to extract tags for matching
-					needTags := matchersNeedTags(ms)
-
-					for _, spanID := range candidateSpanIDs {
-						ref, ok := idx.LookupSpanID(spanID)
-						if !ok || ref.RecordIndex >= len(records) {
-							continue
-						}
-
-						sp, err := extractSpanFromRecordWithOptions(records[ref.RecordIndex], ref.RowIndex, needTags)
-						if err != nil {
-							continue
-						}
-
-						if ms.Matches(sp) && (timeRange == nil || spanInTimeRange(sp, timeRange)) {
-							// If we didn't extract tags during filtering, extract them now for the final result
-							if !needTags {
-								sp, err = extractSpanFromRecordWithOptions(records[ref.RecordIndex], ref.RowIndex, true)
-								if err != nil {
-									continue
-								}
+					// Head block: use GetSpansBatch for consistent interface usage
+					batchSpans, err := hb.GetSpansBatch(candidateSpanIDs)
+					if err == nil {
+						for _, sp := range batchSpans {
+							if ms.Matches(sp) && (timeRange == nil || spanInTimeRange(sp, timeRange)) {
+								spans = append(spans, sp)
 							}
-							spans = append(spans, sp)
 						}
 					}
 					return spans
@@ -679,20 +662,13 @@ func queryArrowBlock(ab *block.ArrowBlock, ms Matchers, timeRange *TimeRange) []
 				}
 
 				if len(candidateSpanIDs) > 0 {
-					records := ab.Records()
-					for _, spanID := range candidateSpanIDs {
-						ref, ok := idx.LookupSpanID(spanID)
-						if !ok || ref.RecordIndex >= len(records) {
-							continue
-						}
-
-						sp, err := extractSpanFromRecord(records[ref.RecordIndex], ref.RowIndex)
-						if err != nil {
-							continue
-						}
-
-						if ms.Matches(sp) && (timeRange == nil || spanInTimeRange(sp, timeRange)) {
-							spans = append(spans, sp)
+					// Arrow block: use GetSpansBatch for consistent interface usage
+					batchSpans, err := ab.GetSpansBatch(candidateSpanIDs)
+					if err == nil {
+						for _, sp := range batchSpans {
+							if ms.Matches(sp) && (timeRange == nil || spanInTimeRange(sp, timeRange)) {
+								spans = append(spans, sp)
+							}
 						}
 					}
 					return spans

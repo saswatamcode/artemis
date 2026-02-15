@@ -203,3 +203,76 @@ func GetEventsBySpanIDFromParquet(dir string, spanID string) ([]*span.SpanEvent,
 
 	return result, nil
 }
+
+// GetEventsBatch efficiently retrieves events for multiple span IDs
+// Returns a map of spanID -> []SpanEvent
+// OPTIMIZATION: Single pass through parquet file instead of N passes
+func (pb *ParquetBlock) GetEventsBatch(spanIDs []string) (map[string][]*span.SpanEvent, error) {
+	if len(spanIDs) == 0 {
+		return nil, nil
+	}
+
+	eventsPath := filepath.Join(pb.dir, parquetEventsFilename)
+
+	// Check if events file exists
+	if _, err := os.Stat(eventsPath); os.IsNotExist(err) {
+		return nil, nil // No events file
+	}
+
+	// Parse all span IDs to uint64 and build set for fast lookup
+	spanIDSet := make(map[uint64]string, len(spanIDs)) // uint64 -> original string
+	for _, sid := range spanIDs {
+		sidInt, err := span.ParseSpanID(sid)
+		if err != nil {
+			continue // Skip invalid span IDs
+		}
+		spanIDSet[sidInt] = sid
+	}
+
+	if len(spanIDSet) == 0 {
+		return nil, nil
+	}
+
+	f, err := os.Open(eventsPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open events parquet file: %w", err)
+	}
+	defer f.Close()
+
+	stat, err := f.Stat()
+	if err != nil {
+		return nil, fmt.Errorf("failed to stat events parquet file: %w", err)
+	}
+
+	file, err := parquet.OpenFile(f, stat.Size())
+	if err != nil {
+		return nil, fmt.Errorf("failed to open events parquet file: %w", err)
+	}
+
+	reader := parquet.NewGenericReader[ParquetSpanEvent](file)
+	defer reader.Close()
+
+	result := make(map[string][]*span.SpanEvent)
+	batch := make([]ParquetSpanEvent, 1024)
+
+	// Single pass through all events
+	for {
+		n, err := reader.Read(batch)
+		if err != nil && err != io.EOF {
+			return nil, fmt.Errorf("failed to read events: %w", err)
+		}
+
+		for i := range n {
+			// Only collect events for span IDs we care about
+			if originalSid, found := spanIDSet[batch[i].SpanID]; found {
+				result[originalSid] = append(result[originalSid], parquetEventToSpanEvent(&batch[i]))
+			}
+		}
+
+		if err == io.EOF {
+			break
+		}
+	}
+
+	return result, nil
+}

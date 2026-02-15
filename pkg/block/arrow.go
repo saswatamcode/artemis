@@ -270,13 +270,21 @@ func (ab *ArrowBlock) GetSpanByID(spanID string) (*span.Span, error) {
 	return extractSpanFromArrowRecord(ab.records[ref.RecordIndex], ref.RowIndex)
 }
 
-// GetSpansBatch efficiently retrieves multiple spans by ID
+// GetSpansBatch efficiently retrieves multiple spans by ID with their events and links
+// OPTIMIZATION: Groups spans by record index to improve cache locality
+// OPTIMIZATION: Fetches events and links in a single pass instead of N separate queries
 func (ab *ArrowBlock) GetSpansBatch(spanIDs []string) ([]*span.Span, error) {
 	if !ab.HasIndex() {
 		return nil, fmt.Errorf("block has no index")
 	}
 
-	result := make([]*span.Span, 0, len(spanIDs))
+	// Group span lookups by record index for better cache locality
+	type spanLookup struct {
+		recordIndex int
+		rowIndex    int
+	}
+	lookups := make([]spanLookup, 0, len(spanIDs))
+
 	for _, spanID := range spanIDs {
 		ref, ok := ab.index.LookupSpanID(spanID)
 		if !ok {
@@ -287,12 +295,57 @@ func (ab *ArrowBlock) GetSpansBatch(spanIDs []string) ([]*span.Span, error) {
 			continue
 		}
 
-		sp, err := extractSpanFromArrowRecord(ab.records[ref.RecordIndex], ref.RowIndex)
-		if err != nil {
-			continue
-		}
+		lookups = append(lookups, spanLookup{
+			recordIndex: ref.RecordIndex,
+			rowIndex:    ref.RowIndex,
+		})
+	}
 
-		result = append(result, sp)
+	// Process spans grouped by record for better cache performance
+	result := make([]*span.Span, 0, len(lookups))
+	recordGroups := make(map[int][]int) // recordIndex -> []rowIndex
+
+	for _, lookup := range lookups {
+		recordGroups[lookup.recordIndex] = append(recordGroups[lookup.recordIndex], lookup.rowIndex)
+	}
+
+	// Process each record once, extracting all needed spans
+	for recordIdx, rowIndices := range recordGroups {
+		record := ab.records[recordIdx]
+		for _, rowIdx := range rowIndices {
+			sp, err := extractSpanFromArrowRecord(record, rowIdx)
+			if err != nil {
+				continue
+			}
+			result = append(result, sp)
+		}
+	}
+
+	// Batch fetch events and links if they exist
+	eventsMap, _ := ab.GetEventsBatch(spanIDs)
+	if eventsMap != nil {
+		for _, sp := range result {
+			if eventPtrs, found := eventsMap[sp.SpanID]; found {
+				// Convert []*SpanEvent to []SpanEvent
+				sp.Events = make([]span.SpanEvent, len(eventPtrs))
+				for i, e := range eventPtrs {
+					sp.Events[i] = *e
+				}
+			}
+		}
+	}
+
+	linksMap, _ := ab.GetLinksBatch(spanIDs)
+	if linksMap != nil {
+		for _, sp := range result {
+			if linkPtrs, found := linksMap[sp.SpanID]; found {
+				// Convert []*SpanLink to []SpanLink
+				sp.Links = make([]span.SpanLink, len(linkPtrs))
+				for i, l := range linkPtrs {
+					sp.Links[i] = *l
+				}
+			}
+		}
 	}
 
 	return result, nil
@@ -375,6 +428,19 @@ func (ab *ArrowBlock) scanByTag(tagKey, tagValue string) ([]*span.Span, error) {
 	return result, nil
 }
 
+// hexDigits for fast hex encoding
+const hexDigits = "0123456789abcdef"
+
+// uint64ToHex converts a uint64 to a 16-character hex string without allocations
+// Much faster than fmt.Sprintf("%016x", val)
+func uint64ToHex(val uint64, buf []byte) {
+	_ = buf[15] // bounds check hint
+	for i := 15; i >= 0; i-- {
+		buf[i] = hexDigits[val&0xf]
+		val >>= 4
+	}
+}
+
 // extractSpanFromArrowRecord extracts a span from an Arrow record
 func extractSpanFromArrowRecord(record arrow.RecordBatch, rowIndex int) (*span.Span, error) {
 	// Validate row index
@@ -395,19 +461,29 @@ func extractSpanFromArrowRecord(record arrow.RecordBatch, rowIndex int) (*span.S
 
 	// Extract fields with bounds checking
 	// Read trace_id_hi and trace_id_lo and format as hex string
+	// OPTIMIZATION: Use fast hex encoding instead of fmt.Sprintf
 	traceIDHi := record.Column(0).(*array.Uint64).Value(rowIndex)
 	traceIDLo := record.Column(1).(*array.Uint64).Value(rowIndex)
-	sp.TraceID = fmt.Sprintf("%016x%016x", traceIDHi, traceIDLo)
+	var traceIDBuf [32]byte
+	uint64ToHex(traceIDHi, traceIDBuf[:16])
+	uint64ToHex(traceIDLo, traceIDBuf[16:])
+	sp.TraceID = string(traceIDBuf[:])
 
 	// Read span_id and format as hex string
+	// OPTIMIZATION: Use fast hex encoding instead of fmt.Sprintf
 	spanIDVal := record.Column(2).(*array.Uint64).Value(rowIndex)
-	sp.SpanID = fmt.Sprintf("%016x", spanIDVal)
+	var spanIDBuf [16]byte
+	uint64ToHex(spanIDVal, spanIDBuf[:])
+	sp.SpanID = string(spanIDBuf[:])
 
 	// Read parent_span_id and format as hex string (or empty if null)
+	// OPTIMIZATION: Use fast hex encoding instead of fmt.Sprintf
 	parentCol := record.Column(3).(*array.Uint64)
 	if !parentCol.IsNull(rowIndex) {
 		parentSpanIDVal := parentCol.Value(rowIndex)
-		sp.ParentSpanID = fmt.Sprintf("%016x", parentSpanIDVal)
+		var parentIDBuf [16]byte
+		uint64ToHex(parentSpanIDVal, parentIDBuf[:])
+		sp.ParentSpanID = string(parentIDBuf[:])
 	}
 
 	sp.Name = record.Column(4).(*array.String).Value(rowIndex)

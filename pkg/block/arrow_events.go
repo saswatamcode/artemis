@@ -182,3 +182,36 @@ func ReadAllEventsFromArrow(records []arrow.RecordBatch) ([]*span.SpanEvent, err
 
 	return result, nil
 }
+
+// GetEventsBatch efficiently retrieves events for multiple span IDs
+// Returns a map of spanID -> []SpanEvent
+// OPTIMIZATION: Single pass through all event records instead of N passes
+func (ab *ArrowBlock) GetEventsBatch(spanIDs []string) (map[string][]*span.SpanEvent, error) {
+	if len(spanIDs) == 0 {
+		return nil, nil
+	}
+
+	// Build set of span IDs we're looking for
+	spanIDSet := make(map[string]struct{}, len(spanIDs))
+	for _, sid := range spanIDs {
+		spanIDSet[sid] = struct{}{}
+	}
+
+	// Single pass through all event records
+	result := make(map[string][]*span.SpanEvent)
+
+	for _, record := range ab.eventRecords {
+		for row := 0; row < int(record.NumRows()); row++ {
+			e, err := extractEventFromArrowRecord(record, row)
+			if err != nil {
+				continue
+			}
+			// Only collect events for span IDs we care about
+			if _, found := spanIDSet[e.SpanID]; found {
+				result[e.SpanID] = append(result[e.SpanID], e)
+			}
+		}
+	}
+
+	return result, nil
+}

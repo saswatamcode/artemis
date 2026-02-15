@@ -341,3 +341,39 @@ func (s *ArrowLinkStorage) GetLinksBySpanID(spanID string) ([]*span.SpanLink, er
 
 	return result, nil
 }
+
+// GetLinksBatch efficiently retrieves links for multiple span IDs
+// Returns a map of spanID -> []SpanLink
+// OPTIMIZATION: Single pass through all link records instead of N passes
+func (s *ArrowLinkStorage) GetLinksBatch(spanIDs []string) (map[string][]*span.SpanLink, error) {
+	if len(spanIDs) == 0 {
+		return nil, nil
+	}
+
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	// Build set of span IDs we're looking for
+	spanIDSet := make(map[string]struct{}, len(spanIDs))
+	for _, sid := range spanIDs {
+		spanIDSet[sid] = struct{}{}
+	}
+
+	// Single pass through all link records
+	result := make(map[string][]*span.SpanLink)
+
+	for _, record := range s.records {
+		for row := 0; row < int(record.NumRows()); row++ {
+			l, err := s.extractLink(record, row)
+			if err != nil {
+				continue
+			}
+			// Only collect links for span IDs we care about
+			if _, found := spanIDSet[l.SpanID]; found {
+				result[l.SpanID] = append(result[l.SpanID], l)
+			}
+		}
+	}
+
+	return result, nil
+}

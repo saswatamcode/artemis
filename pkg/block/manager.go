@@ -249,8 +249,10 @@ func (bm *Manager) GetHead() *storage.ArrowStorage {
 
 // GetHeadAsBlock returns the head block as a Block interface
 // Use this for read/query operations to get uniform access across all block types
+// NOTE: This method is provided for compatibility but event/link storage is not available here.
+// For full event/link support, use DB.GetQuerier() which properly constructs HeadBlock with all storages.
 func (bm *Manager) GetHeadAsBlock() Block {
-	return NewHeadBlock(bm.head)
+	return NewHeadBlock(bm.head, nil, nil)
 }
 
 // RemoveBlock removes a block from the manager's list
