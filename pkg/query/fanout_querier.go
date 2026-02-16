@@ -21,12 +21,20 @@ func NewFanoutQuerier(queriers ...Querier) *FanoutQuerier {
 }
 
 // Select queries spans using matchers across all queriers in parallel
+// Events field is not populated (nil/empty)
 func (q *FanoutQuerier) Select(matchers ...*Matcher) (*SelectResult, error) {
 	return q.SelectWithTimeRange(nil, matchers...)
 }
 
+// SelectWithOptions queries spans with custom options across all queriers in parallel
+// Use QueryOptions.IncludeEvents to populate the Events field
+func (q *FanoutQuerier) SelectWithOptions(opts *QueryOptions, matchers ...*Matcher) (*SelectResult, error) {
+	return q.SelectWithTimeRangeAndOptions(nil, opts, matchers...)
+}
+
 // SelectWithTimeRange queries spans within a time range across all queriers in parallel
 // Results from all queriers are merged together
+// Events field is not populated (nil/empty)
 func (q *FanoutQuerier) SelectWithTimeRange(timeRange *TimeRange, matchers ...*Matcher) (*SelectResult, error) {
 	if len(q.queriers) == 0 {
 		return &SelectResult{Spans: make([]*span.Span, 0)}, nil
@@ -52,6 +60,65 @@ func (q *FanoutQuerier) SelectWithTimeRange(timeRange *TimeRange, matchers ...*M
 		go func(idx int, qr Querier) {
 			defer wg.Done()
 			res, err := qr.SelectWithTimeRange(timeRange, matchers...)
+			resultCh <- querierResult{result: res, err: err, index: idx}
+		}(i, querier)
+	}
+
+	// Wait for all queries to complete
+	go func() {
+		wg.Wait()
+		close(resultCh)
+	}()
+
+	// Collect results in order
+	// We must drain the channel completely even if there's an error
+	// to avoid goroutine leaks (goroutines waiting to send on the channel)
+	results := make([]*SelectResult, len(q.queriers))
+	var firstError error
+	for res := range resultCh {
+		if res.err != nil && firstError == nil {
+			firstError = res.err
+		}
+		results[res.index] = res.result
+	}
+
+	// Return error if any querier failed
+	if firstError != nil {
+		return nil, firstError
+	}
+
+	// Merge results
+	return mergeResults(results), nil
+}
+
+// SelectWithTimeRangeAndOptions queries spans within a time range with custom options
+// across all queriers in parallel. Results from all queriers are merged together.
+// Use QueryOptions.IncludeEvents to populate the Events field on returned spans
+func (q *FanoutQuerier) SelectWithTimeRangeAndOptions(timeRange *TimeRange, opts *QueryOptions, matchers ...*Matcher) (*SelectResult, error) {
+	if len(q.queriers) == 0 {
+		return &SelectResult{Spans: make([]*span.Span, 0)}, nil
+	}
+
+	// If only one querier, no need for parallelization
+	if len(q.queriers) == 1 {
+		return q.queriers[0].SelectWithTimeRangeAndOptions(timeRange, opts, matchers...)
+	}
+
+	// Query all queriers in parallel
+	type querierResult struct {
+		result *SelectResult
+		err    error
+		index  int // Track order for consistent merging
+	}
+
+	resultCh := make(chan querierResult, len(q.queriers))
+	var wg sync.WaitGroup
+
+	for i, querier := range q.queriers {
+		wg.Add(1)
+		go func(idx int, qr Querier) {
+			defer wg.Done()
+			res, err := qr.SelectWithTimeRangeAndOptions(timeRange, opts, matchers...)
 			resultCh <- querierResult{result: res, err: err, index: idx}
 		}(i, querier)
 	}

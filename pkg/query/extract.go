@@ -26,28 +26,38 @@ func extractSpanFromRecordWithOptions(record arrow.RecordBatch, rowIndex int, ex
 
 	sp := &span.Span{}
 
-	sp.TraceID = record.Column(0).(*array.String).Value(rowIndex)
+	// New schema: trace_id_hi(0), trace_id_lo(1), span_id(2), parent_span_id(3), name(4),
+	//             start_time(5), end_time(6), duration(7), service_name(8), tags(9)
 
-	sp.SpanID = record.Column(1).(*array.String).Value(rowIndex)
+	// Read trace_id as two uint64 values and format as hex string
+	traceIDHi := record.Column(0).(*array.Uint64).Value(rowIndex)
+	traceIDLo := record.Column(1).(*array.Uint64).Value(rowIndex)
+	sp.TraceID = fmt.Sprintf("%016x%016x", traceIDHi, traceIDLo)
 
-	parentCol := record.Column(2).(*array.String)
+	// Read span_id and format as hex string
+	spanIDVal := record.Column(2).(*array.Uint64).Value(rowIndex)
+	sp.SpanID = fmt.Sprintf("%016x", spanIDVal)
+
+	// Read parent_span_id and format as hex string (or empty if null)
+	parentCol := record.Column(3).(*array.Uint64)
 	if !parentCol.IsNull(rowIndex) {
-		sp.ParentSpanID = parentCol.Value(rowIndex)
+		parentSpanIDVal := parentCol.Value(rowIndex)
+		sp.ParentSpanID = fmt.Sprintf("%016x", parentSpanIDVal)
 	}
 
-	sp.Name = record.Column(3).(*array.String).Value(rowIndex)
+	sp.Name = record.Column(4).(*array.String).Value(rowIndex)
 
-	sp.StartTime = time.Unix(0, record.Column(4).(*array.Int64).Value(rowIndex))
+	sp.StartTime = time.Unix(0, record.Column(5).(*array.Int64).Value(rowIndex))
 
-	sp.EndTime = time.Unix(0, record.Column(5).(*array.Int64).Value(rowIndex))
+	sp.EndTime = time.Unix(0, record.Column(6).(*array.Int64).Value(rowIndex))
 
-	sp.Duration = record.Column(6).(*array.Int64).Value(rowIndex)
+	sp.Duration = record.Column(7).(*array.Int64).Value(rowIndex)
 
-	sp.ServiceName = record.Column(7).(*array.String).Value(rowIndex)
+	sp.ServiceName = record.Column(8).(*array.String).Value(rowIndex)
 
 	// Only extract tags if needed (expensive operation)
 	if extractTags {
-		tagsCol := record.Column(8).(*array.Map)
+		tagsCol := record.Column(9).(*array.Map)
 		if !tagsCol.IsNull(rowIndex) {
 			sp.Tags = make(map[string]string)
 

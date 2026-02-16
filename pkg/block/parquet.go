@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math/bits"
 	"os"
 	"path/filepath"
 	"sort"
@@ -25,28 +26,34 @@ const (
 // Using struct tags to configure Parquet encoding
 // Compression is configured at the writer level, not per-field
 type ParquetSpan struct {
-	TraceID      string            `parquet:"trace_id,dict"`
-	SpanID       string            `parquet:"span_id"`
-	ParentSpanID string            `parquet:"parent_span_id,optional,dict"`
-	Name         string            `parquet:"name,dict"`
-	StartTime    int64             `parquet:"start_time,delta"` // nanoseconds since epoch
-	EndTime      int64             `parquet:"end_time,delta"`   // nanoseconds since epoch
-	Duration     int64             `parquet:"duration,delta"`   // nanoseconds
-	ServiceName  string            `parquet:"service_name,dict"`
-	Tags         map[string]string `parquet:"tags,optional" parquet-key:"dict" parquet-value:"dict"`
+	TraceIDHi      uint64            `parquet:"trace_id_hi"`
+	TraceIDLo      uint64            `parquet:"trace_id_lo"`
+	SpanID         uint64            `parquet:"span_id"`
+	ParentSpanID   uint64            `parquet:"parent_span_id,optional"`
+	Name           string            `parquet:"name,dict"`
+	StartTime      int64             `parquet:"start_time,delta"` // nanoseconds since epoch
+	EndTime        int64             `parquet:"end_time,delta"`   // nanoseconds since epoch
+	Duration       int64             `parquet:"duration,delta"`   // nanoseconds
+	ServiceName    string            `parquet:"service_name,dict"`
+	Tags           map[string]string `parquet:"tags,optional" parquet-key:"dict" parquet-value:"dict"`
+	Bucket1s       int64             `parquet:"bucket1s"`        // per-second bucket of start time
+	DurationBucket int32             `parquet:"duration_bucket"` // exponential duration bucket
 }
 
 // ParquetSpanMetadata is a metadata-only projection
 // Useful for queries that only need span metadata without tags
 type ParquetSpanMetadata struct {
-	TraceID      string `parquet:"trace_id,dict"`
-	SpanID       string `parquet:"span_id"`
-	ParentSpanID string `parquet:"parent_span_id,optional,dict"`
-	Name         string `parquet:"name,dict"`
-	StartTime    int64  `parquet:"start_time,delta"`
-	EndTime      int64  `parquet:"end_time,delta"`
-	Duration     int64  `parquet:"duration,delta"`
-	ServiceName  string `parquet:"service_name,dict"`
+	TraceIDHi      uint64 `parquet:"trace_id_hi"`
+	TraceIDLo      uint64 `parquet:"trace_id_lo"`
+	SpanID         uint64 `parquet:"span_id"`
+	ParentSpanID   uint64 `parquet:"parent_span_id,optional"`
+	Name           string `parquet:"name,dict"`
+	StartTime      int64  `parquet:"start_time,delta"`
+	EndTime        int64  `parquet:"end_time,delta"`
+	Duration       int64  `parquet:"duration,delta"`
+	ServiceName    string `parquet:"service_name,dict"`
+	Bucket1s       int64  `parquet:"bucket1s"`
+	DurationBucket int32  `parquet:"duration_bucket"`
 }
 
 // ParquetBlock represents a block stored as Parquet (compacted data)
@@ -322,6 +329,33 @@ func (pb *ParquetBlock) GetSpansBatch(spanIDs []string) ([]*span.Span, error) {
 		}()
 	}
 
+	// Batch fetch events and links if they exist
+	eventsMap, _ := pb.GetEventsBatch(spanIDs)
+	if eventsMap != nil {
+		for _, sp := range results {
+			if eventPtrs, found := eventsMap[sp.SpanID]; found {
+				// Convert []*SpanEvent to []SpanEvent
+				sp.Events = make([]span.SpanEvent, len(eventPtrs))
+				for i, e := range eventPtrs {
+					sp.Events[i] = *e
+				}
+			}
+		}
+	}
+
+	linksMap, _ := pb.GetLinksBatch(spanIDs)
+	if linksMap != nil {
+		for _, sp := range results {
+			if linkPtrs, found := linksMap[sp.SpanID]; found {
+				// Convert []*SpanLink to []SpanLink
+				sp.Links = make([]span.SpanLink, len(linkPtrs))
+				for i, l := range linkPtrs {
+					sp.Links[i] = *l
+				}
+			}
+		}
+	}
+
 	return results, nil
 }
 
@@ -508,8 +542,14 @@ func (pb *ParquetBlock) GetSpansByTag(tagKey, tagValue string) ([]*span.Span, er
 
 // scanByTraceID is a fallback metadata scan when no index is available
 func (pb *ParquetBlock) scanByTraceID(traceID string) ([]*span.Span, error) {
+	// Parse the trace ID into hi/lo components
+	traceIDHi, traceIDLo, err := span.ParseTraceID(traceID)
+	if err != nil {
+		return nil, fmt.Errorf("invalid trace ID: %w", err)
+	}
+
 	filterFunc := func(meta *ParquetSpanMetadata) bool {
-		return meta.TraceID == traceID
+		return meta.TraceIDHi == traceIDHi && meta.TraceIDLo == traceIDLo
 	}
 
 	refs, err := pb.ScanMetadata(filterFunc)
@@ -540,25 +580,84 @@ func (pb *ParquetBlock) scanByTag(tagKey, tagValue string) ([]*span.Span, error)
 
 // spanToParquetSpan converts a Span to ParquetSpan
 func spanToParquetSpan(s *span.Span) *ParquetSpan {
+	// Parse trace ID into hi/lo components
+	traceIDHi, traceIDLo, err := span.ParseTraceID(s.TraceID)
+	if err != nil {
+		// If parsing fails, use 0 values
+		traceIDHi, traceIDLo = 0, 0
+	}
+
+	// Parse span ID
+	spanID, err := span.ParseSpanID(s.SpanID)
+	if err != nil {
+		spanID = 0
+	}
+
+	// Parse parent span ID (0 if empty)
+	parentSpanID := uint64(0)
+	if s.ParentSpanID != "" {
+		parentSpanID, err = span.ParseSpanID(s.ParentSpanID)
+		if err != nil {
+			parentSpanID = 0
+		}
+	}
+
+	startUnixNano := s.StartTime.UnixNano()
+	durationNs := s.GetDuration()
+
+	// Calculate bucket1s: round down start time to the second
+	const sec = int64(1_000_000_000)
+	bucket := startUnixNano - (startUnixNano % sec)
+
+	// Calculate duration bucket using exponential bucketing
+	var durationBucketVal int32
+	if durationNs <= 0 {
+		durationBucketVal = 0
+	} else {
+		durationBucketVal = int32(bits.Len64(uint64(durationNs)) - 1)
+	}
+
 	return &ParquetSpan{
-		TraceID:      s.TraceID,
-		SpanID:       s.SpanID,
-		ParentSpanID: s.ParentSpanID,
-		Name:         s.Name,
-		StartTime:    s.StartTime.UnixNano(),
-		EndTime:      s.EndTime.UnixNano(),
-		Duration:     s.GetDuration(),
-		ServiceName:  s.ServiceName,
-		Tags:         s.Tags,
+		TraceIDHi:      traceIDHi,
+		TraceIDLo:      traceIDLo,
+		SpanID:         spanID,
+		ParentSpanID:   parentSpanID,
+		Name:           s.Name,
+		StartTime:      startUnixNano,
+		EndTime:        s.EndTime.UnixNano(),
+		Duration:       durationNs,
+		ServiceName:    s.ServiceName,
+		Tags:           s.Tags,
+		Bucket1s:       bucket,
+		DurationBucket: durationBucketVal,
 	}
 }
 
 // parquetSpanToSpan converts a ParquetSpan to Span
 func parquetSpanToSpan(ps *ParquetSpan) *span.Span {
+	// Convert trace ID from hi/lo to hex string
+	var traceIDBuf [32]byte
+	uint64ToHex(ps.TraceIDHi, traceIDBuf[:16])
+	uint64ToHex(ps.TraceIDLo, traceIDBuf[16:])
+	traceID := string(traceIDBuf[:])
+
+	// Convert span ID to hex string
+	var spanIDBuf [16]byte
+	uint64ToHex(ps.SpanID, spanIDBuf[:])
+	spanID := string(spanIDBuf[:])
+
+	// Convert parent span ID to hex string (empty if 0)
+	parentSpanID := ""
+	if ps.ParentSpanID != 0 {
+		var parentIDBuf [16]byte
+		uint64ToHex(ps.ParentSpanID, parentIDBuf[:])
+		parentSpanID = string(parentIDBuf[:])
+	}
+
 	return &span.Span{
-		TraceID:      ps.TraceID,
-		SpanID:       ps.SpanID,
-		ParentSpanID: ps.ParentSpanID,
+		TraceID:      traceID,
+		SpanID:       spanID,
+		ParentSpanID: parentSpanID,
 		Name:         ps.Name,
 		StartTime:    time.Unix(0, ps.StartTime),
 		EndTime:      time.Unix(0, ps.EndTime),
@@ -566,6 +665,26 @@ func parquetSpanToSpan(ps *ParquetSpan) *span.Span {
 		ServiceName:  ps.ServiceName,
 		Tags:         ps.Tags,
 	}
+}
+
+// GetEventsBySpanID retrieves all events for a given span ID from this block
+func (pb *ParquetBlock) GetEventsBySpanID(spanID string) ([]*span.SpanEvent, error) {
+	return GetEventsBySpanIDFromParquet(pb.dir, spanID)
+}
+
+// ReadAllEvents reads all events from this block
+func (pb *ParquetBlock) ReadAllEvents() ([]*span.SpanEvent, error) {
+	return ReadParquetEvents(pb.dir)
+}
+
+// GetLinksBySpanID retrieves all links for a given span ID from this block
+func (pb *ParquetBlock) GetLinksBySpanID(spanID string) ([]*span.SpanLink, error) {
+	return GetLinksBySpanIDFromParquet(pb.dir, spanID)
+}
+
+// ReadAllLinks reads all links from this block
+func (pb *ParquetBlock) ReadAllLinks() ([]*span.SpanLink, error) {
+	return ReadParquetLinks(pb.dir)
 }
 
 // WriteParquetBlock writes spans to a Parquet file with optimizations

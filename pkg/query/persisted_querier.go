@@ -25,9 +25,25 @@ func (q *PersistedBlockQuerier) Select(matchers ...*Matcher) (*SelectResult, err
 	return q.SelectWithTimeRange(nil, matchers...)
 }
 
+// SelectWithOptions queries spans from persisted blocks with custom options
+// Note: Event loading is not supported at the querier level.
+// Events field will be nil. Use DB.GetEventsForSpan() to load events separately.
+func (q *PersistedBlockQuerier) SelectWithOptions(opts *QueryOptions, matchers ...*Matcher) (*SelectResult, error) {
+	return q.SelectWithTimeRangeAndOptions(nil, opts, matchers...)
+}
+
 // SelectWithTimeRange queries spans from persisted blocks within a time range
 // This method queries blocks in parallel for better performance
 func (q *PersistedBlockQuerier) SelectWithTimeRange(timeRange *TimeRange, matchers ...*Matcher) (*SelectResult, error) {
+	return q.SelectWithTimeRangeAndOptions(timeRange, nil, matchers...)
+}
+
+// SelectWithTimeRangeAndOptions queries spans from persisted blocks within a time range with options
+// This method queries blocks in parallel for better performance
+// Note: Event loading is not supported at the querier level.
+// Events field will be nil regardless of opts.IncludeEvents.
+// Use DB.GetEventsForSpan() to load events separately.
+func (q *PersistedBlockQuerier) SelectWithTimeRangeAndOptions(timeRange *TimeRange, opts *QueryOptions, matchers ...*Matcher) (*SelectResult, error) {
 	ms := Matchers(matchers)
 
 	if len(q.blocks) == 0 {
@@ -76,6 +92,9 @@ func (q *PersistedBlockQuerier) SelectWithTimeRange(timeRange *TimeRange, matche
 			result.Spans = append(result.Spans, res.spans...)
 		}
 	}
+
+	// Note: opts.IncludeEvents is ignored at this level
+	// Event loading should be done via DB.GetEventsForSpan()
 
 	return result, nil
 }

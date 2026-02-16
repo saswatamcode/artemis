@@ -39,8 +39,8 @@ func TestDB_WALSegmentRaceCondition(t *testing.T) {
 	const numSpans = 1000
 	for i := range numSpans {
 		sp := &span.Span{
-			TraceID:     fmt.Sprintf("trace-%d", i),
-			SpanID:      fmt.Sprintf("span-%d", i),
+			TraceID:     fmt.Sprintf("%032x", i),
+			SpanID:      fmt.Sprintf("%016x", i+1),
 			Name:        "operation-with-very-long-name-to-increase-size-and-trigger-rotation",
 			StartTime:   time.Now().Add(time.Duration(i) * time.Millisecond),
 			EndTime:     time.Now().Add(time.Duration(i+1) * time.Millisecond),
@@ -121,8 +121,8 @@ func TestDB_QueryFlushRaceCondition(t *testing.T) {
 	const numSpans = 100
 	for i := range numSpans {
 		sp := &span.Span{
-			TraceID:     "trace-race-test",
-			SpanID:      fmt.Sprintf("span-%d", i),
+			TraceID:     "00000000000000000000000000000001",
+			SpanID:      fmt.Sprintf("%016x", i+1),
 			Name:        "operation",
 			StartTime:   time.Now().Add(time.Duration(i) * time.Millisecond),
 			EndTime:     time.Now().Add(time.Duration(i+1) * time.Millisecond),
@@ -147,11 +147,11 @@ func TestDB_QueryFlushRaceCondition(t *testing.T) {
 		go func(id int) {
 			defer wg.Done()
 			for j := range 10 {
-				matcher, _ := query.NewMatcher(query.MatchEqual, "trace_id", "trace-race-test")
+				matcher, _ := query.NewMatcher(query.MatchEqual, "trace_id", "00000000000000000000000000000001")
 				var result *query.SelectResult
 				err := db.QueryWithLock(func(head *storage.ArrowStorage, blocks []block.Block) error {
 					var queryErr error
-					result, queryErr = query.SelectFromBlocks(block.NewHeadBlock(head), blocks, matcher)
+					result, queryErr = query.SelectFromBlocks(block.NewHeadBlock(head, nil, nil), blocks, matcher)
 					return queryErr
 				})
 				if err != nil {
@@ -190,11 +190,11 @@ func TestDB_QueryFlushRaceCondition(t *testing.T) {
 	}
 
 	// Final verification - all spans should be queryable
-	matcher, _ := query.NewMatcher(query.MatchEqual, "trace_id", "trace-race-test")
+	matcher, _ := query.NewMatcher(query.MatchEqual, "trace_id", "00000000000000000000000000000001")
 	var finalResult *query.SelectResult
 	err = db.QueryWithLock(func(head *storage.ArrowStorage, blocks []block.Block) error {
 		var queryErr error
-		finalResult, queryErr = query.SelectFromBlocks(block.NewHeadBlock(head), blocks, matcher)
+		finalResult, queryErr = query.SelectFromBlocks(block.NewHeadBlock(head, nil, nil), blocks, matcher)
 		return queryErr
 	})
 	if err != nil {
@@ -243,8 +243,8 @@ func TestDB_ConcurrentWritesAndQueries(t *testing.T) {
 			defer wg.Done()
 			for i := range spansPerWriter {
 				sp := &span.Span{
-					TraceID:     fmt.Sprintf("trace-writer-%d", id),
-					SpanID:      fmt.Sprintf("writer-%d-span-%d", id, i),
+					TraceID:     fmt.Sprintf("%032x", id),
+					SpanID:      fmt.Sprintf("%016x", id*1000+i+1),
 					Name:        "concurrent-write",
 					StartTime:   time.Now(),
 					EndTime:     time.Now().Add(time.Millisecond),
@@ -269,7 +269,7 @@ func TestDB_ConcurrentWritesAndQueries(t *testing.T) {
 				var result *query.SelectResult
 				err := db.QueryWithLock(func(head *storage.ArrowStorage, blocks []block.Block) error {
 					var queryErr error
-					result, queryErr = query.SelectFromBlocks(block.NewHeadBlock(head), blocks, matcher)
+					result, queryErr = query.SelectFromBlocks(block.NewHeadBlock(head, nil, nil), blocks, matcher)
 					return queryErr
 				})
 				if err != nil {
@@ -300,7 +300,7 @@ func TestDB_ConcurrentWritesAndQueries(t *testing.T) {
 	var finalResult *query.SelectResult
 	err = db.QueryWithLock(func(head *storage.ArrowStorage, blocks []block.Block) error {
 		var queryErr error
-		finalResult, queryErr = query.SelectFromBlocks(block.NewHeadBlock(head), blocks, matcher)
+		finalResult, queryErr = query.SelectFromBlocks(block.NewHeadBlock(head, nil, nil), blocks, matcher)
 		return queryErr
 	})
 	if err != nil {
@@ -341,8 +341,8 @@ func TestDB_CheckpointWithHeadData(t *testing.T) {
 	// Scenario: Flush first block (segment 0)
 	for i := range 10 {
 		sp := &span.Span{
-			TraceID:     "trace-1",
-			SpanID:      fmt.Sprintf("block1-span-%d", i),
+			TraceID:     "00000000000000000000000000000001",
+			SpanID:      fmt.Sprintf("%016x", i+1),
 			Name:        "operation",
 			StartTime:   time.Now(),
 			EndTime:     time.Now().Add(time.Millisecond),
@@ -356,8 +356,8 @@ func TestDB_CheckpointWithHeadData(t *testing.T) {
 	// Write to head but DON'T flush (stays in segment 0)
 	for i := range 5 {
 		sp := &span.Span{
-			TraceID:     "trace-1",
-			SpanID:      fmt.Sprintf("head-span-%d", i),
+			TraceID:     "00000000000000000000000000000001",
+			SpanID:      fmt.Sprintf("%016x", i+11),
 			Name:        "operation",
 			StartTime:   time.Now(),
 			EndTime:     time.Now().Add(time.Millisecond),

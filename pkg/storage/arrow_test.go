@@ -134,9 +134,9 @@ func TestArrowStorage_GetSpanByID(t *testing.T) {
 	defer storage.Release()
 
 	originalSpan := &span.Span{
-		TraceID:      "trace-123",
-		SpanID:       "span-456",
-		ParentSpanID: "span-000",
+		TraceID:      "0000000000000123000000000000abcd", // Valid 32-char hex string
+		SpanID:       "0000000000000456",                 // Valid 16-char hex string
+		ParentSpanID: "0000000000000000",                 // Valid 16-char hex string
 		Name:         "http.request",
 		StartTime:    time.Unix(0, 1000000),
 		EndTime:      time.Unix(0, 2000000),
@@ -152,7 +152,7 @@ func TestArrowStorage_GetSpanByID(t *testing.T) {
 	storage.Flush()
 
 	// Retrieve the span
-	retrievedSpan, err := storage.GetSpanByID("span-456")
+	retrievedSpan, err := storage.GetSpanByID("0000000000000456")
 	if err != nil {
 		t.Fatalf("GetSpanByID() error = %v", err)
 	}
@@ -366,14 +366,15 @@ func TestArrowStorage_Schema(t *testing.T) {
 	}
 
 	// Verify schema has expected fields
-	if schema.NumFields() != 9 {
-		t.Errorf("Schema has %d fields, want 9", schema.NumFields())
+	if schema.NumFields() != 12 {
+		t.Errorf("Schema has %d fields, want 12", schema.NumFields())
 	}
 
 	// Check field names
 	expectedFields := []string{
-		"trace_id", "span_id", "parent_span_id", "name",
+		"trace_id_hi", "trace_id_lo", "span_id", "parent_span_id", "name",
 		"start_time", "end_time", "duration", "service_name", "tags",
+		"bucket1s", "duration_bucket",
 	}
 
 	for i, expected := range expectedFields {

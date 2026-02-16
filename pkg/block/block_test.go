@@ -283,6 +283,11 @@ func TestManager_FlushHead(t *testing.T) {
 		t.Error("Block directory should exist after flush")
 	}
 
+	// Add the flushed block to the manager
+	if err := mgr.AddFlushedBlock(blockDir); err != nil {
+		t.Fatalf("AddFlushedBlock() error = %v", err)
+	}
+
 	// Verify manager stats updated
 	stats := mgr.Stats()
 	if stats.PersistedBlocks != 1 {
@@ -327,7 +332,16 @@ func TestManager_GetBlocks(t *testing.T) {
 	arrowStorage.Flush()
 
 	mgr.UpdateHeadTimeRange(time.Now().UnixNano(), time.Now().Add(time.Millisecond).UnixNano())
-	mgr.FlushHead(0, 0)
+	meta, err := mgr.FlushHead(0, 0)
+	if err != nil {
+		t.Fatalf("FlushHead() error = %v", err)
+	}
+
+	// Add the flushed block to the manager
+	blockDir := filepath.Join(cfg.Dir, meta.ULID.String())
+	if err := mgr.AddFlushedBlock(blockDir); err != nil {
+		t.Fatalf("AddFlushedBlock() error = %v", err)
+	}
 
 	// Should have one block now
 	blocks = mgr.GetBlocks()
@@ -365,8 +379,8 @@ func TestFlushBlock(t *testing.T) {
 	defer arrowStorage.Release()
 
 	sp := &span.Span{
-		TraceID:     "trace-1",
-		SpanID:      "span-1",
+		TraceID:     "00000000000000010000000000000000", // 128-bit trace-1
+		SpanID:      "0000000000000001",                 // 64-bit span-1
 		Name:        "operation",
 		StartTime:   time.Now(),
 		EndTime:     time.Now().Add(time.Millisecond),
@@ -419,8 +433,8 @@ func TestLoadPersistedBlock(t *testing.T) {
 	defer arrowStorage.Release()
 
 	sp := &span.Span{
-		TraceID:     "trace-1",
-		SpanID:      "span-1",
+		TraceID:     "00000000000000010000000000000000", // 128-bit trace-1
+		SpanID:      "0000000000000001",                 // 64-bit span-1
 		Name:        "operation",
 		StartTime:   time.Now(),
 		EndTime:     time.Now().Add(time.Millisecond),
@@ -468,7 +482,7 @@ func TestLoadPersistedBlock(t *testing.T) {
 		t.Error("Index() should not return nil")
 	}
 
-	_, found := idx.LookupSpanID("span-1")
+	_, found := idx.LookupSpanID("0000000000000001")
 	if !found {
 		t.Error("Index should contain span-1")
 	}
@@ -483,8 +497,8 @@ func TestWriteParquetBlock(t *testing.T) {
 	now := time.Now()
 	spans := []*span.Span{
 		{
-			TraceID:      "trace-1",
-			SpanID:       "span-1",
+			TraceID:      "00000000000000010000000000000000", // 128-bit trace-1
+			SpanID:       "0000000000000001",                 // 64-bit span-1
 			ParentSpanID: "",
 			Name:         "operation-1",
 			StartTime:    now,
@@ -497,9 +511,9 @@ func TestWriteParquetBlock(t *testing.T) {
 			},
 		},
 		{
-			TraceID:      "trace-1",
-			SpanID:       "span-2",
-			ParentSpanID: "span-1",
+			TraceID:      "00000000000000010000000000000000", // 128-bit trace-1
+			SpanID:       "0000000000000002",                 // 64-bit span-2
+			ParentSpanID: "0000000000000001",                 // 64-bit span-1
 			Name:         "operation-2",
 			StartTime:    now.Add(2 * time.Millisecond),
 			EndTime:      now.Add(8 * time.Millisecond),
@@ -510,8 +524,8 @@ func TestWriteParquetBlock(t *testing.T) {
 			},
 		},
 		{
-			TraceID:      "trace-2",
-			SpanID:       "span-3",
+			TraceID:      "00000000000000020000000000000000", // 128-bit trace-2
+			SpanID:       "0000000000000003",                 // 64-bit span-3
 			ParentSpanID: "",
 			Name:         "operation-3",
 			StartTime:    now.Add(15 * time.Millisecond),
@@ -575,8 +589,8 @@ func TestNewParquetBlock(t *testing.T) {
 	now := time.Now()
 	spans := []*span.Span{
 		{
-			TraceID:     "trace-1",
-			SpanID:      "span-1",
+			TraceID:     "00000000000000010000000000000000", // 128-bit trace-1
+			SpanID:      "0000000000000001",                 // 64-bit span-1
 			Name:        "test-op",
 			StartTime:   now,
 			EndTime:     now.Add(time.Millisecond),
@@ -642,8 +656,8 @@ func TestParquetBlock_GetSpan(t *testing.T) {
 	now := time.Now()
 	spans := []*span.Span{
 		{
-			TraceID:     "trace-1",
-			SpanID:      "span-1",
+			TraceID:     "00000000000000010000000000000000", // 128-bit trace-1
+			SpanID:      "0000000000000001",                 // 64-bit span-1
 			Name:        "op-1",
 			StartTime:   now,
 			EndTime:     now.Add(time.Millisecond),
@@ -652,8 +666,8 @@ func TestParquetBlock_GetSpan(t *testing.T) {
 			Tags:        map[string]string{"tag1": "value1"},
 		},
 		{
-			TraceID:     "trace-1",
-			SpanID:      "span-2",
+			TraceID:     "00000000000000010000000000000000", // 128-bit trace-1
+			SpanID:      "0000000000000002",                 // 64-bit span-2
 			Name:        "op-2",
 			StartTime:   now.Add(time.Millisecond),
 			EndTime:     now.Add(2 * time.Millisecond),
@@ -662,8 +676,8 @@ func TestParquetBlock_GetSpan(t *testing.T) {
 			Tags:        map[string]string{"tag2": "value2"},
 		},
 		{
-			TraceID:     "trace-2",
-			SpanID:      "span-3",
+			TraceID:     "00000000000000020000000000000000", // 128-bit trace-2
+			SpanID:      "0000000000000003",                 // 64-bit span-3
 			Name:        "op-3",
 			StartTime:   now.Add(2 * time.Millisecond),
 			EndTime:     now.Add(3 * time.Millisecond),
@@ -760,8 +774,8 @@ func TestParquetBlock_ReadAll(t *testing.T) {
 	now := time.Now()
 	originalSpans := []*span.Span{
 		{
-			TraceID:     "trace-1",
-			SpanID:      "span-1",
+			TraceID:     "00000000000000010000000000000000", // 128-bit trace-1
+			SpanID:      "0000000000000001",                 // 64-bit span-1
 			Name:        "op-1",
 			StartTime:   now,
 			EndTime:     now.Add(time.Millisecond),
@@ -770,8 +784,8 @@ func TestParquetBlock_ReadAll(t *testing.T) {
 			Tags:        map[string]string{"key": "value"},
 		},
 		{
-			TraceID:     "trace-1",
-			SpanID:      "span-2",
+			TraceID:     "00000000000000010000000000000000", // 128-bit trace-1
+			SpanID:      "0000000000000002",                 // 64-bit span-2
 			Name:        "op-2",
 			StartTime:   now.Add(time.Millisecond),
 			EndTime:     now.Add(2 * time.Millisecond),
@@ -845,8 +859,8 @@ func TestPersistedBlock_LoadArrowBlock(t *testing.T) {
 
 	now := time.Now()
 	sp := &span.Span{
-		TraceID:     "trace-1",
-		SpanID:      "span-1",
+		TraceID:     "00000000000000010000000000000000", // 128-bit trace-1
+		SpanID:      "0000000000000001",                 // 64-bit span-1
 		Name:        "test-op",
 		StartTime:   now,
 		EndTime:     now.Add(time.Millisecond),
@@ -899,7 +913,7 @@ func TestPersistedBlock_LoadArrowBlock(t *testing.T) {
 		t.Fatal("Index() should not return nil")
 	}
 
-	_, found := idx.LookupSpanID("span-1")
+	_, found := idx.LookupSpanID("0000000000000001")
 	if !found {
 		t.Error("Index should contain span-1")
 	}
@@ -914,8 +928,8 @@ func TestPersistedBlock_LoadParquetBlock(t *testing.T) {
 	now := time.Now()
 	spans := []*span.Span{
 		{
-			TraceID:     "trace-1",
-			SpanID:      "span-1",
+			TraceID:     "00000000000000010000000000000000", // 128-bit trace-1
+			SpanID:      "0000000000000001",                 // 64-bit span-1
 			Name:        "test-op",
 			StartTime:   now,
 			EndTime:     now.Add(time.Millisecond),
@@ -967,7 +981,7 @@ func TestPersistedBlock_LoadParquetBlock(t *testing.T) {
 		t.Fatal("Index() should not return nil")
 	}
 
-	_, found := idx.LookupSpanID("span-1")
+	_, found := idx.LookupSpanID("0000000000000001")
 	if !found {
 		t.Error("Index should contain span-1")
 	}
@@ -982,8 +996,8 @@ func TestParquetBlock_RoundTrip(t *testing.T) {
 	now := time.Now()
 	originalSpans := []*span.Span{
 		{
-			TraceID:      "trace-abc123",
-			SpanID:       "span-001",
+			TraceID:      "0000000000abc1230000000000000000", // 128-bit trace-abc123
+			SpanID:       "0000000000000001",                 // 64-bit span-001
 			ParentSpanID: "",
 			Name:         "http.request",
 			StartTime:    now,
@@ -998,9 +1012,9 @@ func TestParquetBlock_RoundTrip(t *testing.T) {
 			},
 		},
 		{
-			TraceID:      "trace-abc123",
-			SpanID:       "span-002",
-			ParentSpanID: "span-001",
+			TraceID:      "0000000000abc1230000000000000000", // 128-bit trace-abc123
+			SpanID:       "0000000000000002",                 // 64-bit span-002
+			ParentSpanID: "0000000000000001",                 // 64-bit span-001
 			Name:         "db.query",
 			StartTime:    now.Add(10 * time.Millisecond),
 			EndTime:      now.Add(60 * time.Millisecond),
@@ -1013,9 +1027,9 @@ func TestParquetBlock_RoundTrip(t *testing.T) {
 			},
 		},
 		{
-			TraceID:      "trace-abc123",
-			SpanID:       "span-003",
-			ParentSpanID: "span-001",
+			TraceID:      "0000000000abc1230000000000000000", // 128-bit trace-abc123
+			SpanID:       "0000000000000003",                 // 64-bit span-003
+			ParentSpanID: "0000000000000001",                 // 64-bit span-001
 			Name:         "cache.set",
 			StartTime:    now.Add(65 * time.Millisecond),
 			EndTime:      now.Add(70 * time.Millisecond),
@@ -1130,8 +1144,8 @@ func TestParquetBlock_EmptyTags(t *testing.T) {
 	now := time.Now()
 	spans := []*span.Span{
 		{
-			TraceID:     "trace-1",
-			SpanID:      "span-1",
+			TraceID:     "00000000000000010000000000000000", // 128-bit trace-1
+			SpanID:      "0000000000000001",                 // 64-bit span-1
 			Name:        "op-no-tags",
 			StartTime:   now,
 			EndTime:     now.Add(time.Millisecond),
@@ -1140,8 +1154,8 @@ func TestParquetBlock_EmptyTags(t *testing.T) {
 			Tags:        map[string]string{}, // Empty tags
 		},
 		{
-			TraceID:     "trace-1",
-			SpanID:      "span-2",
+			TraceID:     "00000000000000010000000000000000", // 128-bit trace-1
+			SpanID:      "0000000000000002",                 // 64-bit span-2
 			Name:        "op-nil-tags",
 			StartTime:   now,
 			EndTime:     now.Add(time.Millisecond),

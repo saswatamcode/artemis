@@ -1,6 +1,7 @@
 package block
 
 import (
+	"fmt"
 	"path/filepath"
 	"testing"
 	"time"
@@ -17,12 +18,13 @@ func TestParquetBlock_GetSpansBatch(t *testing.T) {
 	blockDir := filepath.Join(tmpDir, "batch-block")
 
 	// Create test spans across multiple row groups
+	// Use proper 32-char hex trace ID and 16-char hex span IDs
 	now := time.Now()
 	spans := make([]*span.Span, 50)
 	for i := range 50 {
 		spans[i] = &span.Span{
-			TraceID:     "trace-1",
-			SpanID:      ulid.Make().String(),
+			TraceID:     "00000000000000010000000000000000", // trace-1
+			SpanID:      fmt.Sprintf("%016x", uint64(i+1)),  // 16-char hex span IDs
 			Name:        "operation-" + string(rune(i)),
 			StartTime:   now.Add(time.Duration(i) * time.Millisecond),
 			EndTime:     now.Add(time.Duration(i+1) * time.Millisecond),
@@ -143,8 +145,8 @@ func TestParquetBlock_GetSpansBatch_NoIndex(t *testing.T) {
 	now := time.Now()
 	spans := []*span.Span{
 		{
-			TraceID:     "trace-1",
-			SpanID:      "span-1",
+			TraceID:     "00000000000000010000000000000000", // trace-1
+			SpanID:      "0000000000000001",                 // span-1
 			Name:        "op-1",
 			StartTime:   now,
 			EndTime:     now.Add(time.Millisecond),
@@ -176,7 +178,7 @@ func TestParquetBlock_GetSpansBatch_NoIndex(t *testing.T) {
 	defer pb.Close()
 
 	// Should error when trying to use GetSpansBatch without index
-	_, err = pb.GetSpansBatch([]string{"span-1"})
+	_, err = pb.GetSpansBatch([]string{"0000000000000001"})
 	if err == nil {
 		t.Error("GetSpansBatch() should error when block has no index")
 	}
@@ -188,11 +190,12 @@ func TestParquetBlock_ScanMetadata(t *testing.T) {
 	blockDir := filepath.Join(tmpDir, "scan-block")
 
 	// Create test spans with varied metadata
+	// Use proper 32-char hex trace IDs and 16-char hex span IDs
 	now := time.Now()
 	spans := []*span.Span{
 		{
-			TraceID:     "trace-1",
-			SpanID:      "span-1",
+			TraceID:     "00000000000000010000000000000000", // trace-1
+			SpanID:      "0000000000000001",                 // span-1
 			Name:        "GET /api/users",
 			StartTime:   now,
 			EndTime:     now.Add(10 * time.Millisecond),
@@ -201,8 +204,8 @@ func TestParquetBlock_ScanMetadata(t *testing.T) {
 			Tags:        map[string]string{"http.method": "GET", "http.status": "200"},
 		},
 		{
-			TraceID:     "trace-1",
-			SpanID:      "span-2",
+			TraceID:     "00000000000000010000000000000000", // trace-1
+			SpanID:      "0000000000000002",                 // span-2
 			Name:        "SELECT * FROM users",
 			StartTime:   now.Add(2 * time.Millisecond),
 			EndTime:     now.Add(8 * time.Millisecond),
@@ -211,8 +214,8 @@ func TestParquetBlock_ScanMetadata(t *testing.T) {
 			Tags:        map[string]string{"db.type": "postgres"},
 		},
 		{
-			TraceID:     "trace-2",
-			SpanID:      "span-3",
+			TraceID:     "00000000000000020000000000000000", // trace-2
+			SpanID:      "0000000000000003",                 // span-3
 			Name:        "POST /api/orders",
 			StartTime:   now.Add(20 * time.Millisecond),
 			EndTime:     now.Add(50 * time.Millisecond),
@@ -221,8 +224,8 @@ func TestParquetBlock_ScanMetadata(t *testing.T) {
 			Tags:        map[string]string{"http.method": "POST"},
 		},
 		{
-			TraceID:     "trace-2",
-			SpanID:      "span-4",
+			TraceID:     "00000000000000020000000000000000", // trace-2
+			SpanID:      "0000000000000004",                 // span-4
 			Name:        "cache.get",
 			StartTime:   now.Add(22 * time.Millisecond),
 			EndTime:     now.Add(24 * time.Millisecond),
@@ -267,7 +270,9 @@ func TestParquetBlock_ScanMetadata(t *testing.T) {
 		{
 			name: "filter by trace_id",
 			filterFunc: func(meta *ParquetSpanMetadata) bool {
-				return meta.TraceID == "trace-1"
+				// Parse the trace ID from the test spans to get hi/lo
+				traceIDHi, traceIDLo, _ := span.ParseTraceID("00000000000000010000000000000000")
+				return meta.TraceIDHi == traceIDHi && meta.TraceIDLo == traceIDLo
 			},
 			wantCount: 2,
 		},
@@ -346,10 +351,13 @@ func TestParquetBlock_GetSpansByRowReferences(t *testing.T) {
 
 	now := time.Now()
 	spans := make([]*span.Span, 20)
+	// Group spans into 4 traces (spans 0-4, 5-9, 10-14, 15-19)
 	for i := range 20 {
+		// Use proper 32-char hex trace IDs and 16-char hex span IDs
+		traceNum := i / 5 // 0, 1, 2, or 3
 		spans[i] = &span.Span{
-			TraceID:     "trace-" + string(rune(i/5)),
-			SpanID:      "span-" + string(rune(i)),
+			TraceID:     fmt.Sprintf("000000000000000%d0000000000000000", traceNum), // trace-0, trace-1, trace-2, trace-3
+			SpanID:      fmt.Sprintf("%016x", uint64(i+1)),                          // span IDs 1-20 as hex
 			Name:        "operation-" + string(rune(i)),
 			StartTime:   now.Add(time.Duration(i) * time.Millisecond),
 			EndTime:     now.Add(time.Duration(i+1) * time.Millisecond),
@@ -386,9 +394,11 @@ func TestParquetBlock_GetSpansByRowReferences(t *testing.T) {
 	}
 	defer pb.Close()
 
-	// First use ScanMetadata to get references
+	// First use ScanMetadata to get references for trace-1 (spans 5-9)
 	refs, err := pb.ScanMetadata(func(meta *ParquetSpanMetadata) bool {
-		return meta.TraceID == "trace-\x01" // spans 5-9
+		// Parse the expected trace ID (trace group 1)
+		traceIDHi, traceIDLo, _ := span.ParseTraceID("00000000000000010000000000000000")
+		return meta.TraceIDHi == traceIDHi && meta.TraceIDLo == traceIDLo // spans 5-9
 	})
 	if err != nil {
 		t.Fatalf("ScanMetadata() error = %v", err)
@@ -409,9 +419,10 @@ func TestParquetBlock_GetSpansByRowReferences(t *testing.T) {
 	}
 
 	// Verify all returned spans have correct trace_id
+	expectedTraceID := "00000000000000010000000000000000"
 	for _, sp := range result {
-		if sp.TraceID != "trace-\x01" {
-			t.Errorf("GetSpansByRowReferences() returned span with trace_id %s, want trace-\\x01", sp.TraceID)
+		if sp.TraceID != expectedTraceID {
+			t.Errorf("GetSpansByRowReferences() returned span with trace_id %s, want %s", sp.TraceID, expectedTraceID)
 		}
 	}
 
@@ -433,8 +444,8 @@ func TestParquetBlock_ScanAndFetch(t *testing.T) {
 	now := time.Now()
 	spans := []*span.Span{
 		{
-			TraceID:     "trace-prod",
-			SpanID:      "span-1",
+			TraceID:     "0000000000000fff0000000000000000", // trace-prod (using fff for "prod")
+			SpanID:      "0000000000000001",                 // span-1
 			Name:        "GET /health",
 			StartTime:   now,
 			EndTime:     now.Add(time.Millisecond),
@@ -443,8 +454,8 @@ func TestParquetBlock_ScanAndFetch(t *testing.T) {
 			Tags:        map[string]string{"env": "prod"},
 		},
 		{
-			TraceID:     "trace-dev",
-			SpanID:      "span-2",
+			TraceID:     "00000000000000dd0000000000000000", // trace-dev (using dd for "dev")
+			SpanID:      "0000000000000002",                 // span-2
 			Name:        "GET /health",
 			StartTime:   now,
 			EndTime:     now.Add(time.Millisecond),
@@ -453,8 +464,8 @@ func TestParquetBlock_ScanAndFetch(t *testing.T) {
 			Tags:        map[string]string{"env": "dev"},
 		},
 		{
-			TraceID:     "trace-prod",
-			SpanID:      "span-3",
+			TraceID:     "0000000000000fff0000000000000000", // trace-prod (using fff for "prod")
+			SpanID:      "0000000000000003",                 // span-3
 			Name:        "POST /api/data",
 			StartTime:   now,
 			EndTime:     now.Add(10 * time.Millisecond),
@@ -493,7 +504,9 @@ func TestParquetBlock_ScanAndFetch(t *testing.T) {
 
 	// Step 1: Scan metadata to find prod traces
 	refs, err := pb.ScanMetadata(func(meta *ParquetSpanMetadata) bool {
-		return meta.TraceID == "trace-prod"
+		// Parse the expected trace ID
+		traceIDHi, traceIDLo, _ := span.ParseTraceID("0000000000000fff0000000000000000")
+		return meta.TraceIDHi == traceIDHi && meta.TraceIDLo == traceIDLo
 	})
 	if err != nil {
 		t.Fatalf("ScanMetadata() error = %v", err)

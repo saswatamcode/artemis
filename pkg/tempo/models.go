@@ -1,6 +1,7 @@
 package tempo
 
 import (
+	"strconv"
 	"time"
 
 	commonv1 "go.opentelemetry.io/proto/otlp/common/v1"
@@ -21,7 +22,7 @@ type TraceSearchMetadata struct {
 	TraceID           string                 `json:"traceID"`
 	RootServiceName   string                 `json:"rootServiceName"`
 	RootTraceName     string                 `json:"rootTraceName"`
-	StartTimeUnixNano uint64                 `json:"startTimeUnixNano"`
+	StartTimeUnixNano string                 `json:"startTimeUnixNano"`
 	DurationMs        uint64                 `json:"durationMs"`
 	SpanSets          []SpanSet              `json:"spanSets,omitempty"`
 	ServiceStats      map[string]ServiceStat `json:"serviceStats,omitempty"`
@@ -35,11 +36,22 @@ type SpanSet struct {
 
 // SpanMetadata represents span metadata
 type SpanMetadata struct {
-	SpanID            string            `json:"spanID"`
-	Name              string            `json:"name"`
-	StartTimeUnixNano uint64            `json:"startTimeUnixNano"`
-	DurationNanos     uint64            `json:"durationNanos"`
-	Attributes        map[string]string `json:"attributes,omitempty"`
+	SpanID            string      `json:"spanID"`
+	Name              string      `json:"name"`
+	StartTimeUnixNano string      `json:"startTimeUnixNano"`
+	DurationNanos     string      `json:"durationNanos"`
+	Attributes        []Attribute `json:"attributes,omitempty"`
+}
+
+// Attribute represents a span attribute
+type Attribute struct {
+	Key   string         `json:"key"`
+	Value AttributeValue `json:"value"`
+}
+
+// AttributeValue represents an attribute value
+type AttributeValue struct {
+	StringValue string `json:"stringValue,omitempty"`
 }
 
 // ServiceStat represents service statistics
@@ -181,6 +193,48 @@ func convertSpanToOTLP(s *span.Span) *tracev1.Span {
 		}
 	}
 
+	// Convert span events to OTLP events
+	var otlpEvents []*tracev1.Span_Event
+	if len(s.Events) > 0 {
+		otlpEvents = make([]*tracev1.Span_Event, 0, len(s.Events))
+		for _, evt := range s.Events {
+			eventAttrs := make([]*commonv1.KeyValue, 0, len(evt.Attributes))
+			for k, v := range evt.Attributes {
+				eventAttrs = append(eventAttrs, &commonv1.KeyValue{
+					Key:   k,
+					Value: &commonv1.AnyValue{Value: &commonv1.AnyValue_StringValue{StringValue: v}},
+				})
+			}
+
+			otlpEvents = append(otlpEvents, &tracev1.Span_Event{
+				TimeUnixNano: uint64(evt.Timestamp.UnixNano()),
+				Name:         evt.Name,
+				Attributes:   eventAttrs,
+			})
+		}
+	}
+
+	// Convert span links to OTLP links
+	var otlpLinks []*tracev1.Span_Link
+	if len(s.Links) > 0 {
+		otlpLinks = make([]*tracev1.Span_Link, 0, len(s.Links))
+		for _, link := range s.Links {
+			linkAttrs := make([]*commonv1.KeyValue, 0, len(link.Attributes))
+			for k, v := range link.Attributes {
+				linkAttrs = append(linkAttrs, &commonv1.KeyValue{
+					Key:   k,
+					Value: &commonv1.AnyValue{Value: &commonv1.AnyValue_StringValue{StringValue: v}},
+				})
+			}
+
+			otlpLinks = append(otlpLinks, &tracev1.Span_Link{
+				TraceId:    hexToBytes(link.LinkedTraceID),
+				SpanId:     hexToBytes(link.LinkedSpanID),
+				Attributes: linkAttrs,
+			})
+		}
+	}
+
 	return &tracev1.Span{
 		TraceId:           traceID,
 		SpanId:            spanID,
@@ -190,6 +244,8 @@ func convertSpanToOTLP(s *span.Span) *tracev1.Span {
 		StartTimeUnixNano: uint64(s.StartTime.UnixNano()),
 		EndTimeUnixNano:   uint64(s.EndTime.UnixNano()),
 		Attributes:        attrs,
+		Events:            otlpEvents,
+		Links:             otlpLinks,
 		Status: &tracev1.Status{
 			Code: tracev1.Status_STATUS_CODE_UNSET,
 		},
@@ -276,12 +332,44 @@ func ConvertSpansToSearchMetadata(traceSpans map[string][]*span.Span) []TraceSea
 			svcStats[svc] = *stats
 		}
 
+		// Create span metadata for the trace
+		spanMetadata := make([]SpanMetadata, 0, len(spans))
+		for _, s := range spans {
+			// Convert tags to attribute array format
+			attrs := make([]Attribute, 0, len(s.Tags))
+			for k, v := range s.Tags {
+				attrs = append(attrs, Attribute{
+					Key: k,
+					Value: AttributeValue{
+						StringValue: v,
+					},
+				})
+			}
+
+			spanMetadata = append(spanMetadata, SpanMetadata{
+				SpanID:            s.SpanID,
+				Name:              s.Name,
+				StartTimeUnixNano: strconv.FormatUint(uint64(s.StartTime.UnixNano()), 10),
+				DurationNanos:     strconv.FormatUint(uint64(s.EndTime.Sub(s.StartTime).Nanoseconds()), 10),
+				Attributes:        attrs,
+			})
+		}
+
+		// Create a single SpanSet containing all spans in the trace
+		spanSets := []SpanSet{
+			{
+				Spans:   spanMetadata,
+				Matched: len(spanMetadata),
+			},
+		}
+
 		results = append(results, TraceSearchMetadata{
 			TraceID:           traceID,
 			RootServiceName:   rootServiceName,
 			RootTraceName:     rootTraceName,
-			StartTimeUnixNano: uint64(minStartTime.UnixNano()),
+			StartTimeUnixNano: strconv.FormatUint(uint64(minStartTime.UnixNano()), 10),
 			DurationMs:        uint64(duration.Milliseconds()),
+			SpanSets:          spanSets,
 			ServiceStats:      svcStats,
 		})
 	}

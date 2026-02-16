@@ -17,6 +17,13 @@ type SelectResult struct {
 	Spans []*span.Span
 }
 
+// QueryOptions holds options for querying spans
+type QueryOptions struct {
+	// IncludeEvents controls whether span events should be loaded
+	// If true, the Events field on each span will be populated
+	IncludeEvents bool
+}
+
 // TimeRange specifies a time range for queries
 type TimeRange struct {
 	Start time.Time
@@ -258,14 +265,22 @@ func createMetadataFilter(ms Matchers, timeRange *TimeRange) func(*block.Parquet
 
 			switch m.Name {
 			case "trace_id":
-				val = meta.TraceID
+				// Convert uint64 hi/lo to hex string
+				val = fmt.Sprintf("%016x%016x", meta.TraceIDHi, meta.TraceIDLo)
 				ok = val != ""
 			case "span_id":
-				val = meta.SpanID
+				// Convert uint64 to hex string
+				val = fmt.Sprintf("%016x", meta.SpanID)
 				ok = val != ""
 			case "parent_span_id":
-				val = meta.ParentSpanID
-				ok = val != ""
+				// Convert uint64 to hex string (0 means no parent)
+				if meta.ParentSpanID != 0 {
+					val = fmt.Sprintf("%016x", meta.ParentSpanID)
+					ok = true
+				} else {
+					val = ""
+					ok = false
+				}
 			case "name":
 				val = meta.Name
 				ok = val != ""
@@ -411,30 +426,13 @@ func queryHeadBlock(hb *block.HeadBlock, ms Matchers, timeRange *TimeRange) []*s
 				}
 
 				if len(candidateSpanIDs) > 0 {
-					records := storage.GetRecords()
-					// Determine if we need to extract tags for matching
-					needTags := matchersNeedTags(ms)
-
-					for _, spanID := range candidateSpanIDs {
-						ref, ok := idx.LookupSpanID(spanID)
-						if !ok || ref.RecordIndex >= len(records) {
-							continue
-						}
-
-						sp, err := extractSpanFromRecordWithOptions(records[ref.RecordIndex], ref.RowIndex, needTags)
-						if err != nil {
-							continue
-						}
-
-						if ms.Matches(sp) && (timeRange == nil || spanInTimeRange(sp, timeRange)) {
-							// If we didn't extract tags during filtering, extract them now for the final result
-							if !needTags {
-								sp, err = extractSpanFromRecordWithOptions(records[ref.RecordIndex], ref.RowIndex, true)
-								if err != nil {
-									continue
-								}
+					// Head block: use GetSpansBatch for consistent interface usage
+					batchSpans, err := hb.GetSpansBatch(candidateSpanIDs)
+					if err == nil {
+						for _, sp := range batchSpans {
+							if ms.Matches(sp) && (timeRange == nil || spanInTimeRange(sp, timeRange)) {
+								spans = append(spans, sp)
 							}
-							spans = append(spans, sp)
 						}
 					}
 					return spans
@@ -510,10 +508,11 @@ func buildSelectionBitmap(record arrow.RecordBatch, ms Matchers, timeRange *Time
 	}
 
 	// Validate schema has enough columns for time range filtering
-	if timeRange != nil && record.NumCols() >= 6 {
+	if timeRange != nil && record.NumCols() >= 7 {
 		// Phase 1: Filter by time range using columnar access (very fast, SIMD-friendly)
-		startTimeCol := record.Column(4).(*array.Int64)
-		endTimeCol := record.Column(5).(*array.Int64)
+		// New schema: trace_id_hi(0), trace_id_lo(1), span_id(2), parent_span_id(3), name(4), start_time(5), end_time(6)
+		startTimeCol := record.Column(5).(*array.Int64)
+		endTimeCol := record.Column(6).(*array.Int64)
 		startNano := timeRange.Start.UnixNano()
 		endNano := timeRange.End.UnixNano()
 
@@ -554,40 +553,46 @@ func applyMatcherColumnar(record arrow.RecordBatch, m *Matcher, selection []bool
 	numCols := int(record.NumCols())
 
 	// Validate schema before accessing columns
+	// New schema: trace_id_hi(0), trace_id_lo(1), span_id(2), parent_span_id(3), name(4),
+	//             start_time(5), end_time(6), duration(7), service_name(8), tags(9)
 	switch m.Name {
 	case "trace_id":
-		if numCols < 1 {
+		if numCols < 2 {
 			return
 		}
-		col := record.Column(0).(*array.String)
+		hiCol := record.Column(0).(*array.Uint64)
+		loCol := record.Column(1).(*array.Uint64)
 		for row := 0; row < numRows; row++ {
 			if !selection[row] {
 				continue
 			}
-			if !m.MatchesValue(col.Value(row), true) {
+			// Format as hex string: "%016x%016x"
+			traceID := fmt.Sprintf("%016x%016x", hiCol.Value(row), loCol.Value(row))
+			if !m.MatchesValue(traceID, true) {
 				selection[row] = false
 			}
 		}
 
 	case "span_id":
-		if numCols < 2 {
+		if numCols < 3 {
 			return
 		}
-		col := record.Column(1).(*array.String)
+		col := record.Column(2).(*array.Uint64)
 		for row := 0; row < numRows; row++ {
 			if !selection[row] {
 				continue
 			}
-			if !m.MatchesValue(col.Value(row), true) {
+			spanID := fmt.Sprintf("%016x", col.Value(row))
+			if !m.MatchesValue(spanID, true) {
 				selection[row] = false
 			}
 		}
 
 	case "parent_span_id":
-		if numCols < 3 {
+		if numCols < 4 {
 			return
 		}
-		col := record.Column(2).(*array.String)
+		col := record.Column(3).(*array.Uint64)
 		for row := 0; row < numRows; row++ {
 			if !selection[row] {
 				continue
@@ -595,7 +600,7 @@ func applyMatcherColumnar(record arrow.RecordBatch, m *Matcher, selection []bool
 			isNull := col.IsNull(row)
 			val := ""
 			if !isNull {
-				val = col.Value(row)
+				val = fmt.Sprintf("%016x", col.Value(row))
 			}
 			if !m.MatchesValue(val, !isNull) {
 				selection[row] = false
@@ -603,10 +608,10 @@ func applyMatcherColumnar(record arrow.RecordBatch, m *Matcher, selection []bool
 		}
 
 	case "name":
-		if numCols < 4 {
+		if numCols < 5 {
 			return
 		}
-		col := record.Column(3).(*array.String)
+		col := record.Column(4).(*array.String)
 		for row := 0; row < numRows; row++ {
 			if !selection[row] {
 				continue
@@ -617,10 +622,10 @@ func applyMatcherColumnar(record arrow.RecordBatch, m *Matcher, selection []bool
 		}
 
 	case "service.name", "service_name":
-		if numCols < 8 {
+		if numCols < 9 {
 			return
 		}
-		col := record.Column(7).(*array.String)
+		col := record.Column(8).(*array.String)
 		for row := 0; row < numRows; row++ {
 			if !selection[row] {
 				continue
@@ -657,20 +662,13 @@ func queryArrowBlock(ab *block.ArrowBlock, ms Matchers, timeRange *TimeRange) []
 				}
 
 				if len(candidateSpanIDs) > 0 {
-					records := ab.Records()
-					for _, spanID := range candidateSpanIDs {
-						ref, ok := idx.LookupSpanID(spanID)
-						if !ok || ref.RecordIndex >= len(records) {
-							continue
-						}
-
-						sp, err := extractSpanFromRecord(records[ref.RecordIndex], ref.RowIndex)
-						if err != nil {
-							continue
-						}
-
-						if ms.Matches(sp) && (timeRange == nil || spanInTimeRange(sp, timeRange)) {
-							spans = append(spans, sp)
+					// Arrow block: use GetSpansBatch for consistent interface usage
+					batchSpans, err := ab.GetSpansBatch(candidateSpanIDs)
+					if err == nil {
+						for _, sp := range batchSpans {
+							if ms.Matches(sp) && (timeRange == nil || spanInTimeRange(sp, timeRange)) {
+								spans = append(spans, sp)
+							}
 						}
 					}
 					return spans
@@ -679,17 +677,36 @@ func queryArrowBlock(ab *block.ArrowBlock, ms Matchers, timeRange *TimeRange) []
 		}
 	}
 
-	// Fall back to full scan (no index or no exact match matchers)
-	// Arrow block: full scan using Records()
+	// Fall back to full scan using two-phase columnar filtering
+	// Phase 1: Build selection bitmap using columnar access (fast, SIMD-friendly)
+	// Phase 2: Extract only matching spans (avoids unnecessary allocations)
 	records := ab.Records()
+	needTags := matchersNeedTags(ms)
+
 	for _, record := range records {
+		// Phase 1: Build selection bitmap using columnar filtering
+		selection := buildSelectionBitmap(record, ms, timeRange)
+
+		// Phase 2: Extract only selected spans
 		for row := 0; row < int(record.NumRows()); row++ {
-			sp, err := extractSpanFromRecord(record, row)
+			if !selection[row] {
+				continue
+			}
+
+			sp, err := extractSpanFromRecordWithOptions(record, row, needTags)
 			if err != nil {
 				continue
 			}
 
+			// Final validation with full matchers (includes tag checks if needed)
 			if ms.Matches(sp) && (timeRange == nil || spanInTimeRange(sp, timeRange)) {
+				// If we didn't extract tags during filtering, extract them now for the final result
+				if !needTags {
+					sp, err = extractSpanFromRecordWithOptions(record, row, true)
+					if err != nil {
+						continue
+					}
+				}
 				spans = append(spans, sp)
 			}
 		}

@@ -28,7 +28,7 @@ import (
 // 4. Open Grafana in your browser
 // 5. Keep running until you hit the endpoint or press Ctrl+C
 func TestArtemisTracingStack(t *testing.T) {
-	// t.Skip("This is an interactive test, comment this line before running")
+	t.Skip("This is an interactive test, comment this line before running")
 
 	fmt.Println("=== Building Artemis Docker image...")
 	testutil.Ok(t, buildArtemisImage())
@@ -417,7 +417,7 @@ func createTelemetryGen(env e2e.Environment) e2e.Runnable {
 	// telemetrygen will generate traces continuously with varying patterns
 	// Using --rate to control traces per second and --duration for how long to run
 	return f.Init(e2e.StartOptions{
-		Image: "ghcr.io/open-telemetry/opentelemetry-collector-contrib/telemetrygen:latest",
+		Image: "telemetrygen:latest",
 		Command: e2e.NewCommand(
 			"traces",
 			"--otlp-endpoint=otel-collector:4317",
@@ -428,6 +428,8 @@ func createTelemetryGen(env e2e.Environment) e2e.Runnable {
 			"--child-spans=5",
 			"--status-code=2",
 			"--span-duration=123ms",
+			"--span-events=3",
+			"--span-links=3",
 		),
 		// No readiness probe needed since this is a trace generator
 		// It doesn't expose any ports, it just sends traces

@@ -2,7 +2,10 @@ package wal
 
 import (
 	"bufio"
+	"encoding/binary"
 	"fmt"
+	"hash/crc32"
+	"io"
 	"os"
 	"time"
 
@@ -139,16 +142,17 @@ func (r *Reader) replaySegmentWithStats(filename string, callback func(*span.Spa
 	recordIndex := int64(0)
 
 	for {
-		crc, _, recordType, data, offset, err := readRecordFull(reader)
-		if err != nil {
-			if err.Error() == "EOF" {
+		// Read CRC (4 bytes)
+		var crc uint32
+		if err := binary.Read(reader, binary.BigEndian, &crc); err != nil {
+			if err == io.EOF {
 				return nil
 			}
 
 			// Handle corrupted record
 			replayErr := ReplayError{
 				Segment:     filename,
-				Offset:      offset,
+				Offset:      0, // Can't track exact offset without seeking
 				RecordIndex: recordIndex,
 				Err:         err,
 				Timestamp:   time.Now(),
@@ -162,15 +166,79 @@ func (r *Reader) replaySegmentWithStats(filename string, callback func(*span.Spa
 			}
 
 			if opts.StopOnError {
-				return fmt.Errorf("corrupted record at offset %d: %w", offset, err)
+				return fmt.Errorf("corrupted record: %w", err)
 			}
 			continue
 		}
 
-		if !verifyCRC(crc, data) {
+		// Read length (4 bytes)
+		var length uint32
+		if err := binary.Read(reader, binary.BigEndian, &length); err != nil {
 			replayErr := ReplayError{
 				Segment:     filename,
-				Offset:      offset,
+				Offset:      0,
+				RecordIndex: recordIndex,
+				Err:         err,
+				Timestamp:   time.Now(),
+			}
+			stats.Errors = append(stats.Errors, replayErr)
+			stats.CorruptedRecords++
+
+			if opts.StopOnError {
+				return fmt.Errorf("corrupted record: %w", err)
+			}
+			continue
+		}
+
+		// Read type (1 byte)
+		recordType, err := reader.ReadByte()
+		if err != nil {
+			replayErr := ReplayError{
+				Segment:     filename,
+				Offset:      0,
+				RecordIndex: recordIndex,
+				Err:         err,
+				Timestamp:   time.Now(),
+			}
+			stats.Errors = append(stats.Errors, replayErr)
+			stats.CorruptedRecords++
+
+			if opts.StopOnError {
+				return fmt.Errorf("corrupted record: %w", err)
+			}
+			continue
+		}
+
+		// Detect padding - either explicit magic marker or all-zeros fallback
+		// The all-zeros fallback handles edge case where <4 bytes remained for magic
+		if crc == paddingMagic || (crc == 0 && length == 0 && recordType == 0) {
+			return nil
+		}
+
+		// Read data
+		data := make([]byte, length)
+		if _, err := io.ReadFull(reader, data); err != nil {
+			replayErr := ReplayError{
+				Segment:     filename,
+				Offset:      0,
+				RecordIndex: recordIndex,
+				Err:         err,
+				Timestamp:   time.Now(),
+			}
+			stats.Errors = append(stats.Errors, replayErr)
+			stats.CorruptedRecords++
+
+			if opts.StopOnError {
+				return fmt.Errorf("corrupted record: %w", err)
+			}
+			continue
+		}
+
+		// Verify CRC
+		if crc32.ChecksumIEEE(data) != crc {
+			replayErr := ReplayError{
+				Segment:     filename,
+				Offset:      0,
 				RecordIndex: recordIndex,
 				Err:         fmt.Errorf("CRC mismatch"),
 				Timestamp:   time.Now(),
@@ -184,7 +252,7 @@ func (r *Reader) replaySegmentWithStats(filename string, callback func(*span.Spa
 			}
 
 			if opts.StopOnError {
-				return fmt.Errorf("CRC mismatch at offset %d", offset)
+				return fmt.Errorf("CRC mismatch")
 			}
 			continue
 		}
@@ -193,11 +261,11 @@ func (r *Reader) replaySegmentWithStats(filename string, callback func(*span.Spa
 		recordIndex++
 
 		if RecordType(recordType) == RecordTypeSpan {
-			s, err := unmarshalSpan(data)
-			if err != nil {
+			var s span.Span
+			if err := s.UnmarshalBinary(data); err != nil {
 				replayErr := ReplayError{
 					Segment:     filename,
-					Offset:      offset,
+					Offset:      0,
 					RecordIndex: recordIndex,
 					Err:         fmt.Errorf("unmarshal span: %w", err),
 					Timestamp:   time.Now(),
@@ -210,7 +278,7 @@ func (r *Reader) replaySegmentWithStats(filename string, callback func(*span.Spa
 				continue
 			}
 
-			if err := callback(s); err != nil {
+			if err := callback(&s); err != nil {
 				return fmt.Errorf("callback error: %w", err)
 			}
 

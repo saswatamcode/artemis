@@ -42,12 +42,16 @@ const (
 // - HeadBlock: In-memory, mutable, active ingestion
 // - ParquetBlock: Parquet format, L1+, better compression, page-level reads
 type ArrowBlock struct {
-	meta    *BlockMeta
-	dir     string
-	records []arrow.RecordBatch
-	mem     memory.Allocator
-	schema  *arrow.Schema
-	index   *index.Index
+	meta         *BlockMeta
+	dir          string
+	records      []arrow.RecordBatch
+	mem          memory.Allocator
+	schema       *arrow.Schema
+	index        *index.Index
+	eventRecords []arrow.RecordBatch // Event records (optional)
+	eventSchema  *arrow.Schema       // Event schema (optional)
+	linkRecords  []arrow.RecordBatch // Link records (optional)
+	linkSchema   *arrow.Schema       // Link schema (optional)
 }
 
 // NewArrowBlock creates a new Arrow block from disk
@@ -71,6 +75,42 @@ func NewArrowBlock(dir string) (*ArrowBlock, error) {
 
 	if err := ab.loadRecords(); err != nil {
 		return nil, fmt.Errorf("failed to load records: %w", err)
+	}
+
+	// Load event records if they exist
+	if err := ab.loadEventRecords(); err != nil {
+		// If events file exists but can't be read, that's a real error
+		return nil, fmt.Errorf("failed to load event records: %w", err)
+	}
+
+	if ab.eventRecords != nil && len(ab.eventRecords) > 0 {
+		// Count total events
+		totalEvents := int64(0)
+		for _, rec := range ab.eventRecords {
+			totalEvents += rec.NumRows()
+		}
+		slog.Default().Info("loaded event records for Arrow block",
+			slog.String("block_dir", dir),
+			slog.Int("num_records", len(ab.eventRecords)),
+			slog.Int64("total_events", totalEvents))
+	}
+
+	// Load link records if they exist
+	if err := ab.loadLinkRecords(); err != nil {
+		// If links file exists but can't be read, that's a real error
+		return nil, fmt.Errorf("failed to load link records: %w", err)
+	}
+
+	if ab.linkRecords != nil && len(ab.linkRecords) > 0 {
+		// Count total links
+		totalLinks := int64(0)
+		for _, rec := range ab.linkRecords {
+			totalLinks += rec.NumRows()
+		}
+		slog.Default().Info("loaded link records for Arrow block",
+			slog.String("block_dir", dir),
+			slog.Int("num_records", len(ab.linkRecords)),
+			slog.Int64("total_links", totalLinks))
 	}
 
 	// Load index if it exists
@@ -117,6 +157,28 @@ func (ab *ArrowBlock) loadRecords() error {
 	}
 
 	ab.records = records
+	return nil
+}
+
+// loadEventRecords loads event records from the events IPC file if it exists
+func (ab *ArrowBlock) loadEventRecords() error {
+	eventRecords, eventSchema, err := loadEventRecords(ab.dir, ab.mem)
+	if err != nil {
+		return err
+	}
+	ab.eventRecords = eventRecords
+	ab.eventSchema = eventSchema
+	return nil
+}
+
+// loadLinkRecords loads link records from the links IPC file if it exists
+func (ab *ArrowBlock) loadLinkRecords() error {
+	linkRecords, linkSchema, err := loadLinkRecords(ab.dir, ab.mem)
+	if err != nil {
+		return err
+	}
+	ab.linkRecords = linkRecords
+	ab.linkSchema = linkSchema
 	return nil
 }
 
@@ -177,6 +239,16 @@ func (ab *ArrowBlock) Close() error {
 		rec.Release()
 	}
 	ab.records = nil
+
+	for _, rec := range ab.eventRecords {
+		rec.Release()
+	}
+	ab.eventRecords = nil
+
+	for _, rec := range ab.linkRecords {
+		rec.Release()
+	}
+	ab.linkRecords = nil
 	return nil
 }
 
@@ -198,13 +270,21 @@ func (ab *ArrowBlock) GetSpanByID(spanID string) (*span.Span, error) {
 	return extractSpanFromArrowRecord(ab.records[ref.RecordIndex], ref.RowIndex)
 }
 
-// GetSpansBatch efficiently retrieves multiple spans by ID
+// GetSpansBatch efficiently retrieves multiple spans by ID with their events and links
+// Groups spans by record index to improve cache locality
+// Fetches events and links in a single pass instead of N separate queries
 func (ab *ArrowBlock) GetSpansBatch(spanIDs []string) ([]*span.Span, error) {
 	if !ab.HasIndex() {
 		return nil, fmt.Errorf("block has no index")
 	}
 
-	result := make([]*span.Span, 0, len(spanIDs))
+	// Group span lookups by record index for better cache locality
+	type spanLookup struct {
+		recordIndex int
+		rowIndex    int
+	}
+	lookups := make([]spanLookup, 0, len(spanIDs))
+
 	for _, spanID := range spanIDs {
 		ref, ok := ab.index.LookupSpanID(spanID)
 		if !ok {
@@ -215,12 +295,57 @@ func (ab *ArrowBlock) GetSpansBatch(spanIDs []string) ([]*span.Span, error) {
 			continue
 		}
 
-		sp, err := extractSpanFromArrowRecord(ab.records[ref.RecordIndex], ref.RowIndex)
-		if err != nil {
-			continue
-		}
+		lookups = append(lookups, spanLookup{
+			recordIndex: ref.RecordIndex,
+			rowIndex:    ref.RowIndex,
+		})
+	}
 
-		result = append(result, sp)
+	// Process spans grouped by record for better cache performance
+	result := make([]*span.Span, 0, len(lookups))
+	recordGroups := make(map[int][]int) // recordIndex -> []rowIndex
+
+	for _, lookup := range lookups {
+		recordGroups[lookup.recordIndex] = append(recordGroups[lookup.recordIndex], lookup.rowIndex)
+	}
+
+	// Process each record once, extracting all needed spans
+	for recordIdx, rowIndices := range recordGroups {
+		record := ab.records[recordIdx]
+		for _, rowIdx := range rowIndices {
+			sp, err := extractSpanFromArrowRecord(record, rowIdx)
+			if err != nil {
+				continue
+			}
+			result = append(result, sp)
+		}
+	}
+
+	// Batch fetch events and links if they exist
+	eventsMap, _ := ab.GetEventsBatch(spanIDs)
+	if eventsMap != nil {
+		for _, sp := range result {
+			if eventPtrs, found := eventsMap[sp.SpanID]; found {
+				// Convert []*SpanEvent to []SpanEvent
+				sp.Events = make([]span.SpanEvent, len(eventPtrs))
+				for i, e := range eventPtrs {
+					sp.Events[i] = *e
+				}
+			}
+		}
+	}
+
+	linksMap, _ := ab.GetLinksBatch(spanIDs)
+	if linksMap != nil {
+		for _, sp := range result {
+			if linkPtrs, found := linksMap[sp.SpanID]; found {
+				// Convert []*SpanLink to []SpanLink
+				sp.Links = make([]span.SpanLink, len(linkPtrs))
+				for i, l := range linkPtrs {
+					sp.Links[i] = *l
+				}
+			}
+		}
 	}
 
 	return result, nil
@@ -303,6 +428,19 @@ func (ab *ArrowBlock) scanByTag(tagKey, tagValue string) ([]*span.Span, error) {
 	return result, nil
 }
 
+// hexDigits for fast hex encoding
+const hexDigits = "0123456789abcdef"
+
+// uint64ToHex converts a uint64 to a 16-character hex string without allocations
+// Much faster than fmt.Sprintf("%016x", val)
+func uint64ToHex(val uint64, buf []byte) {
+	_ = buf[15] // bounds check hint
+	for i := 15; i >= 0; i-- {
+		buf[i] = hexDigits[val&0xf]
+		val >>= 4
+	}
+}
+
 // extractSpanFromArrowRecord extracts a span from an Arrow record
 func extractSpanFromArrowRecord(record arrow.RecordBatch, rowIndex int) (*span.Span, error) {
 	// Validate row index
@@ -311,7 +449,10 @@ func extractSpanFromArrowRecord(record arrow.RecordBatch, rowIndex int) (*span.S
 	}
 
 	// Validate schema has expected number of columns
-	expectedColumns := 9 // trace_id, span_id, parent_span_id, name, start_time, end_time, duration, service_name, tags
+	// Note: We have 12 columns now (10 original + 2 new indexing fields)
+	// but the new fields (bucket1s, duration_bucket) don't need to be extracted
+	// into the Span struct as they're derived for indexing purposes
+	expectedColumns := 12
 	if record.NumCols() < int64(expectedColumns) {
 		return nil, fmt.Errorf("invalid schema: expected at least %d columns, got %d", expectedColumns, record.NumCols())
 	}
@@ -319,26 +460,40 @@ func extractSpanFromArrowRecord(record arrow.RecordBatch, rowIndex int) (*span.S
 	sp := &span.Span{}
 
 	// Extract fields with bounds checking
-	sp.TraceID = record.Column(0).(*array.String).Value(rowIndex)
+	// Read trace_id_hi and trace_id_lo and format as hex string
+	traceIDHi := record.Column(0).(*array.Uint64).Value(rowIndex)
+	traceIDLo := record.Column(1).(*array.Uint64).Value(rowIndex)
+	var traceIDBuf [32]byte
+	uint64ToHex(traceIDHi, traceIDBuf[:16])
+	uint64ToHex(traceIDLo, traceIDBuf[16:])
+	sp.TraceID = string(traceIDBuf[:])
 
-	sp.SpanID = record.Column(1).(*array.String).Value(rowIndex)
+	// Read span_id and format as hex string
+	spanIDVal := record.Column(2).(*array.Uint64).Value(rowIndex)
+	var spanIDBuf [16]byte
+	uint64ToHex(spanIDVal, spanIDBuf[:])
+	sp.SpanID = string(spanIDBuf[:])
 
-	parentCol := record.Column(2).(*array.String)
+	// Read parent_span_id and format as hex string (or empty if null)
+	parentCol := record.Column(3).(*array.Uint64)
 	if !parentCol.IsNull(rowIndex) {
-		sp.ParentSpanID = parentCol.Value(rowIndex)
+		parentSpanIDVal := parentCol.Value(rowIndex)
+		var parentIDBuf [16]byte
+		uint64ToHex(parentSpanIDVal, parentIDBuf[:])
+		sp.ParentSpanID = string(parentIDBuf[:])
 	}
 
-	sp.Name = record.Column(3).(*array.String).Value(rowIndex)
+	sp.Name = record.Column(4).(*array.String).Value(rowIndex)
 
-	sp.StartTime = time.Unix(0, record.Column(4).(*array.Int64).Value(rowIndex))
+	sp.StartTime = time.Unix(0, record.Column(5).(*array.Int64).Value(rowIndex))
 
-	sp.EndTime = time.Unix(0, record.Column(5).(*array.Int64).Value(rowIndex))
+	sp.EndTime = time.Unix(0, record.Column(6).(*array.Int64).Value(rowIndex))
 
-	sp.Duration = record.Column(6).(*array.Int64).Value(rowIndex)
+	sp.Duration = record.Column(7).(*array.Int64).Value(rowIndex)
 
-	sp.ServiceName = record.Column(7).(*array.String).Value(rowIndex)
+	sp.ServiceName = record.Column(8).(*array.String).Value(rowIndex)
 
-	tagsCol := record.Column(8).(*array.Map)
+	tagsCol := record.Column(9).(*array.Map)
 	if !tagsCol.IsNull(rowIndex) {
 		sp.Tags = make(map[string]string)
 
@@ -355,7 +510,7 @@ func extractSpanFromArrowRecord(record arrow.RecordBatch, rowIndex int) (*span.S
 		items := tagsCol.Items().(*array.String)
 
 		for i := int(offset); i < int(nextOffset); i++ {
-			// FIX: Return error on malformed data instead of silently breaking
+			// Return error on malformed data instead of silently breaking
 			// This ensures callers know the data is corrupted rather than seeing incomplete tags
 			if i >= keys.Len() || i >= items.Len() {
 				return nil, fmt.Errorf("corrupted tags data at row %d: tag index %d exceeds bounds (keys: %d, items: %d)",
@@ -493,6 +648,68 @@ func fsyncDir(dir string) error {
 	}
 	defer d.Close()
 	return d.Sync()
+}
+
+// GetEventsBySpanID retrieves all events for a given span ID from this block
+func (ab *ArrowBlock) GetEventsBySpanID(spanID string) ([]*span.SpanEvent, error) {
+	if ab.eventRecords == nil || len(ab.eventRecords) == 0 {
+		return nil, nil // No events in this block
+	}
+	return GetEventsBySpanIDFromArrow(ab.eventRecords, spanID)
+}
+
+// HasEvents returns true if the block has event records loaded
+func (ab *ArrowBlock) HasEvents() bool {
+	return ab.eventRecords != nil && len(ab.eventRecords) > 0
+}
+
+// EventRecords returns all event records in this block
+func (ab *ArrowBlock) EventRecords() []arrow.RecordBatch {
+	return ab.eventRecords
+}
+
+// ReadAllEvents reads all events from this block
+func (ab *ArrowBlock) ReadAllEvents() ([]*span.SpanEvent, error) {
+	if ab.eventRecords == nil || len(ab.eventRecords) == 0 {
+		return nil, nil // No events in this block
+	}
+	return ReadAllEventsFromArrow(ab.eventRecords)
+}
+
+// EventSchema returns the event schema
+func (ab *ArrowBlock) EventSchema() *arrow.Schema {
+	return ab.eventSchema
+}
+
+// GetLinksBySpanID retrieves all links for a given span ID from this block
+func (ab *ArrowBlock) GetLinksBySpanID(spanID string) ([]*span.SpanLink, error) {
+	if ab.linkRecords == nil || len(ab.linkRecords) == 0 {
+		return nil, nil // No links in this block
+	}
+	return GetLinksBySpanIDFromArrow(ab.linkRecords, spanID)
+}
+
+// HasLinks returns true if the block has link records loaded
+func (ab *ArrowBlock) HasLinks() bool {
+	return ab.linkRecords != nil && len(ab.linkRecords) > 0
+}
+
+// LinkRecords returns all link records in this block
+func (ab *ArrowBlock) LinkRecords() []arrow.RecordBatch {
+	return ab.linkRecords
+}
+
+// ReadAllLinks reads all links from this block
+func (ab *ArrowBlock) ReadAllLinks() ([]*span.SpanLink, error) {
+	if ab.linkRecords == nil || len(ab.linkRecords) == 0 {
+		return nil, nil // No links in this block
+	}
+	return ReadAllLinksFromArrow(ab.linkRecords)
+}
+
+// LinkSchema returns the link schema
+func (ab *ArrowBlock) LinkSchema() *arrow.Schema {
+	return ab.linkSchema
 }
 
 // DeleteBlock deletes a block directory and all its contents

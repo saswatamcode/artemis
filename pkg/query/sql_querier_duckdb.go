@@ -126,16 +126,42 @@ func (sq *duckDBQuerier) LoadBlocks(head *storage.ArrowStorage, blocks []block.B
 
 	// Phase 2: Create SELECT queries for Arrow L0 blocks
 	// DuckDB will parallelize reads across these files
+	// Transform uint64 IDs to hex VARCHAR format for compatibility
 	for _, blk := range arrowBlocks {
 		arrowPath := filepath.Join(blk.Dir(), "spans.arrow")
-		sources = append(sources, fmt.Sprintf("SELECT * FROM read_arrow('%s')", arrowPath))
+		sources = append(sources, fmt.Sprintf(`
+			SELECT
+				printf('%%016x%%016x', trace_id_hi, trace_id_lo) AS trace_id,
+				printf('%%016x', span_id) AS span_id,
+				CASE WHEN parent_span_id = 0 THEN NULL ELSE printf('%%016x', parent_span_id) END AS parent_span_id,
+				name,
+				start_time,
+				end_time,
+				duration,
+				service_name,
+				tags
+			FROM read_arrow('%s')
+		`, arrowPath))
 	}
 
 	// Phase 3: Create SELECT queries for Parquet L1+ blocks
 	// DuckDB will parallelize reads across these files
+	// Transform uint64 IDs to hex VARCHAR format for compatibility
 	for _, blk := range parquetBlocks {
 		parquetPath := filepath.Join(blk.Dir(), "spans.parquet")
-		sources = append(sources, fmt.Sprintf("SELECT * FROM read_parquet('%s')", parquetPath))
+		sources = append(sources, fmt.Sprintf(`
+			SELECT
+				printf('%%016x%%016x', trace_id_hi, trace_id_lo) AS trace_id,
+				printf('%%016x', span_id) AS span_id,
+				CASE WHEN parent_span_id = 0 THEN NULL ELSE printf('%%016x', parent_span_id) END AS parent_span_id,
+				name,
+				start_time,
+				end_time,
+				duration,
+				service_name,
+				tags
+			FROM read_parquet('%s')
+		`, parquetPath))
 	}
 
 	// TODO: Phase 4: Add head block (in-memory Arrow records) if present

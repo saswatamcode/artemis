@@ -53,6 +53,14 @@ type Block interface {
 
 	// GetSpansByTag retrieves all spans that have a specific tag key-value pair
 	GetSpansByTag(tagKey, tagValue string) ([]*span.Span, error)
+
+	// GetEventsBatch efficiently retrieves events for multiple span IDs
+	// Returns a map of spanID -> []SpanEvent
+	GetEventsBatch(spanIDs []string) (map[string][]*span.SpanEvent, error)
+
+	// GetLinksBatch efficiently retrieves links for multiple span IDs
+	// Returns a map of spanID -> []SpanLink
+	GetLinksBatch(spanIDs []string) (map[string][]*span.SpanLink, error)
 }
 
 // LoadBlock loads a block from disk, automatically detecting whether it's

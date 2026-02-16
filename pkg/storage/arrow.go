@@ -2,6 +2,7 @@ package storage
 
 import (
 	"fmt"
+	"math/bits"
 	"sync"
 	"time"
 
@@ -38,15 +39,18 @@ type ArrowStorage struct {
 type SpanRecordBuilder struct {
 	mem             memory.Allocator
 	schema          *arrow.Schema
-	traceID         *array.StringBuilder
-	spanID          *array.StringBuilder
-	parentSpanID    *array.StringBuilder
+	traceIDHi       *array.Uint64Builder
+	traceIDLo       *array.Uint64Builder
+	spanID          *array.Uint64Builder
+	parentSpanID    *array.Uint64Builder
 	name            *array.StringBuilder
 	startTime       *array.Int64Builder
 	endTime         *array.Int64Builder
 	duration        *array.Int64Builder
 	serviceName     *array.StringBuilder
 	tags            *array.MapBuilder
+	bucket1s        *array.Int64Builder
+	durationBucket  *array.Int32Builder
 	currentRowCount int
 }
 
@@ -72,15 +76,18 @@ func NewArrowStorage() *ArrowStorage {
 func createSpanSchema() *arrow.Schema {
 	return arrow.NewSchema(
 		[]arrow.Field{
-			{Name: "trace_id", Type: arrow.BinaryTypes.String, Nullable: false},
-			{Name: "span_id", Type: arrow.BinaryTypes.String, Nullable: false},
-			{Name: "parent_span_id", Type: arrow.BinaryTypes.String, Nullable: true},
+			{Name: "trace_id_hi", Type: arrow.PrimitiveTypes.Uint64, Nullable: false},
+			{Name: "trace_id_lo", Type: arrow.PrimitiveTypes.Uint64, Nullable: false},
+			{Name: "span_id", Type: arrow.PrimitiveTypes.Uint64, Nullable: false},
+			{Name: "parent_span_id", Type: arrow.PrimitiveTypes.Uint64, Nullable: true},
 			{Name: "name", Type: arrow.BinaryTypes.String, Nullable: false},
 			{Name: "start_time", Type: arrow.PrimitiveTypes.Int64, Nullable: false},
 			{Name: "end_time", Type: arrow.PrimitiveTypes.Int64, Nullable: false},
 			{Name: "duration", Type: arrow.PrimitiveTypes.Int64, Nullable: false},
 			{Name: "service_name", Type: arrow.BinaryTypes.String, Nullable: false},
 			{Name: "tags", Type: arrow.MapOf(arrow.BinaryTypes.String, arrow.BinaryTypes.String), Nullable: true},
+			{Name: "bucket1s", Type: arrow.PrimitiveTypes.Int64, Nullable: false},
+			{Name: "duration_bucket", Type: arrow.PrimitiveTypes.Int32, Nullable: false},
 		},
 		nil,
 	)
@@ -89,13 +96,16 @@ func createSpanSchema() *arrow.Schema {
 // NewSpanRecordBuilder creates a new record builder for spans
 func NewSpanRecordBuilder(mem memory.Allocator, schema *arrow.Schema) *SpanRecordBuilder {
 	// Pre-allocate capacity for batch size to reduce allocations
-	traceID := array.NewStringBuilder(mem)
-	traceID.Reserve(batchSize)
+	traceIDHi := array.NewUint64Builder(mem)
+	traceIDHi.Reserve(batchSize)
 
-	spanID := array.NewStringBuilder(mem)
+	traceIDLo := array.NewUint64Builder(mem)
+	traceIDLo.Reserve(batchSize)
+
+	spanID := array.NewUint64Builder(mem)
 	spanID.Reserve(batchSize)
 
-	parentSpanID := array.NewStringBuilder(mem)
+	parentSpanID := array.NewUint64Builder(mem)
 	parentSpanID.Reserve(batchSize)
 
 	name := array.NewStringBuilder(mem)
@@ -116,36 +126,65 @@ func NewSpanRecordBuilder(mem memory.Allocator, schema *arrow.Schema) *SpanRecor
 	tags := array.NewMapBuilder(mem, arrow.BinaryTypes.String, arrow.BinaryTypes.String, false)
 	tags.Reserve(batchSize)
 
+	bucket1s := array.NewInt64Builder(mem)
+	bucket1s.Reserve(batchSize)
+
+	durationBucket := array.NewInt32Builder(mem)
+	durationBucket.Reserve(batchSize)
+
 	return &SpanRecordBuilder{
-		mem:          mem,
-		schema:       schema,
-		traceID:      traceID,
-		spanID:       spanID,
-		parentSpanID: parentSpanID,
-		name:         name,
-		startTime:    startTime,
-		endTime:      endTime,
-		duration:     duration,
-		serviceName:  serviceName,
-		tags:         tags,
+		mem:            mem,
+		schema:         schema,
+		traceIDHi:      traceIDHi,
+		traceIDLo:      traceIDLo,
+		spanID:         spanID,
+		parentSpanID:   parentSpanID,
+		name:           name,
+		startTime:      startTime,
+		endTime:        endTime,
+		duration:       duration,
+		serviceName:    serviceName,
+		tags:           tags,
+		bucket1s:       bucket1s,
+		durationBucket: durationBucket,
 	}
 }
 
 // Append adds a span to the builder
 func (b *SpanRecordBuilder) Append(s *span.Span) {
-	b.traceID.Append(s.TraceID)
-	b.spanID.Append(s.SpanID)
+	// Parse trace ID into hi and lo parts
+	traceIDHi, traceIDLo, err := span.ParseTraceID(s.TraceID)
+	if err != nil {
+		// If parsing fails, use 0 values (should not happen with valid data)
+		traceIDHi, traceIDLo = 0, 0
+	}
+	b.traceIDHi.Append(traceIDHi)
+	b.traceIDLo.Append(traceIDLo)
 
+	// Parse span ID
+	spanIDVal, err := span.ParseSpanID(s.SpanID)
+	if err != nil {
+		spanIDVal = 0
+	}
+	b.spanID.Append(spanIDVal)
+
+	// Parse parent span ID (or use 0 for null)
 	if s.ParentSpanID == "" {
 		b.parentSpanID.AppendNull()
 	} else {
-		b.parentSpanID.Append(s.ParentSpanID)
+		parentSpanIDVal, err := span.ParseSpanID(s.ParentSpanID)
+		if err != nil {
+			parentSpanIDVal = 0
+		}
+		b.parentSpanID.Append(parentSpanIDVal)
 	}
 
 	b.name.Append(s.Name)
-	b.startTime.Append(s.StartTime.UnixNano())
+	startUnixNano := s.StartTime.UnixNano()
+	b.startTime.Append(startUnixNano)
 	b.endTime.Append(s.EndTime.UnixNano())
-	b.duration.Append(s.GetDuration())
+	durationNs := s.GetDuration()
+	b.duration.Append(durationNs)
 	b.serviceName.Append(s.ServiceName)
 
 	if len(s.Tags) > 0 {
@@ -161,6 +200,20 @@ func (b *SpanRecordBuilder) Append(s *span.Span) {
 		b.tags.AppendNull()
 	}
 
+	// Calculate bucket1s: round down start time to the second
+	const sec = int64(1_000_000_000)
+	bucket := startUnixNano - (startUnixNano % sec)
+	b.bucket1s.Append(bucket)
+
+	// Calculate duration bucket using exponential bucketing
+	var durationBucketVal int32
+	if durationNs <= 0 {
+		durationBucketVal = 0
+	} else {
+		durationBucketVal = int32(bits.Len64(uint64(durationNs)) - 1)
+	}
+	b.durationBucket.Append(durationBucketVal)
+
 	b.currentRowCount++
 }
 
@@ -171,15 +224,18 @@ func (b *SpanRecordBuilder) NewRecord() arrow.RecordBatch {
 	}
 
 	columns := []arrow.Array{
-		b.traceID.NewStringArray(),
-		b.spanID.NewStringArray(),
-		b.parentSpanID.NewStringArray(),
+		b.traceIDHi.NewUint64Array(),
+		b.traceIDLo.NewUint64Array(),
+		b.spanID.NewUint64Array(),
+		b.parentSpanID.NewUint64Array(),
 		b.name.NewStringArray(),
 		b.startTime.NewInt64Array(),
 		b.endTime.NewInt64Array(),
 		b.duration.NewInt64Array(),
 		b.serviceName.NewStringArray(),
 		b.tags.NewMapArray(),
+		b.bucket1s.NewInt64Array(),
+		b.durationBucket.NewInt32Array(),
 	}
 
 	record := array.NewRecord(b.schema, columns, int64(b.currentRowCount))
@@ -190,7 +246,8 @@ func (b *SpanRecordBuilder) NewRecord() arrow.RecordBatch {
 
 // Release releases the builder resources
 func (b *SpanRecordBuilder) Release() {
-	b.traceID.Release()
+	b.traceIDHi.Release()
+	b.traceIDLo.Release()
 	b.spanID.Release()
 	b.parentSpanID.Release()
 	b.name.Release()
@@ -199,6 +256,8 @@ func (b *SpanRecordBuilder) Release() {
 	b.duration.Release()
 	b.serviceName.Release()
 	b.tags.Release()
+	b.bucket1s.Release()
+	b.durationBucket.Release()
 }
 
 // AddSpan adds a span to the storage
@@ -385,28 +444,44 @@ func (s *ArrowStorage) extractSpan(record arrow.RecordBatch, rowIndex int) (*spa
 		return nil, fmt.Errorf("invalid row index %d", rowIndex)
 	}
 
-	sp := &span.Span{}
-
-	sp.TraceID = record.Column(0).(*array.String).Value(rowIndex)
-
-	sp.SpanID = record.Column(1).(*array.String).Value(rowIndex)
-
-	parentCol := record.Column(2).(*array.String)
-	if !parentCol.IsNull(rowIndex) {
-		sp.ParentSpanID = parentCol.Value(rowIndex)
+	// Validate schema has expected number of columns
+	// Note: We have 12 columns now (10 original + 2 new indexing fields)
+	// but the new fields (bucket1s, duration_bucket) don't need to be extracted
+	// into the Span struct as they're derived for indexing purposes
+	expectedColumns := 12
+	if record.NumCols() < int64(expectedColumns) {
+		return nil, fmt.Errorf("invalid schema: expected at least %d columns, got %d", expectedColumns, record.NumCols())
 	}
 
-	sp.Name = record.Column(3).(*array.String).Value(rowIndex)
+	sp := &span.Span{}
 
-	sp.StartTime = time.Unix(0, record.Column(4).(*array.Int64).Value(rowIndex))
+	// Read trace_id_hi and trace_id_lo and format as hex string
+	traceIDHi := record.Column(0).(*array.Uint64).Value(rowIndex)
+	traceIDLo := record.Column(1).(*array.Uint64).Value(rowIndex)
+	sp.TraceID = fmt.Sprintf("%016x%016x", traceIDHi, traceIDLo)
 
-	sp.EndTime = time.Unix(0, record.Column(5).(*array.Int64).Value(rowIndex))
+	// Read span_id and format as hex string
+	spanIDVal := record.Column(2).(*array.Uint64).Value(rowIndex)
+	sp.SpanID = fmt.Sprintf("%016x", spanIDVal)
 
-	sp.Duration = record.Column(6).(*array.Int64).Value(rowIndex)
+	// Read parent_span_id and format as hex string (or empty if null)
+	parentCol := record.Column(3).(*array.Uint64)
+	if !parentCol.IsNull(rowIndex) {
+		parentSpanIDVal := parentCol.Value(rowIndex)
+		sp.ParentSpanID = fmt.Sprintf("%016x", parentSpanIDVal)
+	}
 
-	sp.ServiceName = record.Column(7).(*array.String).Value(rowIndex)
+	sp.Name = record.Column(4).(*array.String).Value(rowIndex)
 
-	tagsCol := record.Column(8).(*array.Map)
+	sp.StartTime = time.Unix(0, record.Column(5).(*array.Int64).Value(rowIndex))
+
+	sp.EndTime = time.Unix(0, record.Column(6).(*array.Int64).Value(rowIndex))
+
+	sp.Duration = record.Column(7).(*array.Int64).Value(rowIndex)
+
+	sp.ServiceName = record.Column(8).(*array.String).Value(rowIndex)
+
+	tagsCol := record.Column(9).(*array.Map)
 	if !tagsCol.IsNull(rowIndex) {
 		sp.Tags = make(map[string]string)
 

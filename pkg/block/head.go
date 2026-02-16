@@ -17,14 +17,18 @@ import (
 // - Thread-safe: ArrowStorage has internal locking
 // - Active ingestion: Used for real-time span ingestion
 type HeadBlock struct {
-	storage *storage.ArrowStorage
-	meta    *BlockMeta
+	storage      *storage.ArrowStorage
+	eventStorage *storage.ArrowEventStorage
+	linkStorage  *storage.ArrowLinkStorage
+	meta         *BlockMeta
 }
 
 // NewHeadBlock creates a new head block wrapper around ArrowStorage
-func NewHeadBlock(storage *storage.ArrowStorage) *HeadBlock {
+func NewHeadBlock(storage *storage.ArrowStorage, eventStorage *storage.ArrowEventStorage, linkStorage *storage.ArrowLinkStorage) *HeadBlock {
 	return &HeadBlock{
-		storage: storage,
+		storage:      storage,
+		eventStorage: eventStorage,
+		linkStorage:  linkStorage,
 	}
 }
 
@@ -79,11 +83,19 @@ func (hb *HeadBlock) GetSpanByID(spanID string) (*span.Span, error) {
 
 // GetSpansBatch efficiently retrieves multiple spans by ID
 // For in-memory head block, this is fast since all data is in RAM
+// Groups spans by record index to improve cache locality
 func (hb *HeadBlock) GetSpansBatch(spanIDs []string) ([]*span.Span, error) {
 	idx := hb.storage.GetIndex()
 	records := hb.storage.GetRecords()
 
-	result := make([]*span.Span, 0, len(spanIDs))
+	// Group span lookups by record index for better cache locality
+	// Map: recordIndex -> []rowIndex
+	type spanLookup struct {
+		recordIndex int
+		rowIndex    int
+	}
+	lookups := make([]spanLookup, 0, len(spanIDs))
+
 	for _, spanID := range spanIDs {
 		ref, ok := idx.LookupSpanID(spanID)
 		if !ok {
@@ -91,19 +103,37 @@ func (hb *HeadBlock) GetSpansBatch(spanIDs []string) ([]*span.Span, error) {
 		}
 
 		if ref.RecordIndex >= len(records) {
-			// FIX: Log warning for invalid record index to help detect index corruption
+			// Log warning for invalid record index to help detect index corruption
 			// This makes debugging easier compared to silently skipping
 			fmt.Printf("WARNING: HeadBlock index corruption - span %s has invalid record index %d (only %d records exist)\n",
 				spanID, ref.RecordIndex, len(records))
 			continue
 		}
 
-		sp, err := extractSpanFromArrowRecord(records[ref.RecordIndex], ref.RowIndex)
-		if err != nil {
-			continue
-		}
+		lookups = append(lookups, spanLookup{
+			recordIndex: ref.RecordIndex,
+			rowIndex:    ref.RowIndex,
+		})
+	}
 
-		result = append(result, sp)
+	// Process spans grouped by record for better cache performance
+	result := make([]*span.Span, 0, len(lookups))
+	recordGroups := make(map[int][]int) // recordIndex -> []rowIndex
+
+	for _, lookup := range lookups {
+		recordGroups[lookup.recordIndex] = append(recordGroups[lookup.recordIndex], lookup.rowIndex)
+	}
+
+	// Process each record once, extracting all needed spans
+	for recordIdx, rowIndices := range recordGroups {
+		record := records[recordIdx]
+		for _, rowIdx := range rowIndices {
+			sp, err := extractSpanFromArrowRecord(record, rowIdx)
+			if err != nil {
+				continue
+			}
+			result = append(result, sp)
+		}
 	}
 
 	return result, nil
@@ -139,6 +169,18 @@ func (hb *HeadBlock) GetSpansByTag(tagKey, tagValue string) ([]*span.Span, error
 	idx := hb.storage.GetIndex()
 	spanIDs := idx.LookupByTag(tagKey, tagValue)
 	return hb.GetSpansBatch(spanIDs)
+}
+
+// GetEventsBatch efficiently retrieves events for multiple span IDs
+// Returns a map of spanID -> []SpanEvent
+func (hb *HeadBlock) GetEventsBatch(spanIDs []string) (map[string][]*span.SpanEvent, error) {
+	return hb.eventStorage.GetEventsBatch(spanIDs)
+}
+
+// GetLinksBatch efficiently retrieves links for multiple span IDs
+// Returns a map of spanID -> []SpanLink
+func (hb *HeadBlock) GetLinksBatch(spanIDs []string) (map[string][]*span.SpanLink, error) {
+	return hb.linkStorage.GetLinksBatch(spanIDs)
 }
 
 // Storage returns the underlying ArrowStorage
