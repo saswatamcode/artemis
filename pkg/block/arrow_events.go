@@ -185,7 +185,7 @@ func ReadAllEventsFromArrow(records []arrow.RecordBatch) ([]*span.SpanEvent, err
 
 // GetEventsBatch efficiently retrieves events for multiple span IDs
 // Returns a map of spanID -> []SpanEvent
-// OPTIMIZATION: Single pass through all event records instead of N passes
+// Single pass through all event records instead of N passes
 func (ab *ArrowBlock) GetEventsBatch(spanIDs []string) (map[string][]*span.SpanEvent, error) {
 	if len(spanIDs) == 0 {
 		return nil, nil

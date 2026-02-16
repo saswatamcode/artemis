@@ -344,7 +344,7 @@ func (s *ArrowLinkStorage) GetLinksBySpanID(spanID string) ([]*span.SpanLink, er
 
 // GetLinksBatch efficiently retrieves links for multiple span IDs
 // Returns a map of spanID -> []SpanLink
-// OPTIMIZATION: Single pass through all link records instead of N passes
+// Single pass through all link records instead of N passes
 func (s *ArrowLinkStorage) GetLinksBatch(spanIDs []string) (map[string][]*span.SpanLink, error) {
 	if len(spanIDs) == 0 {
 		return nil, nil

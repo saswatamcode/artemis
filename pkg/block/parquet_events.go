@@ -206,7 +206,7 @@ func GetEventsBySpanIDFromParquet(dir string, spanID string) ([]*span.SpanEvent,
 
 // GetEventsBatch efficiently retrieves events for multiple span IDs
 // Returns a map of spanID -> []SpanEvent
-// OPTIMIZATION: Single pass through parquet file instead of N passes
+// Single pass through parquet file instead of N passes
 func (pb *ParquetBlock) GetEventsBatch(spanIDs []string) (map[string][]*span.SpanEvent, error) {
 	if len(spanIDs) == 0 {
 		return nil, nil

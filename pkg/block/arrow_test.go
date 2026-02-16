@@ -215,7 +215,6 @@ func TestArrowBlock_Schema(t *testing.T) {
 		"service_name",
 		"tags",
 		"bucket1s",
-		"duration_ns",
 		"duration_bucket",
 	}
 

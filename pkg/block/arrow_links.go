@@ -190,7 +190,7 @@ func ReadAllLinksFromArrow(records []arrow.RecordBatch) ([]*span.SpanLink, error
 
 // GetLinksBatch efficiently retrieves links for multiple span IDs
 // Returns a map of spanID -> []SpanLink
-// OPTIMIZATION: Single pass through all link records instead of N passes
+// Single pass through all link records instead of N passes
 func (ab *ArrowBlock) GetLinksBatch(spanIDs []string) (map[string][]*span.SpanLink, error) {
 	if len(spanIDs) == 0 {
 		return nil, nil

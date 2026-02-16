@@ -28,7 +28,7 @@ import (
 // 4. Open Grafana in your browser
 // 5. Keep running until you hit the endpoint or press Ctrl+C
 func TestArtemisTracingStack(t *testing.T) {
-	// t.Skip("This is an interactive test, comment this line before running")
+	t.Skip("This is an interactive test, comment this line before running")
 
 	fmt.Println("=== Building Artemis Docker image...")
 	testutil.Ok(t, buildArtemisImage())

@@ -366,15 +366,15 @@ func TestArrowStorage_Schema(t *testing.T) {
 	}
 
 	// Verify schema has expected fields
-	if schema.NumFields() != 13 {
-		t.Errorf("Schema has %d fields, want 13", schema.NumFields())
+	if schema.NumFields() != 12 {
+		t.Errorf("Schema has %d fields, want 12", schema.NumFields())
 	}
 
 	// Check field names
 	expectedFields := []string{
 		"trace_id_hi", "trace_id_lo", "span_id", "parent_span_id", "name",
 		"start_time", "end_time", "duration", "service_name", "tags",
-		"bucket1s", "duration_ns", "duration_bucket",
+		"bucket1s", "duration_bucket",
 	}
 
 	for i, expected := range expectedFields {

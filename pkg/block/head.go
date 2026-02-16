@@ -83,7 +83,7 @@ func (hb *HeadBlock) GetSpanByID(spanID string) (*span.Span, error) {
 
 // GetSpansBatch efficiently retrieves multiple spans by ID
 // For in-memory head block, this is fast since all data is in RAM
-// OPTIMIZATION: Groups spans by record index to improve cache locality
+// Groups spans by record index to improve cache locality
 func (hb *HeadBlock) GetSpansBatch(spanIDs []string) ([]*span.Span, error) {
 	idx := hb.storage.GetIndex()
 	records := hb.storage.GetRecords()
@@ -103,7 +103,7 @@ func (hb *HeadBlock) GetSpansBatch(spanIDs []string) ([]*span.Span, error) {
 		}
 
 		if ref.RecordIndex >= len(records) {
-			// FIX: Log warning for invalid record index to help detect index corruption
+			// Log warning for invalid record index to help detect index corruption
 			// This makes debugging easier compared to silently skipping
 			fmt.Printf("WARNING: HeadBlock index corruption - span %s has invalid record index %d (only %d records exist)\n",
 				spanID, ref.RecordIndex, len(records))

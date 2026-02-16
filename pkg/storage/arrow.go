@@ -50,7 +50,6 @@ type SpanRecordBuilder struct {
 	serviceName     *array.StringBuilder
 	tags            *array.MapBuilder
 	bucket1s        *array.Int64Builder
-	durationNs      *array.Int64Builder
 	durationBucket  *array.Int32Builder
 	currentRowCount int
 }
@@ -88,7 +87,6 @@ func createSpanSchema() *arrow.Schema {
 			{Name: "service_name", Type: arrow.BinaryTypes.String, Nullable: false},
 			{Name: "tags", Type: arrow.MapOf(arrow.BinaryTypes.String, arrow.BinaryTypes.String), Nullable: true},
 			{Name: "bucket1s", Type: arrow.PrimitiveTypes.Int64, Nullable: false},
-			{Name: "duration_ns", Type: arrow.PrimitiveTypes.Int64, Nullable: false},
 			{Name: "duration_bucket", Type: arrow.PrimitiveTypes.Int32, Nullable: false},
 		},
 		nil,
@@ -131,9 +129,6 @@ func NewSpanRecordBuilder(mem memory.Allocator, schema *arrow.Schema) *SpanRecor
 	bucket1s := array.NewInt64Builder(mem)
 	bucket1s.Reserve(batchSize)
 
-	durationNs := array.NewInt64Builder(mem)
-	durationNs.Reserve(batchSize)
-
 	durationBucket := array.NewInt32Builder(mem)
 	durationBucket.Reserve(batchSize)
 
@@ -151,7 +146,6 @@ func NewSpanRecordBuilder(mem memory.Allocator, schema *arrow.Schema) *SpanRecor
 		serviceName:    serviceName,
 		tags:           tags,
 		bucket1s:       bucket1s,
-		durationNs:     durationNs,
 		durationBucket: durationBucket,
 	}
 }
@@ -211,9 +205,6 @@ func (b *SpanRecordBuilder) Append(s *span.Span) {
 	bucket := startUnixNano - (startUnixNano % sec)
 	b.bucket1s.Append(bucket)
 
-	// Store duration in nanoseconds
-	b.durationNs.Append(durationNs)
-
 	// Calculate duration bucket using exponential bucketing
 	var durationBucketVal int32
 	if durationNs <= 0 {
@@ -244,7 +235,6 @@ func (b *SpanRecordBuilder) NewRecord() arrow.RecordBatch {
 		b.serviceName.NewStringArray(),
 		b.tags.NewMapArray(),
 		b.bucket1s.NewInt64Array(),
-		b.durationNs.NewInt64Array(),
 		b.durationBucket.NewInt32Array(),
 	}
 
@@ -267,7 +257,6 @@ func (b *SpanRecordBuilder) Release() {
 	b.serviceName.Release()
 	b.tags.Release()
 	b.bucket1s.Release()
-	b.durationNs.Release()
 	b.durationBucket.Release()
 }
 
@@ -456,10 +445,10 @@ func (s *ArrowStorage) extractSpan(record arrow.RecordBatch, rowIndex int) (*spa
 	}
 
 	// Validate schema has expected number of columns
-	// Note: We have 13 columns now (10 original + 3 new indexing fields)
-	// but the new fields (bucket1s, duration_ns, duration_bucket) don't need to be extracted
+	// Note: We have 12 columns now (10 original + 2 new indexing fields)
+	// but the new fields (bucket1s, duration_bucket) don't need to be extracted
 	// into the Span struct as they're derived for indexing purposes
-	expectedColumns := 13
+	expectedColumns := 12
 	if record.NumCols() < int64(expectedColumns) {
 		return nil, fmt.Errorf("invalid schema: expected at least %d columns, got %d", expectedColumns, record.NumCols())
 	}

@@ -677,17 +677,36 @@ func queryArrowBlock(ab *block.ArrowBlock, ms Matchers, timeRange *TimeRange) []
 		}
 	}
 
-	// Fall back to full scan (no index or no exact match matchers)
-	// Arrow block: full scan using Records()
+	// Fall back to full scan using two-phase columnar filtering
+	// Phase 1: Build selection bitmap using columnar access (fast, SIMD-friendly)
+	// Phase 2: Extract only matching spans (avoids unnecessary allocations)
 	records := ab.Records()
+	needTags := matchersNeedTags(ms)
+
 	for _, record := range records {
+		// Phase 1: Build selection bitmap using columnar filtering
+		selection := buildSelectionBitmap(record, ms, timeRange)
+
+		// Phase 2: Extract only selected spans
 		for row := 0; row < int(record.NumRows()); row++ {
-			sp, err := extractSpanFromRecord(record, row)
+			if !selection[row] {
+				continue
+			}
+
+			sp, err := extractSpanFromRecordWithOptions(record, row, needTags)
 			if err != nil {
 				continue
 			}
 
+			// Final validation with full matchers (includes tag checks if needed)
 			if ms.Matches(sp) && (timeRange == nil || spanInTimeRange(sp, timeRange)) {
+				// If we didn't extract tags during filtering, extract them now for the final result
+				if !needTags {
+					sp, err = extractSpanFromRecordWithOptions(record, row, true)
+					if err != nil {
+						continue
+					}
+				}
 				spans = append(spans, sp)
 			}
 		}

@@ -246,7 +246,7 @@ func (db *DB) WriteSpans(spans []*span.Span) error {
 	}
 
 	// Write to WAL first for durability (one by one as WAL doesn't have bulk API)
-	// FIX: Collect actual segment indices from each write
+	// Collect actual segment indices from each write
 	for _, s := range spans {
 		actualSegment, err := db.wal.WriteSpan(s)
 		if err != nil {

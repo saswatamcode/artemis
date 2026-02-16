@@ -163,7 +163,7 @@ func (bm *Manager) FlushHead(minWALSegment, maxWALSegment int) (*BlockMeta, erro
 		return nil, fmt.Errorf("head is nil, cannot flush")
 	}
 
-	// CRITICAL FIX: Flush builder state before snapshot to materialize pending records
+	// Flush builder state before snapshot to materialize pending records
 	// Without this, any spans in the builder (not yet in a record) would be lost
 	if err := oldHead.Flush(); err != nil {
 		return nil, fmt.Errorf("failed to flush builder: %w", err)

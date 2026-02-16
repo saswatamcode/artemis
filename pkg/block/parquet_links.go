@@ -225,7 +225,7 @@ func GetLinksBySpanIDFromParquet(dir string, spanID string) ([]*span.SpanLink, e
 
 // GetLinksBatch efficiently retrieves links for multiple span IDs
 // Returns a map of spanID -> []SpanLink
-// OPTIMIZATION: Single pass through parquet file instead of N passes
+// Single pass through parquet file instead of N passes
 func (pb *ParquetBlock) GetLinksBatch(spanIDs []string) (map[string][]*span.SpanLink, error) {
 	if len(spanIDs) == 0 {
 		return nil, nil

@@ -18,7 +18,7 @@ const (
 	// WAL file format: similar to Prometheus WAL
 	// Each record: [CRC32 (4 bytes)][Length (4 bytes)][Type (1 byte)][Data (Length bytes)]
 	recordHeaderSize   = 9                           // 4 + 4 + 1
-	pageSize           = 32 * 1024                   // 32KB per page
+	pageSize           = 256 * 1024                  // 256KB per page
 	maxRecordDataSize  = pageSize - recordHeaderSize // Maximum data size per record
 	defaultSegmentSize = 128 * 1024 * 1024           // 128MB per segment (default)
 

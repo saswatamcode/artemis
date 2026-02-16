@@ -271,8 +271,8 @@ func (ab *ArrowBlock) GetSpanByID(spanID string) (*span.Span, error) {
 }
 
 // GetSpansBatch efficiently retrieves multiple spans by ID with their events and links
-// OPTIMIZATION: Groups spans by record index to improve cache locality
-// OPTIMIZATION: Fetches events and links in a single pass instead of N separate queries
+// Groups spans by record index to improve cache locality
+// Fetches events and links in a single pass instead of N separate queries
 func (ab *ArrowBlock) GetSpansBatch(spanIDs []string) ([]*span.Span, error) {
 	if !ab.HasIndex() {
 		return nil, fmt.Errorf("block has no index")
@@ -449,10 +449,10 @@ func extractSpanFromArrowRecord(record arrow.RecordBatch, rowIndex int) (*span.S
 	}
 
 	// Validate schema has expected number of columns
-	// Note: We have 13 columns now (10 original + 3 new indexing fields)
-	// but the new fields (bucket1s, duration_ns, duration_bucket) don't need to be extracted
+	// Note: We have 12 columns now (10 original + 2 new indexing fields)
+	// but the new fields (bucket1s, duration_bucket) don't need to be extracted
 	// into the Span struct as they're derived for indexing purposes
-	expectedColumns := 13
+	expectedColumns := 12
 	if record.NumCols() < int64(expectedColumns) {
 		return nil, fmt.Errorf("invalid schema: expected at least %d columns, got %d", expectedColumns, record.NumCols())
 	}
@@ -461,7 +461,6 @@ func extractSpanFromArrowRecord(record arrow.RecordBatch, rowIndex int) (*span.S
 
 	// Extract fields with bounds checking
 	// Read trace_id_hi and trace_id_lo and format as hex string
-	// OPTIMIZATION: Use fast hex encoding instead of fmt.Sprintf
 	traceIDHi := record.Column(0).(*array.Uint64).Value(rowIndex)
 	traceIDLo := record.Column(1).(*array.Uint64).Value(rowIndex)
 	var traceIDBuf [32]byte
@@ -470,14 +469,12 @@ func extractSpanFromArrowRecord(record arrow.RecordBatch, rowIndex int) (*span.S
 	sp.TraceID = string(traceIDBuf[:])
 
 	// Read span_id and format as hex string
-	// OPTIMIZATION: Use fast hex encoding instead of fmt.Sprintf
 	spanIDVal := record.Column(2).(*array.Uint64).Value(rowIndex)
 	var spanIDBuf [16]byte
 	uint64ToHex(spanIDVal, spanIDBuf[:])
 	sp.SpanID = string(spanIDBuf[:])
 
 	// Read parent_span_id and format as hex string (or empty if null)
-	// OPTIMIZATION: Use fast hex encoding instead of fmt.Sprintf
 	parentCol := record.Column(3).(*array.Uint64)
 	if !parentCol.IsNull(rowIndex) {
 		parentSpanIDVal := parentCol.Value(rowIndex)
@@ -513,7 +510,7 @@ func extractSpanFromArrowRecord(record arrow.RecordBatch, rowIndex int) (*span.S
 		items := tagsCol.Items().(*array.String)
 
 		for i := int(offset); i < int(nextOffset); i++ {
-			// FIX: Return error on malformed data instead of silently breaking
+			// Return error on malformed data instead of silently breaking
 			// This ensures callers know the data is corrupted rather than seeing incomplete tags
 			if i >= keys.Len() || i >= items.Len() {
 				return nil, fmt.Errorf("corrupted tags data at row %d: tag index %d exceeds bounds (keys: %d, items: %d)",

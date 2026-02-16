@@ -37,7 +37,6 @@ type ParquetSpan struct {
 	ServiceName    string            `parquet:"service_name,dict"`
 	Tags           map[string]string `parquet:"tags,optional" parquet-key:"dict" parquet-value:"dict"`
 	Bucket1s       int64             `parquet:"bucket1s"`        // per-second bucket of start time
-	DurationNs     int64             `parquet:"duration_ns"`     // duration in nanoseconds
 	DurationBucket int32             `parquet:"duration_bucket"` // exponential duration bucket
 }
 
@@ -54,7 +53,6 @@ type ParquetSpanMetadata struct {
 	Duration       int64  `parquet:"duration,delta"`
 	ServiceName    string `parquet:"service_name,dict"`
 	Bucket1s       int64  `parquet:"bucket1s"`
-	DurationNs     int64  `parquet:"duration_ns"`
 	DurationBucket int32  `parquet:"duration_bucket"`
 }
 
@@ -631,29 +629,24 @@ func spanToParquetSpan(s *span.Span) *ParquetSpan {
 		ServiceName:    s.ServiceName,
 		Tags:           s.Tags,
 		Bucket1s:       bucket,
-		DurationNs:     durationNs,
 		DurationBucket: durationBucketVal,
 	}
 }
 
 // parquetSpanToSpan converts a ParquetSpan to Span
-// OPTIMIZATION: Uses fast hex encoding instead of fmt.Sprintf
 func parquetSpanToSpan(ps *ParquetSpan) *span.Span {
 	// Convert trace ID from hi/lo to hex string
-	// OPTIMIZATION: Use fast hex encoding instead of fmt.Sprintf
 	var traceIDBuf [32]byte
 	uint64ToHex(ps.TraceIDHi, traceIDBuf[:16])
 	uint64ToHex(ps.TraceIDLo, traceIDBuf[16:])
 	traceID := string(traceIDBuf[:])
 
 	// Convert span ID to hex string
-	// OPTIMIZATION: Use fast hex encoding instead of fmt.Sprintf
 	var spanIDBuf [16]byte
 	uint64ToHex(ps.SpanID, spanIDBuf[:])
 	spanID := string(spanIDBuf[:])
 
 	// Convert parent span ID to hex string (empty if 0)
-	// OPTIMIZATION: Use fast hex encoding instead of fmt.Sprintf
 	parentSpanID := ""
 	if ps.ParentSpanID != 0 {
 		var parentIDBuf [16]byte

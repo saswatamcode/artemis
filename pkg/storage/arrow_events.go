@@ -319,7 +319,7 @@ func (s *ArrowEventStorage) GetEventsBySpanID(spanID string) ([]*span.SpanEvent,
 
 // GetEventsBatch efficiently retrieves events for multiple span IDs
 // Returns a map of spanID -> []SpanEvent
-// OPTIMIZATION: Single pass through all event records instead of N passes
+// Single pass through all event records instead of N passes
 func (s *ArrowEventStorage) GetEventsBatch(spanIDs []string) (map[string][]*span.SpanEvent, error) {
 	if len(spanIDs) == 0 {
 		return nil, nil
