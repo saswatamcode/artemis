@@ -188,7 +188,7 @@ func TestIndexLookupPaths(t *testing.T) {
 						emptyHead := storage.NewArrowStorage()
 						defer emptyHead.Release()
 						emptyHead.Flush()
-						results, err = SelectFromBlocks(block.NewHeadBlock(emptyHead, nil, nil), blockType.blocks, matcher)
+						results, err = SelectFromBlocks(block.NewHeadBlock(emptyHead, nil), blockType.blocks, matcher)
 					}
 
 					if err != nil {
@@ -326,7 +326,7 @@ func TestTraceIDIndexPath(t *testing.T) {
 		defer emptyHead.Release()
 		emptyHead.Flush()
 
-		results, err := SelectFromBlocks(block.NewHeadBlock(emptyHead, nil, nil), []block.Block{l1Block}, matcher)
+		results, err := SelectFromBlocks(block.NewHeadBlock(emptyHead, nil), []block.Block{l1Block}, matcher)
 		if err != nil {
 			t.Fatalf("SelectFromBlocks error: %v", err)
 		}
@@ -463,7 +463,7 @@ func TestParentSpanIDReverseLookup(t *testing.T) {
 		defer emptyHead.Release()
 		emptyHead.Flush()
 
-		results, err := SelectFromBlocks(block.NewHeadBlock(emptyHead, nil, nil), []block.Block{l1Block}, matcher)
+		results, err := SelectFromBlocks(block.NewHeadBlock(emptyHead, nil), []block.Block{l1Block}, matcher)
 		if err != nil {
 			t.Fatalf("SelectFromBlocks error: %v", err)
 		}
@@ -569,7 +569,7 @@ func TestNameQueryIndexPath(t *testing.T) {
 		defer emptyHead.Release()
 		emptyHead.Flush()
 
-		results, err := SelectFromBlocks(block.NewHeadBlock(emptyHead, nil, nil), []block.Block{l1Block}, matcher)
+		results, err := SelectFromBlocks(block.NewHeadBlock(emptyHead, nil), []block.Block{l1Block}, matcher)
 		if err != nil {
 			t.Fatalf("SelectFromBlocks error: %v", err)
 		}
@@ -679,7 +679,7 @@ func TestSpanIDDirectLookup(t *testing.T) {
 		defer emptyHead.Release()
 		emptyHead.Flush()
 
-		results, err := SelectFromBlocks(block.NewHeadBlock(emptyHead, nil, nil), []block.Block{l1Block}, matcher)
+		results, err := SelectFromBlocks(block.NewHeadBlock(emptyHead, nil), []block.Block{l1Block}, matcher)
 		if err != nil {
 			t.Fatalf("SelectFromBlocks error: %v", err)
 		}

@@ -310,7 +310,7 @@ func TestSelectFromBlocksWithTimeRange(t *testing.T) {
 	timeRange := NewTimeRange(now.Add(-10*time.Minute), now)
 	matcher, _ := NewMatcher(MatchEqual, "env", "prod")
 
-	results, err := SelectFromBlocksWithTimeRange(block.NewHeadBlock(arrowStorage, nil, nil), nil, timeRange, matcher)
+	results, err := SelectFromBlocksWithTimeRange(block.NewHeadBlock(arrowStorage, nil), nil, timeRange, matcher)
 	if err != nil {
 		t.Fatalf("SelectFromBlocksWithTimeRange() error = %v", err)
 	}
@@ -341,7 +341,7 @@ func TestQuerier(t *testing.T) {
 		createTestSpans(t, "block", baseTime, 100, "service-block", "prod"))
 	defer testBlock.Close()
 
-	querier := NewBlockQuerier(block.NewHeadBlock(headStorage, nil, nil), []Block{testBlock})
+	querier := NewBlockQuerier(block.NewHeadBlock(headStorage, nil), []Block{testBlock})
 
 	matcher, _ := NewMatcher(MatchEqual, "env", "prod")
 	results, err := querier.Select(matcher)
@@ -406,7 +406,7 @@ func TestSelectFromMixedBlocks(t *testing.T) {
 	blocks := []Block{l0Block, l1Block}
 
 	matcher, _ := NewMatcher(MatchEqual, "env", "prod")
-	results, err := SelectFromBlocks(block.NewHeadBlock(headStorage, nil, nil), blocks, matcher)
+	results, err := SelectFromBlocks(block.NewHeadBlock(headStorage, nil), blocks, matcher)
 	if err != nil {
 		t.Fatalf("SelectFromBlocks() error = %v", err)
 	}
@@ -444,7 +444,7 @@ func TestSelectFromMixedBlocksWithTimeRange(t *testing.T) {
 	timeRange := NewTimeRange(baseTime.Add(2*time.Hour), baseTime.Add(3*time.Hour))
 	matcher, _ := NewMatcher(MatchEqual, "env", "prod")
 
-	results, err := SelectFromBlocksWithTimeRange(block.NewHeadBlock(headStorage, nil, nil), blocks, timeRange, matcher)
+	results, err := SelectFromBlocksWithTimeRange(block.NewHeadBlock(headStorage, nil), blocks, timeRange, matcher)
 	if err != nil {
 		t.Fatalf("SelectFromBlocksWithTimeRange() error = %v", err)
 	}

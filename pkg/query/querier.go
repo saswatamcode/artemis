@@ -2,7 +2,6 @@ package query
 
 import (
 	"github.com/saswatamcode/artemis/pkg/block"
-	"github.com/saswatamcode/artemis/pkg/span"
 )
 
 // Querier provides an interface for querying spans from storage
@@ -27,15 +26,6 @@ type Querier interface {
 }
 
 // EventQuerier provides methods for querying span events separately
-type EventQuerier interface {
-	// GetEventsForSpan retrieves all events for a specific span
-	GetEventsForSpan(spanID string) ([]span.SpanEvent, error)
-
-	// GetEventsForTrace retrieves all events for all spans in a trace
-	// Returns a map of spanID -> events
-	GetEventsForTrace(traceID string) (map[string][]span.SpanEvent, error)
-}
-
 // BlockQuerier queries spans across all blocks uniformly through the Block interface
 // Treats HeadBlock, ArrowBlock (L0), and ParquetBlock (L1+) uniformly
 // Uses FanoutQuerier internally to query head and persisted blocks in parallel

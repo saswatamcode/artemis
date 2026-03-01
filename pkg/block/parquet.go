@@ -25,19 +25,19 @@ const (
 // ParquetSpan is the Parquet-optimized representation of a span
 // Using struct tags to configure Parquet encoding
 // Compression is configured at the writer level, not per-field
+// NOTE: Tags are NOT stored here - they are in attributes.parquet for efficient sparse storage
 type ParquetSpan struct {
-	TraceIDHi      uint64            `parquet:"trace_id_hi"`
-	TraceIDLo      uint64            `parquet:"trace_id_lo"`
-	SpanID         uint64            `parquet:"span_id"`
-	ParentSpanID   uint64            `parquet:"parent_span_id,optional"`
-	Name           string            `parquet:"name,dict"`
-	StartTime      int64             `parquet:"start_time,delta"` // nanoseconds since epoch
-	EndTime        int64             `parquet:"end_time,delta"`   // nanoseconds since epoch
-	Duration       int64             `parquet:"duration,delta"`   // nanoseconds
-	ServiceName    string            `parquet:"service_name,dict"`
-	Tags           map[string]string `parquet:"tags,optional" parquet-key:"dict" parquet-value:"dict"`
-	Bucket1s       int64             `parquet:"bucket1s"`        // per-second bucket of start time
-	DurationBucket int32             `parquet:"duration_bucket"` // exponential duration bucket
+	TraceIDHi      uint64 `parquet:"trace_id_hi"`
+	TraceIDLo      uint64 `parquet:"trace_id_lo"`
+	SpanID         uint64 `parquet:"span_id"`
+	ParentSpanID   uint64 `parquet:"parent_span_id,optional"`
+	Name           string `parquet:"name,dict"`
+	StartTime      int64  `parquet:"start_time,delta"` // nanoseconds since epoch
+	EndTime        int64  `parquet:"end_time,delta"`   // nanoseconds since epoch
+	Duration       int64  `parquet:"duration,delta"`   // nanoseconds
+	ServiceName    string `parquet:"service_name,dict"`
+	Bucket1s       int64  `parquet:"bucket1s"`        // per-second bucket of start time
+	DurationBucket int32  `parquet:"duration_bucket"` // exponential duration bucket
 }
 
 // ParquetSpanMetadata is a metadata-only projection
@@ -329,20 +329,26 @@ func (pb *ParquetBlock) GetSpansBatch(spanIDs []string) ([]*span.Span, error) {
 		}()
 	}
 
-	// Batch fetch events and links if they exist
-	eventsMap, _ := pb.GetEventsBatch(spanIDs)
-	if eventsMap != nil {
+	// Batch fetch attributes from separate attributes.parquet file if it exists
+	// This provides sparse, efficient attribute storage
+	attrsMap, _ := GetAttributesBatch(pb.dir, spanIDs)
+	if attrsMap != nil {
 		for _, sp := range results {
-			if eventPtrs, found := eventsMap[sp.SpanID]; found {
-				// Convert []*SpanEvent to []SpanEvent
-				sp.Events = make([]span.SpanEvent, len(eventPtrs))
-				for i, e := range eventPtrs {
-					sp.Events[i] = *e
+			if attrs, found := attrsMap[sp.SpanID]; found {
+				// Merge attributes from separate file
+				// Attributes from attributes.parquet take precedence if there's overlap
+				if sp.Tags == nil {
+					sp.Tags = attrs
+				} else {
+					for k, v := range attrs {
+						sp.Tags[k] = v
+					}
 				}
 			}
 		}
 	}
 
+	// Batch fetch links if they exist
 	linksMap, _ := pb.GetLinksBatch(spanIDs)
 	if linksMap != nil {
 		for _, sp := range results {
@@ -493,6 +499,29 @@ func (pb *ParquetBlock) GetSpansByRowReferences(refs []RowReference) ([]*span.Sp
 		currentRow++
 	}
 
+	// Load attributes from attributes.parquet for matched spans
+	if len(results) > 0 {
+		spanIDs := make([]string, len(results))
+		for i, sp := range results {
+			spanIDs[i] = sp.SpanID
+		}
+
+		attrsMap, _ := GetAttributesBatch(pb.dir, spanIDs)
+		if attrsMap != nil {
+			for _, sp := range results {
+				if attrs, found := attrsMap[sp.SpanID]; found {
+					if sp.Tags == nil {
+						sp.Tags = attrs
+					} else {
+						for k, v := range attrs {
+							sp.Tags[k] = v
+						}
+					}
+				}
+			}
+		}
+	}
+
 	return results, nil
 }
 
@@ -561,21 +590,16 @@ func (pb *ParquetBlock) scanByTraceID(traceID string) ([]*span.Span, error) {
 }
 
 // scanByTag is a fallback full scan when no index is available
-// Note: This requires reading full span data since tags aren't in metadata projection
+// Queries attributes.parquet for matching span IDs, then fetches those spans
 func (pb *ParquetBlock) scanByTag(tagKey, tagValue string) ([]*span.Span, error) {
-	allSpans, err := pb.ReadAll()
-	if err != nil {
-		return nil, err
+	// Query attributes.parquet directly for this tag
+	matchingSpanIDs, err := QueryAttributesByKey(pb.dir, tagKey, tagValue)
+	if err != nil || len(matchingSpanIDs) == 0 {
+		return make([]*span.Span, 0), nil
 	}
 
-	result := make([]*span.Span, 0)
-	for _, sp := range allSpans {
-		if sp.Tags != nil && sp.Tags[tagKey] == tagValue {
-			result = append(result, sp)
-		}
-	}
-
-	return result, nil
+	// Fetch spans for matching span IDs
+	return pb.GetSpansBatch(matchingSpanIDs)
 }
 
 // spanToParquetSpan converts a Span to ParquetSpan
@@ -627,10 +651,10 @@ func spanToParquetSpan(s *span.Span) *ParquetSpan {
 		EndTime:        s.EndTime.UnixNano(),
 		Duration:       durationNs,
 		ServiceName:    s.ServiceName,
-		Tags:           s.Tags,
 		Bucket1s:       bucket,
 		DurationBucket: durationBucketVal,
 	}
+	// NOTE: Tags are stored separately in attributes.parquet, not in spans.parquet
 }
 
 // parquetSpanToSpan converts a ParquetSpan to Span
@@ -663,18 +687,9 @@ func parquetSpanToSpan(ps *ParquetSpan) *span.Span {
 		EndTime:      time.Unix(0, ps.EndTime),
 		Duration:     ps.Duration,
 		ServiceName:  ps.ServiceName,
-		Tags:         ps.Tags,
+		Tags:         nil, // Tags loaded separately from attributes.parquet
 	}
-}
-
-// GetEventsBySpanID retrieves all events for a given span ID from this block
-func (pb *ParquetBlock) GetEventsBySpanID(spanID string) ([]*span.SpanEvent, error) {
-	return GetEventsBySpanIDFromParquet(pb.dir, spanID)
-}
-
-// ReadAllEvents reads all events from this block
-func (pb *ParquetBlock) ReadAllEvents() ([]*span.SpanEvent, error) {
-	return ReadParquetEvents(pb.dir)
+	// NOTE: Tags will be loaded and merged from attributes.parquet by caller
 }
 
 // GetLinksBySpanID retrieves all links for a given span ID from this block
@@ -726,45 +741,85 @@ func WriteParquetBlock(dir string, meta *BlockMeta, spans []*span.Span, idx *ind
 		}
 	}
 
-	parquetSpans := make([]ParquetSpan, len(spans))
-	for i, s := range spans {
-		parquetSpans[i] = *spanToParquetSpan(s)
+	// Write spans.parquet and attributes.parquet in parallel for efficiency
+	// Both files are independent and can be written concurrently
+	type writeResult struct {
+		name string
+		err  error
 	}
 
-	dataPath := filepath.Join(tmpDir, parquetDataFilename)
-	f, err := os.Create(dataPath)
-	if err != nil {
-		os.RemoveAll(tmpDir)
-		return fmt.Errorf("failed to create parquet file: %w", err)
-	}
+	resultCh := make(chan writeResult, 2)
 
-	writer := parquet.NewGenericWriter[ParquetSpan](
-		f,
-		parquet.Compression(&snappy.Codec{}),
-		parquet.PageBufferSize(100*1024*1024),
-	)
+	// Goroutine 1: Write spans.parquet
+	go func() {
+		parquetSpans := make([]ParquetSpan, len(spans))
+		for i, s := range spans {
+			parquetSpans[i] = *spanToParquetSpan(s)
+		}
 
-	_, err = writer.Write(parquetSpans)
-	if err != nil {
-		writer.Close()
+		dataPath := filepath.Join(tmpDir, parquetDataFilename)
+		f, err := os.Create(dataPath)
+		if err != nil {
+			resultCh <- writeResult{"spans.parquet", fmt.Errorf("failed to create parquet file: %w", err)}
+			return
+		}
+
+		writer := parquet.NewGenericWriter[ParquetSpan](
+			f,
+			parquet.Compression(&snappy.Codec{}),
+			parquet.PageBufferSize(100*1024*1024),
+		)
+
+		_, err = writer.Write(parquetSpans)
+		if err != nil {
+			writer.Close()
+			f.Close()
+			resultCh <- writeResult{"spans.parquet", fmt.Errorf("failed to write parquet data: %w", err)}
+			return
+		}
+
+		if err := writer.Close(); err != nil {
+			f.Close()
+			resultCh <- writeResult{"spans.parquet", fmt.Errorf("failed to close writer: %w", err)}
+			return
+		}
+
+		// CRITICAL: Fsync data file
+		if err := f.Sync(); err != nil {
+			f.Close()
+			resultCh <- writeResult{"spans.parquet", fmt.Errorf("failed to sync parquet file: %w", err)}
+			return
+		}
 		f.Close()
-		os.RemoveAll(tmpDir)
-		return fmt.Errorf("failed to write parquet data: %w", err)
+
+		resultCh <- writeResult{"spans.parquet", nil}
+	}()
+
+	// Goroutine 2: Write attributes.parquet
+	go func() {
+		err := WriteParquetAttributes(tmpDir, spans)
+		if err != nil {
+			resultCh <- writeResult{"attributes.parquet", err}
+		} else {
+			resultCh <- writeResult{"attributes.parquet", nil}
+		}
+	}()
+
+	// Wait for both writes to complete
+	var writeErrors []error
+	for i := 0; i < 2; i++ {
+		result := <-resultCh
+		if result.err != nil {
+			writeErrors = append(writeErrors, fmt.Errorf("%s: %w", result.name, result.err))
+		}
 	}
 
-	if err := writer.Close(); err != nil {
-		f.Close()
+	// Check if any writes failed
+	if len(writeErrors) > 0 {
 		os.RemoveAll(tmpDir)
-		return fmt.Errorf("failed to close writer: %w", err)
+		// Return first error (both errors would be visible in logs)
+		return writeErrors[0]
 	}
-
-	// CRITICAL: Fsync data file
-	if err := f.Sync(); err != nil {
-		f.Close()
-		os.RemoveAll(tmpDir)
-		return fmt.Errorf("failed to sync parquet file: %w", err)
-	}
-	f.Close()
 
 	// Fsync directory
 	if err := fsyncDir(tmpDir); err != nil {

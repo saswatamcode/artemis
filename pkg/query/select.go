@@ -334,38 +334,111 @@ func queryBlockWithTimeRange(blk block.Block, ms Matchers, timeRange *TimeRange)
 func queryParquetBlock(pb *block.ParquetBlock, ms Matchers, timeRange *TimeRange) []*span.Span {
 	spans := make([]*span.Span, 0)
 
-	if pb.HasIndex() && len(ms) > 0 {
-		idx := pb.Index()
-
-		// Find first exact match to use as index lookup
-		// Priority: trace_id > span_id > other fields
+	// OPTIMIZATION: Try attribute-first query path for attribute matchers
+	// This queries attributes.parquet FIRST to get matching span IDs, then fetches spans
+	// Much faster than: fetch all spans → load attributes → filter
+	if len(ms) > 0 {
 		for _, m := range ms {
 			if m.Type == MatchEqual {
-				var candidateSpanIDs []string
-				// Check if this is a trace ID lookup (highly selective!)
+				// Priority order for different matcher types:
+				// 1. trace_id → use index (most selective)
+				// 2. span_id → use index (unique)
+				// 3. attribute (tag) → query attributes.parquet FIRST (new optimization!)
+				// 4. other metadata fields → use index or metadata scan
+
 				switch m.Name {
 				case "trace_id":
-					candidateSpanIDs = idx.LookupByTraceID(m.Value)
-				case "span_id":
-					if _, ok := idx.LookupSpanID(m.Value); ok {
-						candidateSpanIDs = []string{m.Value}
-					}
-				default:
-					candidateSpanIDs = idx.LookupByTag(m.Name, m.Value)
-				}
-
-				if len(candidateSpanIDs) > 0 {
-					// Parquet block: use GetSpansBatch for efficient batched reads
-					// This groups I/O by row group instead of reading spans one-by-one
-					batchSpans, err := pb.GetSpansBatch(candidateSpanIDs)
-					if err == nil {
-						for _, sp := range batchSpans {
-							if ms.Matches(sp) && (timeRange == nil || spanInTimeRange(sp, timeRange)) {
-								spans = append(spans, sp)
+					// Highest priority - use index
+					if pb.HasIndex() {
+						candidateSpanIDs := pb.Index().LookupByTraceID(m.Value)
+						if len(candidateSpanIDs) > 0 {
+							batchSpans, err := pb.GetSpansBatch(candidateSpanIDs)
+							if err == nil {
+								for _, sp := range batchSpans {
+									if ms.Matches(sp) && (timeRange == nil || spanInTimeRange(sp, timeRange)) {
+										spans = append(spans, sp)
+									}
+								}
 							}
+							return spans
 						}
 					}
-					return spans
+
+				case "span_id":
+					// Second priority - use index
+					if pb.HasIndex() {
+						if _, ok := pb.Index().LookupSpanID(m.Value); ok {
+							candidateSpanIDs := []string{m.Value}
+							batchSpans, err := pb.GetSpansBatch(candidateSpanIDs)
+							if err == nil {
+								for _, sp := range batchSpans {
+									if ms.Matches(sp) && (timeRange == nil || spanInTimeRange(sp, timeRange)) {
+										spans = append(spans, sp)
+									}
+								}
+							}
+							return spans
+						}
+					}
+
+				case "service_name", "name", "parent_span_id":
+					// Metadata fields - use index if available
+					if pb.HasIndex() {
+						candidateSpanIDs := pb.Index().LookupByTag(m.Name, m.Value)
+						if len(candidateSpanIDs) > 0 {
+							batchSpans, err := pb.GetSpansBatch(candidateSpanIDs)
+							if err == nil {
+								for _, sp := range batchSpans {
+									if ms.Matches(sp) && (timeRange == nil || spanInTimeRange(sp, timeRange)) {
+										spans = append(spans, sp)
+									}
+								}
+							}
+							return spans
+						}
+					}
+
+				default:
+					// ATTRIBUTE MATCHER - use attribute-first query path!
+					// This is the key optimization for tag/attribute queries
+					//
+					// Old path: index → GetSpansBatch → load all span data → load attributes → filter
+					// New path: QueryAttributesByKey → get matching span IDs → GetSpansBatch (with attributes already loaded)
+					//
+					// Benefits:
+					// - Column projection on attributes.parquet (read only one attribute column)
+					// - Row group statistics pruning on attribute values
+					// - Only fetch spans that match the attribute filter
+					matchingSpanIDs, err := block.QueryAttributesByKey(pb.Dir(), m.Name, m.Value)
+					if err == nil && len(matchingSpanIDs) > 0 {
+						// Fetch spans for matching span IDs
+						batchSpans, err := pb.GetSpansBatch(matchingSpanIDs)
+						if err == nil {
+							for _, sp := range batchSpans {
+								if ms.Matches(sp) && (timeRange == nil || spanInTimeRange(sp, timeRange)) {
+									spans = append(spans, sp)
+								}
+							}
+						}
+						return spans
+					}
+
+					// If attribute query didn't find matches or attributes.parquet doesn't exist,
+					// fall back to index-based tag lookup
+					if pb.HasIndex() {
+						candidateSpanIDs := pb.Index().LookupByTag(m.Name, m.Value)
+						if len(candidateSpanIDs) > 0 {
+							batchSpans, err := pb.GetSpansBatch(candidateSpanIDs)
+							if err == nil {
+								for _, sp := range batchSpans {
+									if ms.Matches(sp) && (timeRange == nil || spanInTimeRange(sp, timeRange)) {
+										spans = append(spans, sp)
+									}
+								}
+							}
+							return spans
+						}
+					}
 				}
 			}
 		}
@@ -382,6 +455,7 @@ func queryParquetBlock(pb *block.ParquetBlock, ms Matchers, timeRange *TimeRange
 	}
 
 	// Fetch full spans only for matching rows
+	// Note: GetSpansByRowReferences now automatically loads attributes from attributes.parquet
 	matchedSpans, err := pb.GetSpansByRowReferences(refs)
 	if err != nil {
 		return spans

@@ -42,16 +42,14 @@ const (
 // - HeadBlock: In-memory, mutable, active ingestion
 // - ParquetBlock: Parquet format, L1+, better compression, page-level reads
 type ArrowBlock struct {
-	meta         *BlockMeta
-	dir          string
-	records      []arrow.RecordBatch
-	mem          memory.Allocator
-	schema       *arrow.Schema
-	index        *index.Index
-	eventRecords []arrow.RecordBatch // Event records (optional)
-	eventSchema  *arrow.Schema       // Event schema (optional)
-	linkRecords  []arrow.RecordBatch // Link records (optional)
-	linkSchema   *arrow.Schema       // Link schema (optional)
+	meta        *BlockMeta
+	dir         string
+	records     []arrow.RecordBatch
+	mem         memory.Allocator
+	schema      *arrow.Schema
+	index       *index.Index
+	linkRecords []arrow.RecordBatch // Link records (optional)
+	linkSchema  *arrow.Schema       // Link schema (optional)
 }
 
 // NewArrowBlock creates a new Arrow block from disk
@@ -75,24 +73,6 @@ func NewArrowBlock(dir string) (*ArrowBlock, error) {
 
 	if err := ab.loadRecords(); err != nil {
 		return nil, fmt.Errorf("failed to load records: %w", err)
-	}
-
-	// Load event records if they exist
-	if err := ab.loadEventRecords(); err != nil {
-		// If events file exists but can't be read, that's a real error
-		return nil, fmt.Errorf("failed to load event records: %w", err)
-	}
-
-	if ab.eventRecords != nil && len(ab.eventRecords) > 0 {
-		// Count total events
-		totalEvents := int64(0)
-		for _, rec := range ab.eventRecords {
-			totalEvents += rec.NumRows()
-		}
-		slog.Default().Info("loaded event records for Arrow block",
-			slog.String("block_dir", dir),
-			slog.Int("num_records", len(ab.eventRecords)),
-			slog.Int64("total_events", totalEvents))
 	}
 
 	// Load link records if they exist
@@ -157,17 +137,6 @@ func (ab *ArrowBlock) loadRecords() error {
 	}
 
 	ab.records = records
-	return nil
-}
-
-// loadEventRecords loads event records from the events IPC file if it exists
-func (ab *ArrowBlock) loadEventRecords() error {
-	eventRecords, eventSchema, err := loadEventRecords(ab.dir, ab.mem)
-	if err != nil {
-		return err
-	}
-	ab.eventRecords = eventRecords
-	ab.eventSchema = eventSchema
 	return nil
 }
 
@@ -239,11 +208,6 @@ func (ab *ArrowBlock) Close() error {
 		rec.Release()
 	}
 	ab.records = nil
-
-	for _, rec := range ab.eventRecords {
-		rec.Release()
-	}
-	ab.eventRecords = nil
 
 	for _, rec := range ab.linkRecords {
 		rec.Release()
@@ -321,20 +285,7 @@ func (ab *ArrowBlock) GetSpansBatch(spanIDs []string) ([]*span.Span, error) {
 		}
 	}
 
-	// Batch fetch events and links if they exist
-	eventsMap, _ := ab.GetEventsBatch(spanIDs)
-	if eventsMap != nil {
-		for _, sp := range result {
-			if eventPtrs, found := eventsMap[sp.SpanID]; found {
-				// Convert []*SpanEvent to []SpanEvent
-				sp.Events = make([]span.SpanEvent, len(eventPtrs))
-				for i, e := range eventPtrs {
-					sp.Events[i] = *e
-				}
-			}
-		}
-	}
-
+	// Batch fetch links if they exist
 	linksMap, _ := ab.GetLinksBatch(spanIDs)
 	if linksMap != nil {
 		for _, sp := range result {
@@ -651,36 +602,6 @@ func fsyncDir(dir string) error {
 }
 
 // GetEventsBySpanID retrieves all events for a given span ID from this block
-func (ab *ArrowBlock) GetEventsBySpanID(spanID string) ([]*span.SpanEvent, error) {
-	if ab.eventRecords == nil || len(ab.eventRecords) == 0 {
-		return nil, nil // No events in this block
-	}
-	return GetEventsBySpanIDFromArrow(ab.eventRecords, spanID)
-}
-
-// HasEvents returns true if the block has event records loaded
-func (ab *ArrowBlock) HasEvents() bool {
-	return ab.eventRecords != nil && len(ab.eventRecords) > 0
-}
-
-// EventRecords returns all event records in this block
-func (ab *ArrowBlock) EventRecords() []arrow.RecordBatch {
-	return ab.eventRecords
-}
-
-// ReadAllEvents reads all events from this block
-func (ab *ArrowBlock) ReadAllEvents() ([]*span.SpanEvent, error) {
-	if ab.eventRecords == nil || len(ab.eventRecords) == 0 {
-		return nil, nil // No events in this block
-	}
-	return ReadAllEventsFromArrow(ab.eventRecords)
-}
-
-// EventSchema returns the event schema
-func (ab *ArrowBlock) EventSchema() *arrow.Schema {
-	return ab.eventSchema
-}
-
 // GetLinksBySpanID retrieves all links for a given span ID from this block
 func (ab *ArrowBlock) GetLinksBySpanID(spanID string) ([]*span.SpanLink, error) {
 	if ab.linkRecords == nil || len(ab.linkRecords) == 0 {

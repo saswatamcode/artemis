@@ -114,27 +114,6 @@ func convertOTLPSpan(otlpSpan *tracev1.Span, resourceAttrs, scopeAttrs map[strin
 		tags["parent_span_id"] = parentSpanID
 	}
 
-	// Extract span events
-	var events []span.SpanEvent
-	if len(otlpSpan.Events) > 0 {
-		events = make([]span.SpanEvent, 0, len(otlpSpan.Events))
-		for _, otlpEvent := range otlpSpan.Events {
-			event := span.SpanEvent{
-				SpanID:     spanID,
-				Name:       otlpEvent.Name,
-				Timestamp:  time.Unix(0, int64(otlpEvent.TimeUnixNano)),
-				Attributes: make(map[string]string),
-			}
-
-			// Extract event attributes
-			for _, attr := range otlpEvent.Attributes {
-				event.Attributes[attr.Key] = attributeValueToString(attr.Value)
-			}
-
-			events = append(events, event)
-		}
-	}
-
 	// Extract span links
 	var links []span.SpanLink
 	if len(otlpSpan.Links) > 0 {
@@ -166,7 +145,6 @@ func convertOTLPSpan(otlpSpan *tracev1.Span, resourceAttrs, scopeAttrs map[strin
 		Duration:     duration,
 		ServiceName:  serviceName,
 		Tags:         tags,
-		Events:       events,
 		Links:        links,
 	}
 }

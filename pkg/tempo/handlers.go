@@ -189,21 +189,9 @@ func (s *Server) handleGetTrace(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Load events and links for all spans in the trace
+	// Load links for all spans in the trace
 	for _, sp := range result.Spans {
 		if sp != nil {
-			// Load events
-			events, err := s.db.GetEventsForSpan(sp.SpanID)
-			if err != nil {
-				s.logger.Warn("failed to load events for span",
-					slog.String("span_id", sp.SpanID),
-					slog.String("error", err.Error()))
-				// Continue without events rather than failing the entire request
-				sp.Events = nil
-			} else {
-				sp.Events = events
-			}
-
 			// Load links
 			links, err := s.db.GetLinksForSpan(sp.SpanID)
 			if err != nil {
