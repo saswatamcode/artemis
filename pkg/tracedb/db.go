@@ -19,7 +19,8 @@ import (
 type DB struct {
 	wal          *wal.WAL
 	storage      *storage.ArrowStorage
-	linkStorage  *storage.ArrowLinkStorage // Link storage
+	linkStorage  *storage.ArrowLinkStorage     // Link storage
+	isolation    *storage.IsolationCoordinator // Transaction isolation coordinator
 	blockManager *block.Manager
 	compactor    *compactor.Compactor
 	walDir       string
@@ -101,6 +102,7 @@ func New(cfg *Config) (*DB, error) {
 
 	arrowStorage := storage.NewArrowStorage()
 	linkStorage := storage.NewArrowLinkStorage()
+	isolationCoord := storage.NewIsolationCoordinator()
 
 	var blockMgr *block.Manager
 	var comp *compactor.Compactor
@@ -125,6 +127,7 @@ func New(cfg *Config) (*DB, error) {
 		wal:                      walLog,
 		storage:                  arrowStorage,
 		linkStorage:              linkStorage,
+		isolation:                isolationCoord,
 		blockManager:             blockMgr,
 		compactor:                comp,
 		walDir:                   cfg.WALDir,
@@ -140,6 +143,9 @@ func New(cfg *Config) (*DB, error) {
 		lastRetentionCleanupTime: time.Now(),
 		stopCh:                   make(chan struct{}),
 	}
+
+	// Configure transactional dependencies for ArrowStorage
+	arrowStorage.SetTransactionDependencies(isolationCoord, linkStorage, walLog)
 
 	// Load existing WAL data into Arrow storage with progress tracking
 	logger.Info("replaying wal", "dir", cfg.WALDir)
@@ -196,14 +202,13 @@ func (db *DB) WriteSpan(s *span.Span) error {
 
 // WriteSpans writes multiple spans to the database in bulk
 // This is more efficient than calling WriteSpan repeatedly for batch ingestion
-// First writes to WAL for durability, then adds to in-memory storage
+// Uses transactional Appender for MVCC snapshot isolation and efficient buffer pooling
 func (db *DB) WriteSpans(spans []*span.Span) error {
 	if len(spans) == 0 {
 		return nil
 	}
 
-	// CRITICAL: Check if closed while holding mu lock, then acquire queryMu
-	// This prevents TOCTOU race where Close() runs between check and queryMu acquisition
+	// CRITICAL: Check if closed before starting transaction
 	db.mu.Lock()
 	if db.closed {
 		db.mu.Unlock()
@@ -217,54 +222,41 @@ func (db *DB) WriteSpans(spans []*span.Span) error {
 	db.mu.Unlock() // Release mu now that we have queryMu
 	defer db.queryMu.RUnlock()
 
-	// Track which segments we actually write to
-	segmentSet := make(map[int]bool)
+	// Create new transaction appender via factory method on ArrowStorage
+	// The appender handles:
+	// - Unique transaction ID allocation
+	// - Buffer pooling (sync.Pool)
+	// - appendMutex acquisition (serializes commits)
+	// - WAL-first durability
+	// - MVCC registration
+	appender := db.storage.BeginTransaction()
 
-	// Collect links from all spans
-	var allLinks []*span.SpanLink
+	// Add all spans to transaction buffer (in-memory, no locks)
 	for _, s := range spans {
+		if err := appender.AddSpan(s); err != nil {
+			appender.Rollback()
+			return fmt.Errorf("failed to add span to transaction: %w", err)
+		}
+
+		// Add links from this span
 		if len(s.Links) > 0 {
-			// Convert []SpanLink to []*SpanLink for WriteLinks
 			for i := range s.Links {
-				allLinks = append(allLinks, &s.Links[i])
+				if err := appender.AddLink(&s.Links[i]); err != nil {
+					appender.Rollback()
+					return fmt.Errorf("failed to add link to transaction: %w", err)
+				}
 			}
 		}
 	}
 
-	// Write to WAL first for durability (one by one as WAL doesn't have bulk API)
-	// Collect actual segment indices from each write
-	for _, s := range spans {
-		actualSegment, err := db.wal.WriteSpan(s)
-		if err != nil {
-			return fmt.Errorf("failed to write span to WAL: %w", err)
-		}
-		segmentSet[actualSegment] = true
-	}
-
-	// Write links to WAL if we have any
-	if len(allLinks) > 0 {
-		_, err := db.wal.WriteLinks(allLinks)
-		if err != nil {
-			return fmt.Errorf("failed to write links to WAL: %w", err)
-		}
-	}
-
-	// Update WAL segment tracking for all segments that were actually written to
-	// This is precise - we only track segments that contain data
-	for seg := range segmentSet {
-		db.storage.UpdateWALSegment(seg)
-	}
-
-	// Add to in-memory Arrow storage in bulk for better performance
-	if err := db.storage.AddSpans(spans); err != nil {
-		return fmt.Errorf("failed to add spans to storage: %w", err)
-	}
-
-	// Add links to in-memory link storage
-	if len(allLinks) > 0 {
-		if err := db.linkStorage.AddLinks(allLinks); err != nil {
-			return fmt.Errorf("failed to add links to storage: %w", err)
-		}
+	// Commit transaction atomically
+	// Phase 1: Write to WAL (durability)
+	// Phase 2: Update Arrow storage (performance)
+	// Phase 3: Register with MVCC (snapshot isolation)
+	// Phase 4: Release buffers and locks
+	if err := appender.Commit(); err != nil {
+		appender.Rollback()
+		return fmt.Errorf("failed to commit transaction: %w", err)
 	}
 
 	return nil

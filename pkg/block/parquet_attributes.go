@@ -140,9 +140,24 @@ func DecodeAttributeIndex(data []byte) ([]int, error) {
 	return indices, nil
 }
 
+// AttrRowInfo holds row position information for a span in attributes.parquet
+type AttrRowInfo struct {
+	RowGroup int // Row group index
+	Row      int // Row index within row group
+}
+
 // WriteParquetAttributes writes span attributes to a separate Parquet file with dynamic schema
 // This creates a sparse representation where only populated attributes consume storage
 func WriteParquetAttributes(dir string, spans []*span.Span) error {
+	_, err := WriteParquetAttributesWithRowMap(dir, spans)
+	return err
+}
+
+// WriteParquetAttributesWithRowMap writes attributes and returns row position mapping
+// This enables building an index with direct row references for fast attribute lookups
+func WriteParquetAttributesWithRowMap(dir string, spans []*span.Span) (map[string]AttrRowInfo, error) {
+	rowMap := make(map[string]AttrRowInfo)
+
 	// Filter to only spans with attributes
 	spansWithAttrs := make([]*span.Span, 0, len(spans))
 	for _, s := range spans {
@@ -152,130 +167,128 @@ func WriteParquetAttributes(dir string, spans []*span.Span) error {
 	}
 
 	if len(spansWithAttrs) == 0 {
-		return nil // No attributes to write
+		return rowMap, nil // No attributes to write
 	}
 
 	// Discover all unique attribute keys across all spans
 	attrKeys := DiscoverAttributeKeys(spansWithAttrs)
 	if len(attrKeys) == 0 {
-		return nil
+		return rowMap, nil
 	}
 
 	// Build dynamic schema based on discovered attributes
 	schema := BuildAttributesSchema(attrKeys)
 
-	// Get actual column order from schema (important because maps are unordered!)
-	schemaColumns := schema.Columns()
-	columnNames := make([]string, len(schemaColumns))
-	for i, col := range schemaColumns {
-		columnNames[i] = col[0]
+	// Build rows using RowBuilder (Thanos pattern)
+	rows := make([]parquet.Row, 0, len(spansWithAttrs))
+	rowBuilder := parquet.NewRowBuilder(schema)
+
+	// Build column index lookups
+	spanIDColIdx, _ := schema.Lookup("span_id")
+	attrIndexColIdx, _ := schema.Lookup("__attr_index")
+	attrColIndices := make(map[string]int)
+	for _, key := range attrKeys {
+		colName := AttributeColumnName(key)
+		if lc, ok := schema.Lookup(colName); ok {
+			attrColIndices[key] = lc.ColumnIndex
+		}
 	}
 
-	// Create map buffer for writing
-	// We need to use map[string]any for dynamic parquet writing
-	rows := make([]parquet.Row, 0, len(spansWithAttrs))
+	// CRITICAL: Sort spans by span_id BEFORE building rows
+	// This enables row group min/max statistics pruning during queries
+	// Similar optimization as in WriteParquetLinks
+	sort.Slice(spansWithAttrs, func(i, j int) bool {
+		// Parse and compare span IDs numerically for correct sorting
+		idI, errI := span.ParseSpanID(spansWithAttrs[i].SpanID)
+		idJ, errJ := span.ParseSpanID(spansWithAttrs[j].SpanID)
+		if errI != nil || errJ != nil {
+			return spansWithAttrs[i].SpanID < spansWithAttrs[j].SpanID // Fallback to string comparison
+		}
+		return idI < idJ
+	})
+
+	// Track row positions for index building
+	// Assume default row group size (typically 1024 rows per row group in Parquet)
+	const defaultRowGroupSize = 1024
+	rowIdx := 0
 
 	for _, s := range spansWithAttrs {
 		// Parse span ID
 		spanID, err := span.ParseSpanID(s.SpanID)
 		if err != nil {
-			// Skip spans with invalid span IDs to avoid data corruption
 			continue
 		}
 
-		// Pre-encode attr_index
+		rowBuilder.Reset()
+
+		// Add span_id (required field)
+		rowBuilder.Add(spanIDColIdx.ColumnIndex, parquet.ValueOf(spanID))
+
+		// Add __attr_index (optional)
 		attrIndex := EncodeAttributeIndex(attrKeys, s.Tags)
+		if attrIndex != nil {
+			rowBuilder.Add(attrIndexColIdx.ColumnIndex, parquet.ValueOf(attrIndex))
+		}
 
-		// Build row in the EXACT order of schema columns
-		row := make(parquet.Row, 0, len(columnNames))
-
-		for colIdx, colName := range columnNames {
-			switch colName {
-			case "span_id":
-				row = append(row, parquet.ValueOf(spanID).Level(0, 0, colIdx))
-
-			case "__attr_index":
-				if attrIndex != nil {
-					// Definition level 1 = value is present
-					row = append(row, parquet.ValueOf(attrIndex).Level(0, 1, colIdx))
-				} else {
-					// Definition level 0 = value is null
-					row = append(row, parquet.ValueOf(nil).Level(0, 0, colIdx))
-				}
-
-			default:
-				// This is an attribute column
-				if attrKey, ok := ColumnToAttributeName(colName); ok {
-					if value, found := s.Tags[attrKey]; found {
-						// Attribute is present - write value
-						row = append(row, parquet.ValueOf(value).Level(0, 1, colIdx))
-					} else {
-						// Attribute is not present - write null
-						row = append(row, parquet.ValueOf(nil).Level(0, 0, colIdx))
-					}
-				} else {
-					// Unknown column - write null
-					row = append(row, parquet.ValueOf(nil).Level(0, 0, colIdx))
-				}
+		// Add attribute values (only populated ones!)
+		for key, value := range s.Tags {
+			if colIdx, ok := attrColIndices[key]; ok {
+				rowBuilder.Add(colIdx, parquet.ValueOf(value))
 			}
 		}
 
-		rows = append(rows, row)
-	}
+		// Append row to buffer
+		var row parquet.Row
+		row = rowBuilder.AppendRow(row[:0])
 
-	// Find the span_id column index for sorting
-	spanIDColIdx := -1
-	for idx, colName := range columnNames {
-		if colName == "span_id" {
-			spanIDColIdx = idx
-			break
+		// CRITICAL: Make a deep copy of the row to avoid sharing underlying memory
+		// parquet.Row is a slice, and if we don't copy, all rows might share data
+		rowCopy := make(parquet.Row, len(row))
+		copy(rowCopy, row)
+		rows = append(rows, rowCopy)
+
+		// Track row position for this span
+		rowMap[s.SpanID] = AttrRowInfo{
+			RowGroup: rowIdx / defaultRowGroupSize,
+			Row:      rowIdx % defaultRowGroupSize,
 		}
-	}
-
-	// Sort rows by span_id for optimal query performance
-	if spanIDColIdx >= 0 {
-		sort.Slice(rows, func(i, j int) bool {
-			// Extract span_id from its column
-			spanIDi := rows[i][spanIDColIdx].Uint64()
-			spanIDj := rows[j][spanIDColIdx].Uint64()
-			return spanIDi < spanIDj
-		})
+		rowIdx++
 	}
 
 	// Write to parquet file
 	attrsPath := filepath.Join(dir, parquetAttributesFilename)
 	f, err := os.Create(attrsPath)
 	if err != nil {
-		return fmt.Errorf("failed to create attributes parquet file: %w", err)
+		return nil, fmt.Errorf("failed to create attributes parquet file: %w", err)
 	}
+	defer f.Close()
 
 	writer := parquet.NewWriter(
 		f,
 		schema,
 		parquet.Compression(&snappy.Codec{}),
-		parquet.PageBufferSize(100*1024*1024),
+		// Explicitly set row group size to prevent automatic buffering/doubling
+		parquet.MaxRowsPerRowGroup(1024),
 	)
 
-	for _, row := range rows {
-		if _, err := writer.WriteRows([]parquet.Row{row}); err != nil {
-			writer.Close()
-			f.Close()
-			return fmt.Errorf("failed to write attributes row: %w", err)
-		}
+	// Write all rows at once
+	_, err = writer.WriteRows(rows)
+	if err != nil {
+		writer.Close()
+		return nil, fmt.Errorf("failed to write rows: %w", err)
 	}
 
 	if err := writer.Close(); err != nil {
-		f.Close()
-		return fmt.Errorf("failed to close attributes writer: %w", err)
+		return nil, fmt.Errorf("failed to close attributes writer: %w", err)
 	}
 
 	if err := f.Sync(); err != nil {
 		f.Close()
-		return fmt.Errorf("failed to sync attributes parquet file: %w", err)
+		return nil, fmt.Errorf("failed to sync attributes parquet file: %w", err)
 	}
 	f.Close()
 
-	return nil
+	return rowMap, nil
 }
 
 // ReadParquetAttributes reads all attributes from the attributes.parquet file
@@ -325,6 +338,7 @@ func ReadParquetAttributes(dir string) (map[string]map[string]string, error) {
 
 	result := make(map[string]map[string]string)
 
+	rowCount := 0
 	for {
 		row := make(parquet.Row, len(schemaColumns))
 		_, err := reader.ReadRows([]parquet.Row{row})
@@ -334,6 +348,8 @@ func ReadParquetAttributes(dir string) (map[string]map[string]string, error) {
 		if err != nil {
 			return nil, fmt.Errorf("failed to read attributes row: %w", err)
 		}
+
+		rowCount++
 
 		// Extract span_id from its actual column position
 		if len(row) <= spanIDColIdx {
@@ -512,10 +528,9 @@ func GetAttributesBatch(dir string, spanIDs []string) (map[string]map[string]str
 		return nil, fmt.Errorf("failed to open attributes parquet file: %w", err)
 	}
 
+	// Build column name to index mapping
 	schema := file.Schema()
 	schemaColumns := schema.Columns()
-
-	// Build column name to index mapping
 	columnNameToIdx := make(map[string]int)
 	for i, col := range schemaColumns {
 		columnNameToIdx[col[0]] = i
@@ -530,91 +545,90 @@ func GetAttributesBatch(dir string, spanIDs []string) (map[string]map[string]str
 	result := make(map[string]map[string]string)
 	rowGroups := file.RowGroups()
 
-	// Process each row group
+	// OPTIMIZATION: Use row group statistics to skip irrelevant row groups
+	// Now that attributes are sorted by span_id, we can use min/max statistics
 	for _, rg := range rowGroups {
-		// OPTIMIZATION: Use row group statistics to skip irrelevant row groups
 		columnChunks := rg.ColumnChunks()
 		if spanIDColIdx >= len(columnChunks) {
 			continue
 		}
 
-		spanIDColumn := columnChunks[spanIDColIdx] // Get span_id column chunk
+		spanIDColumn := columnChunks[spanIDColIdx]
 
-		// Check column index for min/max values
-		colIdx, err := spanIDColumn.ColumnIndex()
+		// Use row group statistics to skip row groups that can't contain our span IDs
+		columnIndex, err := spanIDColumn.ColumnIndex()
 		canSkipRowGroup := false
-		if err == nil && colIdx != nil && colIdx.NumPages() > 0 {
-			rowGroupHasMatch := false
-			for pageIdx := 0; pageIdx < colIdx.NumPages(); pageIdx++ {
-				if colIdx.NullPage(pageIdx) {
+		if err == nil && columnIndex != nil && columnIndex.NumPages() > 0 {
+			// Check if ANY page in this row group overlaps with our span ID range
+			rowGroupMightMatch := false
+			for pageIdx := 0; pageIdx < columnIndex.NumPages(); pageIdx++ {
+				if columnIndex.NullPage(pageIdx) {
 					continue
 				}
 
-				pageMin := colIdx.MinValue(pageIdx)
-				pageMax := colIdx.MaxValue(pageIdx)
+				pageMin := columnIndex.MinValue(pageIdx).Uint64()
+				pageMax := columnIndex.MaxValue(pageIdx).Uint64()
 
-				if len(pageMin.Bytes()) == 8 && len(pageMax.Bytes()) == 8 {
-					pageMinVal := binary.LittleEndian.Uint64(pageMin.Bytes())
-					pageMaxVal := binary.LittleEndian.Uint64(pageMax.Bytes())
-
-					if !(pageMaxVal < minSpanID || pageMinVal > maxSpanID) {
-						rowGroupHasMatch = true
-						break
-					}
-				} else {
-					rowGroupHasMatch = true
+				// Check if page range [pageMin, pageMax] overlaps with our range [minSpanID, maxSpanID]
+				if pageMax >= minSpanID && pageMin <= maxSpanID {
+					rowGroupMightMatch = true
 					break
 				}
 			}
 
-			if !rowGroupHasMatch {
+			if !rowGroupMightMatch {
 				canSkipRowGroup = true
 			}
 		}
 
 		if canSkipRowGroup {
-			continue
+			continue // Skip this entire row group - huge performance win!
 		}
 
-		// Row group might contain data - read it
+		// Read rows from this row group
 		reader := parquet.NewRowGroupReader(rg)
+		rows := make([]parquet.Row, 128)
 
 		for {
-			row := make(parquet.Row, len(schemaColumns))
-			_, err := reader.ReadRows([]parquet.Row{row})
-			if err == io.EOF {
-				break
-			}
-			if err != nil {
+			n, err := reader.ReadRows(rows)
+			if err != nil && err != io.EOF {
 				break
 			}
 
-			if len(row) <= spanIDColIdx {
-				continue
-			}
+			for i := 0; i < n; i++ {
+				row := rows[i]
 
-			rowSpanID := row[spanIDColIdx].Uint64()
-			if originalSid, found := spanIDSet[rowSpanID]; found {
-				// Extract attributes
-				attrs := make(map[string]string)
-				for colName, colIdx := range columnNameToIdx {
-					// Skip special columns
-					if colName == "span_id" || colName == "__attr_index" {
-						continue
-					}
+				if len(row) <= spanIDColIdx {
+					continue
+				}
 
-					// Check if this is an attribute column
-					if attrKey, ok := ColumnToAttributeName(colName); ok {
-						if colIdx < len(row) && !row[colIdx].IsNull() {
-							value := row[colIdx].String()
-							attrs[attrKey] = value
+				rowSpanID := row[spanIDColIdx].Uint64()
+				if originalSid, found := spanIDSet[rowSpanID]; found {
+					// Extract attributes
+					attrs := make(map[string]string)
+					for colName, colIdx := range columnNameToIdx {
+						// Skip special columns
+						if colName == "span_id" || colName == "__attr_index" {
+							continue
+						}
+
+						// Check if this is an attribute column
+						if attrKey, ok := ColumnToAttributeName(colName); ok {
+							if colIdx < len(row) && !row[colIdx].IsNull() {
+								value := row[colIdx].String()
+								attrs[attrKey] = value
+							}
 						}
 					}
-				}
 
-				if len(attrs) > 0 {
-					result[originalSid] = attrs
+					if len(attrs) > 0 {
+						result[originalSid] = attrs
+					}
 				}
+			}
+
+			if err == io.EOF {
+				break
 			}
 		}
 	}
@@ -622,8 +636,6 @@ func GetAttributesBatch(dir string, spanIDs []string) (map[string]map[string]str
 	return result, nil
 }
 
-// RemoveNullAttributeColumns creates a projection that excludes columns with only null values
-// Similar to Thanos' RemoveNullColumns
 func RemoveNullAttributeColumns(file *parquet.File) *parquet.Schema {
 	g := make(parquet.Group)
 	schema := file.Schema()

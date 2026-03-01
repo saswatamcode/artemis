@@ -141,7 +141,7 @@ func TestIndex_AddSpanAndLookup(t *testing.T) {
 		},
 	}
 
-	idx.AddSpan(sp, 0, 0)
+	idx.AddSpan(sp, 0, 0, nil)
 
 	// Lookup by span ID
 	ref, ok := idx.LookupSpanID("span-1")
@@ -176,9 +176,9 @@ func TestIndex_LookupByTraceID(t *testing.T) {
 		SpanID:  "span-3",
 	}
 
-	idx.AddSpan(sp1, 0, 0)
-	idx.AddSpan(sp2, 0, 1)
-	idx.AddSpan(sp3, 1, 0)
+	idx.AddSpan(sp1, 0, 0, nil)
+	idx.AddSpan(sp2, 0, 1, nil)
+	idx.AddSpan(sp3, 1, 0, nil)
 
 	// Lookup by trace ID
 	trace1Spans := idx.LookupByTraceID("trace-1")
@@ -226,8 +226,8 @@ func TestIndex_TraceIDSerialization(t *testing.T) {
 		Tags:    map[string]string{"env": "prod"},
 	}
 
-	idx.AddSpan(sp1, 0, 0)
-	idx.AddSpan(sp2, 0, 1)
+	idx.AddSpan(sp1, 0, 0, nil)
+	idx.AddSpan(sp2, 0, 1, nil)
 
 	// Serialize
 	serialized := idx.Serialize()
@@ -267,9 +267,9 @@ func TestIndex_LookupByTag(t *testing.T) {
 		},
 	}
 
-	idx.AddSpan(sp1, 0, 0)
-	idx.AddSpan(sp2, 0, 1)
-	idx.AddSpan(sp3, 0, 2)
+	idx.AddSpan(sp1, 0, 0, nil)
+	idx.AddSpan(sp2, 0, 1, nil)
+	idx.AddSpan(sp3, 0, 2, nil)
 
 	// Lookup by tag
 	prodSpans := idx.LookupByTag("env", "prod")
@@ -313,8 +313,8 @@ func TestIndex_Stats(t *testing.T) {
 		},
 	}
 
-	idx.AddSpan(sp1, 0, 0)
-	idx.AddSpan(sp2, 0, 1)
+	idx.AddSpan(sp1, 0, 0, nil)
+	idx.AddSpan(sp2, 0, 1, nil)
 
 	stats = idx.Stats()
 	if stats.TotalSpans != 2 {
@@ -338,7 +338,7 @@ func TestIndex_Clear(t *testing.T) {
 		},
 	}
 
-	idx.AddSpan(sp, 0, 0)
+	idx.AddSpan(sp, 0, 0, nil)
 
 	stats := idx.Stats()
 	if stats.TotalSpans == 0 {
@@ -368,7 +368,7 @@ func TestIndex_Serialization(t *testing.T) {
 			"env": "prod",
 		},
 	}
-	idx.AddSpan(sp, 5, 10)
+	idx.AddSpan(sp, 5, 10, nil)
 
 	// Serialize
 	serialized := idx.Serialize()
@@ -404,7 +404,7 @@ func TestIndex_MultipleReferences(t *testing.T) {
 			SpanID: "span-" + string(rune('A'+i)),
 			Tags:   map[string]string{"batch": "1"},
 		}
-		idx.AddSpan(sp, i, i*10)
+		idx.AddSpan(sp, i, i*10, nil)
 	}
 
 	// Verify each span has correct reference
@@ -440,7 +440,7 @@ func BenchmarkIndex_AddSpan(b *testing.B) {
 	}
 
 	for i := 0; b.Loop(); i++ {
-		idx.AddSpan(sp, i, 0)
+		idx.AddSpan(sp, i, 0, nil)
 	}
 }
 
@@ -450,7 +450,7 @@ func BenchmarkIndex_LookupSpanID(b *testing.B) {
 		SpanID: "span-1",
 		Tags:   map[string]string{"key": "value"},
 	}
-	idx.AddSpan(sp, 0, 0)
+	idx.AddSpan(sp, 0, 0, nil)
 
 	for b.Loop() {
 		idx.LookupSpanID("span-1")
@@ -464,7 +464,7 @@ func BenchmarkIndex_LookupByTag(b *testing.B) {
 			SpanID: "span-" + string(rune(i)),
 			Tags:   map[string]string{"env": "prod"},
 		}
-		idx.AddSpan(sp, i, 0)
+		idx.AddSpan(sp, i, 0, nil)
 	}
 
 	for b.Loop() {

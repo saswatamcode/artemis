@@ -284,9 +284,9 @@ func (c *Compactor) buildIndex(spans []*span.Span) *index.Index {
 
 	const rowGroupSize = 1024
 	for i, sp := range spans {
-		recordIdx := i / rowGroupSize // Which row group
-		rowIdx := i % rowGroupSize    // Row within row group
-		idx.AddSpan(sp, recordIdx, rowIdx)
+		recordIdx := i / rowGroupSize           // Which row group
+		rowIdx := i % rowGroupSize              // Row within row group
+		idx.AddSpan(sp, recordIdx, rowIdx, nil) // No attrRef for in-memory compaction
 	}
 
 	return idx

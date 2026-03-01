@@ -477,7 +477,18 @@ func queryHeadBlock(hb *block.HeadBlock, ms Matchers, timeRange *TimeRange) []*s
 	spans := make([]*span.Span, 0)
 
 	// Get the underlying storage
-	storage := hb.Storage()
+	arrowStorage := hb.Storage()
+
+	// MVCC Snapshot Isolation (Prometheus-style):
+	// 1. Capture snapshot commit sequence (lightweight, releases lock immediately)
+	// 2. Query executes without holding locks
+	// 3. Filter results by snapshot visibility
+	var snapshotSeq uint64
+	var isolation *storage.IsolationCoordinator
+	if ic := hb.IsolationCoordinator(); ic != nil {
+		snapshotSeq = ic.BeginQuery()
+		isolation = ic
+	}
 
 	if hb.HasIndex() && len(ms) > 0 {
 		idx := hb.Index()
@@ -504,6 +515,11 @@ func queryHeadBlock(hb *block.HeadBlock, ms Matchers, timeRange *TimeRange) []*s
 					batchSpans, err := hb.GetSpansBatch(candidateSpanIDs)
 					if err == nil {
 						for _, sp := range batchSpans {
+							// Check MVCC visibility first (fast check using reverse index)
+							if isolation != nil && !isolation.IsVisible(sp.SpanID, snapshotSeq) {
+								continue // Span not visible at query snapshot
+							}
+
 							if ms.Matches(sp) && (timeRange == nil || spanInTimeRange(sp, timeRange)) {
 								spans = append(spans, sp)
 							}
@@ -518,7 +534,7 @@ func queryHeadBlock(hb *block.HeadBlock, ms Matchers, timeRange *TimeRange) []*s
 	// Fall back to full scan using two-phase columnar filtering
 	// Phase 1: Build selection bitmap using columnar access (fast)
 	// Phase 2: Extract only matching spans (avoids unnecessary allocations)
-	records := storage.GetRecords()
+	records := arrowStorage.GetRecords()
 	needTags := matchersNeedTags(ms)
 
 	for _, record := range records {
@@ -534,6 +550,11 @@ func queryHeadBlock(hb *block.HeadBlock, ms Matchers, timeRange *TimeRange) []*s
 			sp, err := extractSpanFromRecordWithOptions(record, row, needTags)
 			if err != nil {
 				continue
+			}
+
+			// Check MVCC visibility (lock-free check using reverse index)
+			if isolation != nil && !isolation.IsVisible(sp.SpanID, snapshotSeq) {
+				continue // Span not visible at query snapshot
 			}
 
 			// Final validation with full matchers (includes tag checks if needed)

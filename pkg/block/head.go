@@ -181,6 +181,12 @@ func (hb *HeadBlock) Storage() *storage.ArrowStorage {
 	return hb.storage
 }
 
+// IsolationCoordinator returns the MVCC isolation coordinator for snapshot isolation.
+// Returns nil if no isolation coordinator is configured (non-transactional mode).
+func (hb *HeadBlock) IsolationCoordinator() *storage.IsolationCoordinator {
+	return hb.storage.GetIsolationCoordinator()
+}
+
 // Flush forces creation of a record from current builder state
 // This ensures all pending spans are visible for queries
 func (hb *HeadBlock) Flush() error {
