@@ -19,6 +19,12 @@ type BlockManager interface {
 	UpdateHeadTimeRange(minTime, maxTime int64)
 }
 
+// WAL interface for write-ahead logging
+type WAL interface {
+	WriteSpan(s *span.Span) (int, error)
+	WriteLink(link *span.SpanLink) (int, error)
+}
+
 // ArrowStorage stores spans in-memory using Apache Arrow columnar format
 type ArrowStorage struct {
 	mu            sync.RWMutex
@@ -33,6 +39,11 @@ type ArrowStorage struct {
 	maxTime       int64        // Maximum timestamp in head block
 	minWALSegment int          // Minimum WAL segment index in head block (-1 if not set)
 	maxWALSegment int          // Maximum WAL segment index in head block (-1 if not set)
+
+	// Transaction dependencies (set via SetTransactionDependencies)
+	isolation   *IsolationCoordinator
+	linkStorage *ArrowLinkStorage
+	wal         WAL
 }
 
 // SpanRecordBuilder builds Arrow records from spans
@@ -285,6 +296,17 @@ func (s *ArrowStorage) AddSpans(spans []*span.Span) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	return s.addSpansLocked(spans)
+}
+
+// addSpansLocked adds multiple spans without acquiring the lock.
+// MUST be called with s.mu held.
+// Used by the Appender interface for transactional ingestion.
+func (s *ArrowStorage) addSpansLocked(spans []*span.Span) error {
+	if len(spans) == 0 {
+		return nil
+	}
+
 	timeRangeChanged := false
 	for _, sp := range spans {
 		if s.addSpanLocked(sp) {
@@ -350,7 +372,7 @@ func (s *ArrowStorage) addSpanLocked(sp *span.Span) bool {
 		currentRowInBuilder = s.builder.currentRowCount - 1
 	}
 
-	s.idx.AddSpan(sp, currentRecordIndex, currentRowInBuilder)
+	s.idx.AddSpan(sp, currentRecordIndex, currentRowInBuilder, nil) // No attrRef for in-memory storage
 	return timeRangeChanged
 }
 
@@ -507,6 +529,12 @@ func (s *ArrowStorage) GetIndex() *index.Index {
 	return s.idx
 }
 
+// GetIsolationCoordinator returns the isolation coordinator for MVCC snapshot isolation.
+// Returns nil if no isolation coordinator is configured (non-transactional mode).
+func (s *ArrowStorage) GetIsolationCoordinator() *IsolationCoordinator {
+	return s.isolation
+}
+
 // Schema returns the Arrow schema
 func (s *ArrowStorage) Schema() *arrow.Schema {
 	return s.schema
@@ -517,6 +545,38 @@ func (s *ArrowStorage) SetBlockManager(bm BlockManager) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.blockManager = bm
+}
+
+// SetTransactionDependencies configures the dependencies needed for transactional ingestion.
+// Must be called before using BeginTransaction().
+func (s *ArrowStorage) SetTransactionDependencies(
+	isolation *IsolationCoordinator,
+	linkStorage *ArrowLinkStorage,
+	wal WAL,
+) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.isolation = isolation
+	s.linkStorage = linkStorage
+	s.wal = wal
+}
+
+// BeginTransaction creates a new transactional appender for ingesting spans.
+// Each appender represents a single atomic transaction (typically one OTLP batch).
+//
+// Usage:
+//
+//	appender := storage.BeginTransaction()
+//	for _, span := range otlpBatch {
+//	    appender.AddSpan(span)
+//	}
+//	if err := appender.Commit(); err != nil {
+//	    appender.Rollback()
+//	}
+func (s *ArrowStorage) BeginTransaction() Appender {
+	// No locks needed - just creating a new appender
+	// The appender will acquire locks when needed
+	return NewArrowAppender(s.isolation, s, s.linkStorage, s.wal)
 }
 
 // GetTimeRange returns the min and max time of spans in this storage

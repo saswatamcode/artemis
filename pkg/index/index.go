@@ -15,6 +15,14 @@ type SpanRef struct {
 	RowIndex int
 }
 
+// AttrRef is a reference to span attributes in attributes.parquet
+type AttrRef struct {
+	// Row group index in attributes.parquet
+	RecordIndex int
+	// Row index within row group
+	RowIndex int
+}
+
 // Index provides fast lookups for spans
 type Index struct {
 	mu sync.RWMutex
@@ -25,6 +33,9 @@ type Index struct {
 
 	// Span ID -> SpanRef
 	spanIndex map[string]SpanRef
+
+	// Span ID -> AttrRef (NEW: direct row references for attributes.parquet)
+	attrIndex map[string]AttrRef
 
 	// Trace ID -> list of span IDs
 	traceIndex map[string][]string
@@ -43,6 +54,7 @@ func NewIndex() *Index {
 		tagKeys:    NewSymbolTable(),
 		tagValues:  NewSymbolTable(),
 		spanIndex:  make(map[string]SpanRef),
+		attrIndex:  make(map[string]AttrRef),
 		traceIndex: make(map[string][]string),
 		tagIndex:   make(map[string][]string),
 		spanTags:   make(map[string][]string),
@@ -50,7 +62,8 @@ func NewIndex() *Index {
 }
 
 // AddSpan adds a span to the index
-func (idx *Index) AddSpan(s *span.Span, recordIndex, rowIndex int) {
+// attrRef is optional - if provided, enables fast attribute lookups
+func (idx *Index) AddSpan(s *span.Span, recordIndex, rowIndex int, attrRef *AttrRef) {
 	idx.mu.Lock()
 	defer idx.mu.Unlock()
 
@@ -60,6 +73,11 @@ func (idx *Index) AddSpan(s *span.Span, recordIndex, rowIndex int) {
 	}
 
 	idx.spanIndex[s.SpanID] = ref
+
+	// Add attribute reference if provided
+	if attrRef != nil {
+		idx.attrIndex[s.SpanID] = *attrRef
+	}
 
 	// Index by trace ID (critical for trace lookups!)
 	idx.traceIndex[s.TraceID] = append(idx.traceIndex[s.TraceID], s.SpanID)
@@ -89,6 +107,30 @@ func (idx *Index) LookupSpanID(spanID string) (SpanRef, bool) {
 
 	ref, ok := idx.spanIndex[spanID]
 	return ref, ok
+}
+
+// LookupAttrRef returns the attribute reference for a span ID
+func (idx *Index) LookupAttrRef(spanID string) (AttrRef, bool) {
+	idx.mu.RLock()
+	defer idx.mu.RUnlock()
+
+	ref, ok := idx.attrIndex[spanID]
+	return ref, ok
+}
+
+// LookupAttrRefsBatch returns attribute references for multiple span IDs
+// Returns only the refs that exist in the index
+func (idx *Index) LookupAttrRefsBatch(spanIDs []string) map[string]AttrRef {
+	idx.mu.RLock()
+	defer idx.mu.RUnlock()
+
+	result := make(map[string]AttrRef, len(spanIDs))
+	for _, spanID := range spanIDs {
+		if ref, ok := idx.attrIndex[spanID]; ok {
+			result[spanID] = ref
+		}
+	}
+	return result
 }
 
 // LookupByTraceID returns all span IDs for a given trace ID
@@ -165,9 +207,35 @@ func (idx *Index) Clear() {
 	idx.tagKeys = NewSymbolTable()
 	idx.tagValues = NewSymbolTable()
 	idx.spanIndex = make(map[string]SpanRef)
+	idx.attrIndex = make(map[string]AttrRef)
 	idx.traceIndex = make(map[string][]string)
 	idx.tagIndex = make(map[string][]string)
 	idx.spanTags = make(map[string][]string)
+}
+
+// ClearStorageRefs clears only storage references (spanIndex, attrIndex, traceIndex)
+// Preserves tag index and symbol tables for query compatibility
+// Used when converting Arrow block to Parquet block
+func (idx *Index) ClearStorageRefs() {
+	idx.mu.Lock()
+	defer idx.mu.Unlock()
+
+	idx.spanIndex = make(map[string]SpanRef)
+	idx.attrIndex = make(map[string]AttrRef)
+	idx.traceIndex = make(map[string][]string)
+}
+
+// AddSpanRef adds span and trace index entries without processing tags
+// Used when tag index already exists from Arrow storage
+func (idx *Index) AddSpanRef(spanID, traceID string, spanRef SpanRef, attrRef *AttrRef) {
+	idx.mu.Lock()
+	defer idx.mu.Unlock()
+
+	idx.spanIndex[spanID] = spanRef
+	if attrRef != nil {
+		idx.attrIndex[spanID] = *attrRef
+	}
+	idx.traceIndex[traceID] = append(idx.traceIndex[traceID], spanID)
 }
 
 // SerializedIndex is a JSON-serializable version of Index
@@ -175,6 +243,7 @@ type SerializedIndex struct {
 	TagKeys    map[string]uint32   `json:"tag_keys"`
 	TagValues  map[string]uint32   `json:"tag_values"`
 	SpanIndex  map[string]SpanRef  `json:"span_index"`
+	AttrIndex  map[string]AttrRef  `json:"attr_index,omitempty"` // Optional for backward compatibility
 	TraceIndex map[string][]string `json:"trace_index"`
 	TagIndex   map[string][]string `json:"tag_index"`
 	SpanTags   map[string][]string `json:"span_tags"`
@@ -190,6 +259,12 @@ func (idx *Index) Serialize() *SerializedIndex {
 	spanIndexCopy := make(map[string]SpanRef, len(idx.spanIndex))
 	for k, v := range idx.spanIndex {
 		spanIndexCopy[k] = v
+	}
+
+	// Deep copy attrIndex map
+	attrIndexCopy := make(map[string]AttrRef, len(idx.attrIndex))
+	for k, v := range idx.attrIndex {
+		attrIndexCopy[k] = v
 	}
 
 	// Deep copy traceIndex map (including slices)
@@ -220,6 +295,7 @@ func (idx *Index) Serialize() *SerializedIndex {
 		TagKeys:    idx.tagKeys.SerializeToMap(),
 		TagValues:  idx.tagValues.SerializeToMap(),
 		SpanIndex:  spanIndexCopy,
+		AttrIndex:  attrIndexCopy,
 		TraceIndex: traceIndexCopy,
 		TagIndex:   tagIndexCopy,
 		SpanTags:   spanTagsCopy,
@@ -227,11 +303,19 @@ func (idx *Index) Serialize() *SerializedIndex {
 }
 
 // NewIndexFromSerialized creates an index from serialized data
+// Handles backward compatibility for indexes without attrIndex
 func NewIndexFromSerialized(s *SerializedIndex) *Index {
+	// Initialize attrIndex even if it's nil in serialized data (backward compatibility)
+	attrIndex := s.AttrIndex
+	if attrIndex == nil {
+		attrIndex = make(map[string]AttrRef)
+	}
+
 	return &Index{
 		tagKeys:    NewSymbolTableFromMap(s.TagKeys),
 		tagValues:  NewSymbolTableFromMap(s.TagValues),
 		spanIndex:  s.SpanIndex,
+		attrIndex:  attrIndex,
 		traceIndex: s.TraceIndex,
 		tagIndex:   s.TagIndex,
 		spanTags:   s.SpanTags,

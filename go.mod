@@ -9,7 +9,7 @@ require (
 	github.com/efficientgo/e2e v0.14.1-0.20251204144843-44570aa52a90
 	github.com/oklog/run v1.2.0
 	github.com/oklog/ulid/v2 v2.1.1
-	github.com/parquet-go/parquet-go v0.27.1-0.20260126212724-30f6dd3d6952
+	github.com/parquet-go/parquet-go v0.25.1
 	github.com/prometheus/common v0.67.5
 	github.com/spf13/cobra v1.10.2
 	go.opentelemetry.io/proto/otlp v1.9.0
@@ -37,11 +37,8 @@ require (
 	github.com/inconshreveable/mousetrap v1.1.0 // indirect
 	github.com/klauspost/compress v1.18.3 // indirect
 	github.com/klauspost/cpuid/v2 v2.3.0 // indirect
-	github.com/parquet-go/bitpack v1.0.0 // indirect
-	github.com/parquet-go/jsonlite v1.0.0 // indirect
 	github.com/pierrec/lz4/v4 v4.1.25 // indirect
 	github.com/spf13/pflag v1.0.9 // indirect
-	github.com/twpayne/go-geom v1.6.1 // indirect
 	github.com/xhit/go-str2duration/v2 v2.1.0 // indirect
 	github.com/zeebo/xxh3 v1.1.0 // indirect
 	go.opentelemetry.io/otel v1.39.0 // indirect

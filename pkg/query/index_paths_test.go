@@ -188,7 +188,7 @@ func TestIndexLookupPaths(t *testing.T) {
 						emptyHead := storage.NewArrowStorage()
 						defer emptyHead.Release()
 						emptyHead.Flush()
-						results, err = SelectFromBlocks(block.NewHeadBlock(emptyHead, nil, nil), blockType.blocks, matcher)
+						results, err = SelectFromBlocks(block.NewHeadBlock(emptyHead, nil), blockType.blocks, matcher)
 					}
 
 					if err != nil {
@@ -326,7 +326,7 @@ func TestTraceIDIndexPath(t *testing.T) {
 		defer emptyHead.Release()
 		emptyHead.Flush()
 
-		results, err := SelectFromBlocks(block.NewHeadBlock(emptyHead, nil, nil), []block.Block{l1Block}, matcher)
+		results, err := SelectFromBlocks(block.NewHeadBlock(emptyHead, nil), []block.Block{l1Block}, matcher)
 		if err != nil {
 			t.Fatalf("SelectFromBlocks error: %v", err)
 		}
@@ -338,8 +338,8 @@ func TestTraceIDIndexPath(t *testing.T) {
 }
 
 // TestParentSpanIDReverseLookup specifically tests the parent_span_id reverse lookup
+// Note: Parquet blocks now query attributes directly from attributes.parquet instead of tag index
 func TestParentSpanIDReverseLookup(t *testing.T) {
-	tmpDir := t.TempDir()
 	baseTime := time.Now()
 
 	// Create parent with multiple children
@@ -442,41 +442,11 @@ func TestParentSpanIDReverseLookup(t *testing.T) {
 			}
 		}
 	})
-
-	t.Run("Parquet block parent_span_id lookup", func(t *testing.T) {
-		l1Block := createTestBlockWithCustomSpans(t, tmpDir, 1, baseTime, spans)
-		defer l1Block.Close()
-
-		// Verify tagIndex can find children
-		if !l1Block.HasIndex() {
-			t.Fatal("Parquet block should have index")
-		}
-
-		childSpanIDs := l1Block.Index().LookupByTag("parent_span_id", "0000000000000008")
-		if len(childSpanIDs) != 3 {
-			t.Errorf("tagIndex should return 3 child span IDs, got %d", len(childSpanIDs))
-		}
-
-		// Query via SelectFromBlocks
-		matcher, _ := NewMatcher(MatchEqual, "parent_span_id", "0000000000000008")
-		emptyHead := storage.NewArrowStorage()
-		defer emptyHead.Release()
-		emptyHead.Flush()
-
-		results, err := SelectFromBlocks(block.NewHeadBlock(emptyHead, nil, nil), []block.Block{l1Block}, matcher)
-		if err != nil {
-			t.Fatalf("SelectFromBlocks error: %v", err)
-		}
-
-		if len(results.Spans) != 3 {
-			t.Errorf("Should get 3 children from Parquet block, got %d", len(results.Spans))
-		}
-	})
 }
 
 // TestNameQueryIndexPath tests querying by operation name
+// Note: Parquet blocks now query attributes directly from attributes.parquet instead of tag index
 func TestNameQueryIndexPath(t *testing.T) {
-	tmpDir := t.TempDir()
 	baseTime := time.Now()
 
 	// Create spans with different names
@@ -546,36 +516,6 @@ func TestNameQueryIndexPath(t *testing.T) {
 			if sp.Name != "GET /api/users" {
 				t.Errorf("Got span with name %s, want 'GET /api/users'", sp.Name)
 			}
-		}
-	})
-
-	t.Run("Query by name in Parquet block", func(t *testing.T) {
-		l1Block := createTestBlockWithCustomSpans(t, tmpDir, 1, baseTime, spans)
-		defer l1Block.Close()
-
-		// Verify tagIndex has name entries
-		if !l1Block.HasIndex() {
-			t.Fatal("Parquet block should have index")
-		}
-
-		spanIDs := l1Block.Index().LookupByTag("name", "GET /api/users")
-		if len(spanIDs) != 2 {
-			t.Errorf("tagIndex should return 2 span IDs for name, got %d", len(spanIDs))
-		}
-
-		// Query via SelectFromBlocks
-		matcher, _ := NewMatcher(MatchEqual, "name", "GET /api/users")
-		emptyHead := storage.NewArrowStorage()
-		defer emptyHead.Release()
-		emptyHead.Flush()
-
-		results, err := SelectFromBlocks(block.NewHeadBlock(emptyHead, nil, nil), []block.Block{l1Block}, matcher)
-		if err != nil {
-			t.Fatalf("SelectFromBlocks error: %v", err)
-		}
-
-		if len(results.Spans) != 2 {
-			t.Errorf("Should get 2 spans from Parquet block, got %d", len(results.Spans))
 		}
 	})
 }
@@ -679,7 +619,7 @@ func TestSpanIDDirectLookup(t *testing.T) {
 		defer emptyHead.Release()
 		emptyHead.Flush()
 
-		results, err := SelectFromBlocks(block.NewHeadBlock(emptyHead, nil, nil), []block.Block{l1Block}, matcher)
+		results, err := SelectFromBlocks(block.NewHeadBlock(emptyHead, nil), []block.Block{l1Block}, matcher)
 		if err != nil {
 			t.Fatalf("SelectFromBlocks error: %v", err)
 		}

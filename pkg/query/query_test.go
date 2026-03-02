@@ -9,6 +9,7 @@ import (
 	"github.com/oklog/ulid/v2"
 
 	"github.com/saswatamcode/artemis/pkg/block"
+	"github.com/saswatamcode/artemis/pkg/index"
 	"github.com/saswatamcode/artemis/pkg/span"
 	"github.com/saswatamcode/artemis/pkg/storage"
 )
@@ -310,7 +311,7 @@ func TestSelectFromBlocksWithTimeRange(t *testing.T) {
 	timeRange := NewTimeRange(now.Add(-10*time.Minute), now)
 	matcher, _ := NewMatcher(MatchEqual, "env", "prod")
 
-	results, err := SelectFromBlocksWithTimeRange(block.NewHeadBlock(arrowStorage, nil, nil), nil, timeRange, matcher)
+	results, err := SelectFromBlocksWithTimeRange(block.NewHeadBlock(arrowStorage, nil), nil, timeRange, matcher)
 	if err != nil {
 		t.Fatalf("SelectFromBlocksWithTimeRange() error = %v", err)
 	}
@@ -326,24 +327,56 @@ func TestSelectFromBlocksWithTimeRange(t *testing.T) {
 func TestQuerier(t *testing.T) {
 	tmpDir := t.TempDir()
 
-	headStorage := storage.NewArrowStorage()
+	// Use appender-based setup for proper MVCC support
+	_, headStorage, linkStorage, _ := setupTestStorageWithAppender(t)
 	defer headStorage.Release()
+	defer linkStorage.Release()
 
 	baseTime := time.Now().Add(-2 * time.Hour)
 
+	// Add head spans using appender to ensure MVCC registration
 	headSpans := createTestSpans(t, "head", baseTime.Add(1*time.Hour), 50, "service-head", "prod")
-	for _, sp := range headSpans {
-		headStorage.AddSpan(sp)
-	}
-	headStorage.Flush()
 
-	testBlock := createTestBlockWithCustomSpans(t, tmpDir, 1, baseTime,
-		createTestSpans(t, "block", baseTime, 100, "service-block", "prod"))
+	// Verify head spans have tags
+	for i, sp := range headSpans {
+		if len(sp.Tags) == 0 {
+			t.Fatalf("Head span %d has no tags!", i)
+		}
+		if sp.Tags["env"] != "prod" {
+			t.Fatalf("Head span %d has env=%q, want 'prod'", i, sp.Tags["env"])
+		}
+	}
+
+	if err := addSpansWithAppender(t, headStorage, headSpans); err != nil {
+		t.Fatalf("Failed to add head spans: %v", err)
+	}
+
+	// Test with Parquet blocks (level 1)
+	blockSpans := createTestSpans(t, "block", baseTime, 100, "service-block", "prod")
+
+	// Verify block spans have tags and unique span IDs
+	spanIDSet := make(map[string]bool)
+	for i, sp := range blockSpans {
+		if len(sp.Tags) == 0 {
+			t.Fatalf("Block span %d has no tags!", i)
+		}
+		if sp.Tags["env"] != "prod" {
+			t.Fatalf("Block span %d has env=%q, want 'prod'", i, sp.Tags["env"])
+		}
+		if spanIDSet[sp.SpanID] {
+			t.Fatalf("Duplicate span ID at index %d: %s", i, sp.SpanID)
+		}
+		spanIDSet[sp.SpanID] = true
+	}
+
+	testBlock := createTestBlockWithCustomSpans(t, tmpDir, 1, baseTime, blockSpans)
 	defer testBlock.Close()
 
-	querier := NewBlockQuerier(block.NewHeadBlock(headStorage, nil, nil), []Block{testBlock})
+	// HeadBlock gets isolation coordinator from storage (set via SetTransactionDependencies)
+	querier := NewBlockQuerier(block.NewHeadBlock(headStorage, linkStorage), []Block{testBlock})
 
 	matcher, _ := NewMatcher(MatchEqual, "env", "prod")
+
 	results, err := querier.Select(matcher)
 	if err != nil {
 		t.Fatalf("Querier.Select() error = %v", err)
@@ -384,17 +417,20 @@ func Benchmark_Select(b *testing.B) {
 func TestSelectFromMixedBlocks(t *testing.T) {
 	tmpDir := t.TempDir()
 
-	headStorage := storage.NewArrowStorage()
+	// Use appender-based setup for proper MVCC support
+	_, headStorage, linkStorage, _ := setupTestStorageWithAppender(t)
 	defer headStorage.Release()
+	defer linkStorage.Release()
 
 	baseTime := time.Now().Add(-3 * time.Hour)
 
+	// Add head spans using appender to ensure MVCC registration
 	headSpans := createTestSpans(t, "head", baseTime.Add(2*time.Hour), 50, "service-head", "prod")
-	for _, sp := range headSpans {
-		headStorage.AddSpan(sp)
+	if err := addSpansWithAppender(t, headStorage, headSpans); err != nil {
+		t.Fatalf("Failed to add head spans: %v", err)
 	}
-	headStorage.Flush()
 
+	// Test with actual L0 (Arrow) and L1 (Parquet) blocks
 	l0Block := createTestBlockWithCustomSpans(t, tmpDir, 0, baseTime.Add(1*time.Hour),
 		createTestSpans(t, "l0", baseTime.Add(1*time.Hour), 100, "service-l0", "prod"))
 	defer l0Block.Close()
@@ -406,7 +442,8 @@ func TestSelectFromMixedBlocks(t *testing.T) {
 	blocks := []Block{l0Block, l1Block}
 
 	matcher, _ := NewMatcher(MatchEqual, "env", "prod")
-	results, err := SelectFromBlocks(block.NewHeadBlock(headStorage, nil, nil), blocks, matcher)
+	// HeadBlock gets isolation coordinator from storage (set via SetTransactionDependencies)
+	results, err := SelectFromBlocks(block.NewHeadBlock(headStorage, linkStorage), blocks, matcher)
 	if err != nil {
 		t.Fatalf("SelectFromBlocks() error = %v", err)
 	}
@@ -444,7 +481,7 @@ func TestSelectFromMixedBlocksWithTimeRange(t *testing.T) {
 	timeRange := NewTimeRange(baseTime.Add(2*time.Hour), baseTime.Add(3*time.Hour))
 	matcher, _ := NewMatcher(MatchEqual, "env", "prod")
 
-	results, err := SelectFromBlocksWithTimeRange(block.NewHeadBlock(headStorage, nil, nil), blocks, timeRange, matcher)
+	results, err := SelectFromBlocksWithTimeRange(block.NewHeadBlock(headStorage, nil), blocks, timeRange, matcher)
 	if err != nil {
 		t.Fatalf("SelectFromBlocksWithTimeRange() error = %v", err)
 	}
@@ -455,6 +492,63 @@ func TestSelectFromMixedBlocksWithTimeRange(t *testing.T) {
 }
 
 // Helper functions
+
+// mockWAL implements the WAL interface for testing
+type mockWAL struct {
+	spans []*span.Span
+	links []*span.SpanLink
+}
+
+func newMockWAL() *mockWAL {
+	return &mockWAL{
+		spans: make([]*span.Span, 0),
+		links: make([]*span.SpanLink, 0),
+	}
+}
+
+func (m *mockWAL) WriteSpan(s *span.Span) (int, error) {
+	m.spans = append(m.spans, s)
+	return 1, nil
+}
+
+func (m *mockWAL) WriteLink(link *span.SpanLink) (int, error) {
+	m.links = append(m.links, link)
+	return 1, nil
+}
+
+// setupTestStorageWithAppender creates a properly configured storage with MVCC support
+// This should be used instead of direct AddSpan() to ensure proper transaction semantics
+func setupTestStorageWithAppender(t *testing.T) (*storage.IsolationCoordinator, *storage.ArrowStorage, *storage.ArrowLinkStorage, *mockWAL) {
+	t.Helper()
+
+	isolation := storage.NewIsolationCoordinator()
+	arrowStorage := storage.NewArrowStorage()
+	linkStorage := storage.NewArrowLinkStorage()
+	wal := newMockWAL()
+
+	arrowStorage.SetTransactionDependencies(isolation, linkStorage, wal)
+
+	return isolation, arrowStorage, linkStorage, wal
+}
+
+// addSpansWithAppender is a helper that adds spans using the appender interface
+// This ensures proper MVCC registration and should be used instead of direct AddSpan()
+func addSpansWithAppender(t *testing.T, arrowStorage *storage.ArrowStorage, spans []*span.Span) error {
+	t.Helper()
+
+	appender := arrowStorage.BeginTransaction()
+	for _, sp := range spans {
+		if err := appender.AddSpan(sp); err != nil {
+			appender.Rollback()
+			return fmt.Errorf("failed to add span: %w", err)
+		}
+	}
+	if err := appender.Commit(); err != nil {
+		return fmt.Errorf("failed to commit: %w", err)
+	}
+	arrowStorage.Flush()
+	return nil
+}
 
 func createTestSpans(t *testing.T, prefix string, baseTime time.Time, count int, serviceName, env string) []*span.Span {
 	t.Helper()
@@ -480,7 +574,7 @@ func createTestSpans(t *testing.T, prefix string, baseTime time.Time, count int,
 			Tags: map[string]string{
 				"env":     env,
 				"version": "2.0",
-				"index":   string(rune(i % 10)),
+				"index":   fmt.Sprintf("%d", i%10), // Use string number instead of rune
 			},
 		}
 	}
@@ -495,14 +589,20 @@ func formatSpanID(id uint64) string {
 func createTestBlockWithCustomSpans(t *testing.T, baseDir string, level int, createdAt time.Time, spans []*span.Span) Block {
 	t.Helper()
 
-	// We need to import the necessary packages
-	// Use storage to write the spans properly
+	// Persisted blocks don't need MVCC, so use direct AddSpan
+	// This avoids issues with tag/attribute handling in the appender path
 	arrowStorage := storage.NewArrowStorage()
 	defer arrowStorage.Release()
 
+	// Add spans directly to storage
+	for _, sp := range spans {
+		arrowStorage.AddSpan(sp)
+	}
+	arrowStorage.Flush()
+
+	// Calculate time range
 	var minTime, maxTime int64
 	for i, sp := range spans {
-		arrowStorage.AddSpan(sp)
 		startNano := sp.StartTime.UnixNano()
 		endNano := sp.EndTime.UnixNano()
 
@@ -518,7 +618,6 @@ func createTestBlockWithCustomSpans(t *testing.T, baseDir string, level int, cre
 			}
 		}
 	}
-	arrowStorage.Flush()
 
 	// Create block metadata
 	blockID := ulid.Make()
@@ -549,7 +648,9 @@ func createTestBlockWithCustomSpans(t *testing.T, baseDir string, level int, cre
 		err = block.FlushBlock(blockDir, meta, arrowStorage.GetRecords(), arrowStorage.Schema(), arrowStorage.GetIndex())
 	} else {
 		// Write as Parquet
-		err = block.WriteParquetBlock(blockDir, meta, spans, arrowStorage.GetIndex())
+		// Use fresh index - WriteParquetBlock will build it properly with attrRefs
+		freshIdx := index.NewIndex()
+		err = block.WriteParquetBlock(blockDir, meta, spans, freshIdx)
 	}
 
 	if err != nil {

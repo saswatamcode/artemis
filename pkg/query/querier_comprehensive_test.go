@@ -34,7 +34,7 @@ func TestFanoutQuerier_SingleQuerier(t *testing.T) {
 	}
 	headStorage.Flush()
 
-	headQuerier := NewHeadBlockQuerier(block.NewHeadBlock(headStorage, nil, nil))
+	headQuerier := NewHeadBlockQuerier(block.NewHeadBlock(headStorage, nil))
 	fanoutQuerier := NewFanoutQuerier(headQuerier)
 
 	result, err := fanoutQuerier.Select()
@@ -72,7 +72,7 @@ func TestFanoutQuerier_MultipleQueriers(t *testing.T) {
 	defer block2.Close()
 
 	// Create queriers
-	headQuerier := NewHeadBlockQuerier(block.NewHeadBlock(headStorage, nil, nil))
+	headQuerier := NewHeadBlockQuerier(block.NewHeadBlock(headStorage, nil))
 	persistedQuerier := NewPersistedBlockQuerier([]block.Block{block1, block2})
 	fanoutQuerier := NewFanoutQuerier(persistedQuerier, headQuerier)
 
@@ -123,7 +123,7 @@ func TestHeadBlockQuerier_EmptyHead(t *testing.T) {
 	defer headStorage.Release()
 	headStorage.Flush()
 
-	querier := NewHeadBlockQuerier(block.NewHeadBlock(headStorage, nil, nil))
+	querier := NewHeadBlockQuerier(block.NewHeadBlock(headStorage, nil))
 
 	result, err := querier.Select()
 	if err != nil {
@@ -177,7 +177,7 @@ func TestHeadBlockQuerier_WithTimeRangeFilter(t *testing.T) {
 	}
 	headStorage.Flush()
 
-	querier := NewHeadBlockQuerier(block.NewHeadBlock(headStorage, nil, nil))
+	querier := NewHeadBlockQuerier(block.NewHeadBlock(headStorage, nil))
 
 	t.Run("time range matches recent span only", func(t *testing.T) {
 		timeRange := NewTimeRange(now.Add(-1*time.Hour), now)
@@ -363,7 +363,7 @@ func TestBlockQuerier_HeadWithoutBlocks(t *testing.T) {
 	}
 	headStorage.Flush()
 
-	querier := NewBlockQuerier(block.NewHeadBlock(headStorage, nil, nil), []block.Block{})
+	querier := NewBlockQuerier(block.NewHeadBlock(headStorage, nil), []block.Block{})
 
 	result, err := querier.Select()
 	if err != nil {
@@ -381,7 +381,7 @@ func TestBlockQuerier_EmptyHeadAndBlocks(t *testing.T) {
 	defer headStorage.Release()
 	headStorage.Flush()
 
-	querier := NewBlockQuerier(block.NewHeadBlock(headStorage, nil, nil), []block.Block{})
+	querier := NewBlockQuerier(block.NewHeadBlock(headStorage, nil), []block.Block{})
 
 	result, err := querier.Select()
 	if err != nil {
@@ -423,7 +423,7 @@ func TestBlockQuerier_ComplexTimeRangeScenarios(t *testing.T) {
 		createTestSpans(t, "b3", baseTime.Add(2*time.Hour), 50, "service", "prod"))
 	defer block3.Close()
 
-	querier := NewBlockQuerier(block.NewHeadBlock(headStorage, nil, nil), []block.Block{block1, block2, block3})
+	querier := NewBlockQuerier(block.NewHeadBlock(headStorage, nil), []block.Block{block1, block2, block3})
 
 	t.Run("query exact block boundary", func(t *testing.T) {
 		// Query 1-2 hours ago window to get block2
@@ -545,7 +545,7 @@ func TestBlockQuerier_MatcherCombinations(t *testing.T) {
 	}
 	headStorage.Flush()
 
-	querier := NewBlockQuerier(block.NewHeadBlock(headStorage, nil, nil), []block.Block{})
+	querier := NewBlockQuerier(block.NewHeadBlock(headStorage, nil), []block.Block{})
 
 	t.Run("single matcher", func(t *testing.T) {
 		matcher, _ := NewMatcher(MatchEqual, "env", "prod")

@@ -17,18 +17,16 @@ import (
 // - Thread-safe: ArrowStorage has internal locking
 // - Active ingestion: Used for real-time span ingestion
 type HeadBlock struct {
-	storage      *storage.ArrowStorage
-	eventStorage *storage.ArrowEventStorage
-	linkStorage  *storage.ArrowLinkStorage
-	meta         *BlockMeta
+	storage     *storage.ArrowStorage
+	linkStorage *storage.ArrowLinkStorage
+	meta        *BlockMeta
 }
 
 // NewHeadBlock creates a new head block wrapper around ArrowStorage
-func NewHeadBlock(storage *storage.ArrowStorage, eventStorage *storage.ArrowEventStorage, linkStorage *storage.ArrowLinkStorage) *HeadBlock {
+func NewHeadBlock(storage *storage.ArrowStorage, linkStorage *storage.ArrowLinkStorage) *HeadBlock {
 	return &HeadBlock{
-		storage:      storage,
-		eventStorage: eventStorage,
-		linkStorage:  linkStorage,
+		storage:     storage,
+		linkStorage: linkStorage,
 	}
 }
 
@@ -171,12 +169,6 @@ func (hb *HeadBlock) GetSpansByTag(tagKey, tagValue string) ([]*span.Span, error
 	return hb.GetSpansBatch(spanIDs)
 }
 
-// GetEventsBatch efficiently retrieves events for multiple span IDs
-// Returns a map of spanID -> []SpanEvent
-func (hb *HeadBlock) GetEventsBatch(spanIDs []string) (map[string][]*span.SpanEvent, error) {
-	return hb.eventStorage.GetEventsBatch(spanIDs)
-}
-
 // GetLinksBatch efficiently retrieves links for multiple span IDs
 // Returns a map of spanID -> []SpanLink
 func (hb *HeadBlock) GetLinksBatch(spanIDs []string) (map[string][]*span.SpanLink, error) {
@@ -187,6 +179,12 @@ func (hb *HeadBlock) GetLinksBatch(spanIDs []string) (map[string][]*span.SpanLin
 // This is useful for write operations (AddSpan, etc.)
 func (hb *HeadBlock) Storage() *storage.ArrowStorage {
 	return hb.storage
+}
+
+// IsolationCoordinator returns the MVCC isolation coordinator for snapshot isolation.
+// Returns nil if no isolation coordinator is configured (non-transactional mode).
+func (hb *HeadBlock) IsolationCoordinator() *storage.IsolationCoordinator {
+	return hb.storage.GetIsolationCoordinator()
 }
 
 // Flush forces creation of a record from current builder state

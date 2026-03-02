@@ -96,49 +96,6 @@ func TestSpan_RootSpan(t *testing.T) {
 	}
 }
 
-func TestSpanEvent_MarshalUnmarshal(t *testing.T) {
-	original := &SpanEvent{
-		SpanID:    "fedcba9876543210",
-		Name:      "test-event",
-		Timestamp: time.Unix(0, 1500000000),
-		Attributes: map[string]string{
-			"attr1": "val1",
-			"attr2": "val2",
-		},
-	}
-
-	// Marshal
-	data, err := original.MarshalBinary()
-	if err != nil {
-		t.Fatalf("MarshalBinary() error = %v", err)
-	}
-
-	// Unmarshal
-	var decoded SpanEvent
-	if err := decoded.UnmarshalBinary(data); err != nil {
-		t.Fatalf("UnmarshalBinary() error = %v", err)
-	}
-
-	// Compare
-	if decoded.SpanID != original.SpanID {
-		t.Errorf("SpanID mismatch: got %q, want %q", decoded.SpanID, original.SpanID)
-	}
-	if decoded.Name != original.Name {
-		t.Errorf("Name mismatch: got %q, want %q", decoded.Name, original.Name)
-	}
-	if !decoded.Timestamp.Equal(original.Timestamp) {
-		t.Errorf("Timestamp mismatch: got %v, want %v", decoded.Timestamp, original.Timestamp)
-	}
-	if len(decoded.Attributes) != len(original.Attributes) {
-		t.Errorf("Attributes length mismatch: got %d, want %d", len(decoded.Attributes), len(original.Attributes))
-	}
-	for k, v := range original.Attributes {
-		if decoded.Attributes[k] != v {
-			t.Errorf("Attribute %q mismatch: got %q, want %q", k, decoded.Attributes[k], v)
-		}
-	}
-}
-
 func TestSpanLink_MarshalUnmarshal(t *testing.T) {
 	original := &SpanLink{
 		SpanID:        "fedcba9876543210",
@@ -263,33 +220,6 @@ func TestSpan_DeterministicEncoding(t *testing.T) {
 		}
 		if data1[i] != data3[i] {
 			t.Errorf("Byte %d differs between encoding #1 and #3: %x vs %x", i, data1[i], data3[i])
-			break
-		}
-	}
-}
-
-func TestSpanEvent_DeterministicEncoding(t *testing.T) {
-	original := &SpanEvent{
-		SpanID:    "fedcba9876543210",
-		Name:      "test-event",
-		Timestamp: time.Unix(0, 1500000000),
-		Attributes: map[string]string{
-			"z_attr": "last",
-			"a_attr": "first",
-			"m_attr": "middle",
-		},
-	}
-
-	data1, _ := original.MarshalBinary()
-	data2, _ := original.MarshalBinary()
-
-	if len(data1) != len(data2) {
-		t.Errorf("Encoded lengths differ: %d vs %d", len(data1), len(data2))
-	}
-
-	for i := range data1 {
-		if data1[i] != data2[i] {
-			t.Errorf("Byte %d differs: %x vs %x", i, data1[i], data2[i])
 			break
 		}
 	}

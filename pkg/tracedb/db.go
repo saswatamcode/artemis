@@ -19,8 +19,8 @@ import (
 type DB struct {
 	wal          *wal.WAL
 	storage      *storage.ArrowStorage
-	eventStorage *storage.ArrowEventStorage // Event storage
-	linkStorage  *storage.ArrowLinkStorage  // Link storage
+	linkStorage  *storage.ArrowLinkStorage     // Link storage
+	isolation    *storage.IsolationCoordinator // Transaction isolation coordinator
 	blockManager *block.Manager
 	compactor    *compactor.Compactor
 	walDir       string
@@ -101,8 +101,8 @@ func New(cfg *Config) (*DB, error) {
 	}
 
 	arrowStorage := storage.NewArrowStorage()
-	eventStorage := storage.NewArrowEventStorage()
 	linkStorage := storage.NewArrowLinkStorage()
+	isolationCoord := storage.NewIsolationCoordinator()
 
 	var blockMgr *block.Manager
 	var comp *compactor.Compactor
@@ -126,8 +126,8 @@ func New(cfg *Config) (*DB, error) {
 	db := &DB{
 		wal:                      walLog,
 		storage:                  arrowStorage,
-		eventStorage:             eventStorage,
 		linkStorage:              linkStorage,
+		isolation:                isolationCoord,
 		blockManager:             blockMgr,
 		compactor:                comp,
 		walDir:                   cfg.WALDir,
@@ -143,6 +143,9 @@ func New(cfg *Config) (*DB, error) {
 		lastRetentionCleanupTime: time.Now(),
 		stopCh:                   make(chan struct{}),
 	}
+
+	// Configure transactional dependencies for ArrowStorage
+	arrowStorage.SetTransactionDependencies(isolationCoord, linkStorage, walLog)
 
 	// Load existing WAL data into Arrow storage with progress tracking
 	logger.Info("replaying wal", "dir", cfg.WALDir)
@@ -199,14 +202,13 @@ func (db *DB) WriteSpan(s *span.Span) error {
 
 // WriteSpans writes multiple spans to the database in bulk
 // This is more efficient than calling WriteSpan repeatedly for batch ingestion
-// First writes to WAL for durability, then adds to in-memory storage
+// Uses transactional Appender for MVCC snapshot isolation and efficient buffer pooling
 func (db *DB) WriteSpans(spans []*span.Span) error {
 	if len(spans) == 0 {
 		return nil
 	}
 
-	// CRITICAL: Check if closed while holding mu lock, then acquire queryMu
-	// This prevents TOCTOU race where Close() runs between check and queryMu acquisition
+	// CRITICAL: Check if closed before starting transaction
 	db.mu.Lock()
 	if db.closed {
 		db.mu.Unlock()
@@ -220,137 +222,41 @@ func (db *DB) WriteSpans(spans []*span.Span) error {
 	db.mu.Unlock() // Release mu now that we have queryMu
 	defer db.queryMu.RUnlock()
 
-	// Track which segments we actually write to
-	segmentSet := make(map[int]bool)
+	// Create new transaction appender via factory method on ArrowStorage
+	// The appender handles:
+	// - Unique transaction ID allocation
+	// - Buffer pooling (sync.Pool)
+	// - appendMutex acquisition (serializes commits)
+	// - WAL-first durability
+	// - MVCC registration
+	appender := db.storage.BeginTransaction()
 
-	// Collect events from all spans
-	var allEvents []*span.SpanEvent
+	// Add all spans to transaction buffer (in-memory, no locks)
 	for _, s := range spans {
-		if len(s.Events) > 0 {
-			// Convert []SpanEvent to []*SpanEvent for WriteEvents
-			for i := range s.Events {
-				allEvents = append(allEvents, &s.Events[i])
-			}
+		if err := appender.AddSpan(s); err != nil {
+			appender.Rollback()
+			return fmt.Errorf("failed to add span to transaction: %w", err)
 		}
-	}
 
-	// Collect links from all spans
-	var allLinks []*span.SpanLink
-	for _, s := range spans {
+		// Add links from this span
 		if len(s.Links) > 0 {
-			// Convert []SpanLink to []*SpanLink for WriteLinks
 			for i := range s.Links {
-				allLinks = append(allLinks, &s.Links[i])
+				if err := appender.AddLink(&s.Links[i]); err != nil {
+					appender.Rollback()
+					return fmt.Errorf("failed to add link to transaction: %w", err)
+				}
 			}
 		}
 	}
 
-	// Write to WAL first for durability (one by one as WAL doesn't have bulk API)
-	// Collect actual segment indices from each write
-	for _, s := range spans {
-		actualSegment, err := db.wal.WriteSpan(s)
-		if err != nil {
-			return fmt.Errorf("failed to write span to WAL: %w", err)
-		}
-		segmentSet[actualSegment] = true
-	}
-
-	// Write events to WAL if we have any
-	if len(allEvents) > 0 {
-		_, err := db.wal.WriteEvents(allEvents)
-		if err != nil {
-			return fmt.Errorf("failed to write events to WAL: %w", err)
-		}
-	}
-
-	// Write links to WAL if we have any
-	if len(allLinks) > 0 {
-		_, err := db.wal.WriteLinks(allLinks)
-		if err != nil {
-			return fmt.Errorf("failed to write links to WAL: %w", err)
-		}
-	}
-
-	// Update WAL segment tracking for all segments that were actually written to
-	// This is precise - we only track segments that contain data
-	for seg := range segmentSet {
-		db.storage.UpdateWALSegment(seg)
-	}
-
-	// Add to in-memory Arrow storage in bulk for better performance
-	if err := db.storage.AddSpans(spans); err != nil {
-		return fmt.Errorf("failed to add spans to storage: %w", err)
-	}
-
-	// Add events to in-memory event storage
-	if len(allEvents) > 0 {
-		if err := db.eventStorage.AddEvents(allEvents); err != nil {
-			return fmt.Errorf("failed to add events to storage: %w", err)
-		}
-	}
-
-	// Add links to in-memory link storage
-	if len(allLinks) > 0 {
-		if err := db.linkStorage.AddLinks(allLinks); err != nil {
-			return fmt.Errorf("failed to add links to storage: %w", err)
-		}
-	}
-
-	return nil
-}
-
-// WriteEvent writes a span event to the database
-// First writes to WAL for durability, then adds to in-memory event storage
-func (db *DB) WriteEvent(e *span.SpanEvent) error {
-	db.mu.Lock()
-	if db.closed {
-		db.mu.Unlock()
-		return fmt.Errorf("database is closed")
-	}
-
-	db.queryMu.RLock()
-	db.mu.Unlock()
-	defer db.queryMu.RUnlock()
-
-	// Write to WAL first for durability
-	_, err := db.wal.WriteEvent(e)
-	if err != nil {
-		return fmt.Errorf("failed to write event to WAL: %w", err)
-	}
-
-	if err := db.eventStorage.AddEvent(e); err != nil {
-		return fmt.Errorf("failed to add event to storage: %w", err)
-	}
-
-	return nil
-}
-
-// WriteEvents writes multiple span events to the database in bulk
-// More efficient than calling WriteEvent repeatedly for batch ingestion
-func (db *DB) WriteEvents(events []*span.SpanEvent) error {
-	if len(events) == 0 {
-		return nil
-	}
-
-	db.mu.Lock()
-	if db.closed {
-		db.mu.Unlock()
-		return fmt.Errorf("database is closed")
-	}
-
-	db.queryMu.RLock()
-	db.mu.Unlock()
-	defer db.queryMu.RUnlock()
-
-	// Write to WAL first for durability
-	_, err := db.wal.WriteEvents(events)
-	if err != nil {
-		return fmt.Errorf("failed to write events to WAL: %w", err)
-	}
-
-	// Add to in-memory Arrow event storage in bulk
-	if err := db.eventStorage.AddEvents(events); err != nil {
-		return fmt.Errorf("failed to add events to storage: %w", err)
+	// Commit transaction atomically
+	// Phase 1: Write to WAL (durability)
+	// Phase 2: Update Arrow storage (performance)
+	// Phase 3: Register with MVCC (snapshot isolation)
+	// Phase 4: Release buffers and locks
+	if err := appender.Commit(); err != nil {
+		appender.Rollback()
+		return fmt.Errorf("failed to commit transaction: %w", err)
 	}
 
 	return nil
@@ -405,14 +311,11 @@ func (db *DB) replayWAL(progressCallback wal.ReplayCallback) error {
 		}
 	}
 
-	// Replay spans, events, and links from WAL
+	// Replay spans and links from WAL
 	var err error
-	err = reader.ReadAllWithEventsAndLinks(
+	err = reader.ReadAllWithLinks(
 		func(s *span.Span) error {
 			return db.storage.AddSpan(s)
-		},
-		func(e *span.SpanEvent) error {
-			return db.eventStorage.AddEvent(e)
 		},
 		func(l *span.SpanLink) error {
 			return db.linkStorage.AddLink(l)
@@ -425,18 +328,14 @@ func (db *DB) replayWAL(progressCallback wal.ReplayCallback) error {
 
 	db.logger.Info("wal replay complete",
 		"span_count", db.storage.RowCount(),
-		"event_count", db.eventStorage.RowCount(),
 		"link_count", db.linkStorage.RowCount())
 
 	return nil
 }
 
-// Flush flushes pending spans, events, and links to Arrow record batches
+// Flush flushes pending spans and links to Arrow record batches
 func (db *DB) Flush() error {
 	if err := db.storage.Flush(); err != nil {
-		return err
-	}
-	if err := db.eventStorage.Flush(); err != nil {
 		return err
 	}
 	return db.linkStorage.Flush()
@@ -588,7 +487,6 @@ func (db *DB) Close() error {
 
 	// Release Arrow storage
 	db.storage.Release()
-	db.eventStorage.Release()
 	db.linkStorage.Release()
 
 	db.logger.Info("database shutdown complete")
@@ -824,14 +722,6 @@ func (db *DB) flushHeadBlock() error {
 	if meta != nil {
 		blockDir := filepath.Join(db.blocksDir, meta.ULID.String())
 
-		// Flush event records to disk if we have any
-		eventRecords := db.eventStorage.GetRecords()
-		if len(eventRecords) > 0 {
-			if err := block.FlushEventsBlock(blockDir, eventRecords, db.eventStorage.Schema()); err != nil {
-				return fmt.Errorf("failed to flush events block: %w", err)
-			}
-		}
-
 		// Flush link records to disk if we have any
 		linkRecords := db.linkStorage.GetRecords()
 		if len(linkRecords) > 0 {
@@ -840,7 +730,7 @@ func (db *DB) flushHeadBlock() error {
 			}
 		}
 
-		// Now add the block to the manager (this loads it with events and links)
+		// Now add the block to the manager (this loads it with links)
 		if err := db.blockManager.AddFlushedBlock(blockDir); err != nil {
 			return fmt.Errorf("failed to add flushed block: %w", err)
 		}
@@ -850,13 +740,11 @@ func (db *DB) flushHeadBlock() error {
 			"min_wal_segment", meta.MinWALSegment,
 			"max_wal_segment", meta.MaxWALSegment,
 			"span_count", meta.SpanCount,
-			"event_count", db.eventStorage.RowCount(),
 			"link_count", db.linkStorage.RowCount(),
 			"level", meta.Level())
 
-		// Reset the head block, event storage, and link storage
+		// Reset the head block and link storage
 		db.storage.Reset()
-		db.eventStorage.Reset()
 		db.linkStorage.Reset()
 	}
 
@@ -889,7 +777,7 @@ func (db *DB) GetQuerier() query.Querier {
 		blocks = db.blockManager.GetBlocks()
 	}
 
-	headBlock := block.NewHeadBlock(db.storage, db.eventStorage, db.linkStorage)
+	headBlock := block.NewHeadBlock(db.storage, db.linkStorage)
 	return query.NewBlockQuerier(headBlock, blocks)
 }
 
@@ -1151,14 +1039,14 @@ func (db *DB) QueryWithLock(fn func(head *storage.ArrowStorage, blocks []block.B
 	return fn(db.storage, blocks)
 }
 
-// QuerySpansWithEvents queries spans and optionally loads their events
-// This is a convenience method that wraps GetQuerier() and handles event loading
-// If includeEvents is true, the Events field on each span will be populated
+// QuerySpansWithLinks queries spans and optionally loads their links
+// This is a convenience method that wraps GetQuerier() and handles link loading
+// If includeLinks is true, the Links field on each span will be populated
 //
-// NOTE: Events and links are automatically populated by GetSpansBatch for
+// NOTE: Links are automatically populated by GetSpansBatch for
 // Arrow and Parquet persisted blocks. For in-memory head block spans, we fetch
-// them separately from eventStorage/linkStorage.
-func (db *DB) QuerySpansWithEvents(includeEvents bool, matchers ...*query.Matcher) ([]*span.Span, error) {
+// them separately from linkStorage.
+func (db *DB) QuerySpansWithLinks(includeLinks bool, matchers ...*query.Matcher) ([]*span.Span, error) {
 	// Get querier and query spans
 	querier := db.GetQuerier()
 	result, err := querier.Select(matchers...)
@@ -1166,22 +1054,15 @@ func (db *DB) QuerySpansWithEvents(includeEvents bool, matchers ...*query.Matche
 		return nil, err
 	}
 
-	// If events are not requested, return spans as-is
-	if !includeEvents {
+	// If links are not requested, return spans as-is
+	if !includeLinks {
 		return result.Spans, nil
 	}
 
-	// Load events and links for spans that don't already have them
+	// Load links for spans that don't already have them
 	// (e.g., spans from in-memory head block)
 	for _, s := range result.Spans {
-		if s != nil && len(s.Events) == 0 && len(s.Links) == 0 {
-			// Fetch events if not already populated
-			events, err := db.GetEventsForSpan(s.SpanID)
-			if err != nil {
-				return nil, fmt.Errorf("failed to load events for span %s: %w", s.SpanID, err)
-			}
-			s.Events = events
-
+		if s != nil && len(s.Links) == 0 {
 			// Fetch links if not already populated
 			links, err := db.GetLinksForSpan(s.SpanID)
 			if err != nil {
@@ -1192,100 +1073,6 @@ func (db *DB) QuerySpansWithEvents(includeEvents bool, matchers ...*query.Matche
 	}
 
 	return result.Spans, nil
-}
-
-// GetEventsForSpan retrieves all events for a specific span
-// Queries both in-memory event storage and persisted blocks
-func (db *DB) GetEventsForSpan(spanID string) ([]span.SpanEvent, error) {
-	db.queryMu.RLock()
-	defer db.queryMu.RUnlock()
-
-	// Flush any pending events to record batches before querying
-	if err := db.eventStorage.Flush(); err != nil {
-		return nil, err
-	}
-
-	// Query in-memory event storage (head)
-	headEvents, err := db.eventStorage.GetEventsBySpanID(spanID)
-	if err != nil {
-		return nil, fmt.Errorf("failed to query head events: %w", err)
-	}
-
-	// Convert pointers to values
-	result := make([]span.SpanEvent, 0, len(headEvents))
-	for _, e := range headEvents {
-		if e != nil {
-			result = append(result, *e)
-		}
-	}
-
-	// Query persisted blocks if block manager is enabled
-	if db.blockManager != nil {
-		blocks := db.blockManager.GetBlocks()
-		for _, blk := range blocks {
-			// Try to get events from this block
-			// ArrowBlock and ParquetBlock both implement GetEventsBySpanID if they have events
-			var blockEvents []*span.SpanEvent
-			var err error
-
-			// Check block type and call appropriate method
-			switch b := blk.(type) {
-			case *block.ArrowBlock:
-				blockEvents, err = b.GetEventsBySpanID(spanID)
-			case *block.ParquetBlock:
-				blockEvents, err = b.GetEventsBySpanID(spanID)
-			default:
-				// Block type doesn't support events, skip
-				continue
-			}
-
-			if err != nil {
-				return nil, fmt.Errorf("failed to query events from block %s: %w", blk.Meta().ULID, err)
-			}
-
-			// Add block events to result
-			for _, e := range blockEvents {
-				if e != nil {
-					result = append(result, *e)
-				}
-			}
-		}
-	}
-
-	return result, nil
-}
-
-// GetEventsForTrace retrieves all events for all spans in a trace
-// Returns a map of spanID -> events
-// This method first queries all spans for the trace, then fetches events for each span
-func (db *DB) GetEventsForTrace(traceID string) (map[string][]span.SpanEvent, error) {
-	// First, find all spans in this trace using the querier
-	matcher, err := query.NewMatcher(query.MatchEqual, "trace_id", traceID)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create matcher: %w", err)
-	}
-
-	querier := db.GetQuerier()
-	result, err := querier.Select(matcher)
-	if err != nil {
-		return nil, fmt.Errorf("failed to query spans for trace: %w", err)
-	}
-
-	// Now fetch events for each span
-	eventsMap := make(map[string][]span.SpanEvent)
-	for _, s := range result.Spans {
-		if s != nil {
-			events, err := db.GetEventsForSpan(s.SpanID)
-			if err != nil {
-				return nil, fmt.Errorf("failed to get events for span %s: %w", s.SpanID, err)
-			}
-			if len(events) > 0 {
-				eventsMap[s.SpanID] = events
-			}
-		}
-	}
-
-	return eventsMap, nil
 }
 
 // GetLinksForSpan retrieves all links for a specific span
