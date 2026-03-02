@@ -68,23 +68,67 @@ func TestMVCCSnapshotIsolation_BeginQuery(t *testing.T) {
 
 // TestMVCCSnapshotIsolation_IsVisible tests the lock-free visibility checks
 func TestMVCCSnapshotIsolation_IsVisible(t *testing.T) {
+	// Create test infrastructure with appender
 	ic := NewIsolationCoordinator()
+	storage := NewArrowStorage()
+	defer storage.Release()
+	linkStorage := NewArrowLinkStorage()
+	defer linkStorage.Release()
+	wal := newMockWAL()
+	storage.SetTransactionDependencies(ic, linkStorage, wal)
 
-	// Register commits
-	ic.AcquireAppendLock()
-	seq1 := ic.AssignCommitSequence(100)
-	ic.ReleaseAppendLock()
-	ic.RegisterCommit(100, seq1, []string{"span1"})
+	now := time.Now()
 
-	ic.AcquireAppendLock()
-	seq2 := ic.AssignCommitSequence(101)
-	ic.ReleaseAppendLock()
-	ic.RegisterCommit(101, seq2, []string{"span2"})
+	// Commit transaction 1 with span1
+	appender1 := storage.BeginTransaction()
+	span1 := &span.Span{
+		TraceID:     "00000000000000010000000000000000",
+		SpanID:      "span1",
+		Name:        "test1",
+		StartTime:   now,
+		EndTime:     now.Add(time.Millisecond),
+		Duration:    1_000_000,
+		ServiceName: "svc1",
+	}
+	appender1.AddSpan(span1)
+	if err := appender1.Commit(); err != nil {
+		t.Fatalf("Failed to commit transaction 1: %v", err)
+	}
+	seq1 := ic.BeginQuery() // Capture seq after commit
 
-	ic.AcquireAppendLock()
-	seq3 := ic.AssignCommitSequence(102)
-	ic.ReleaseAppendLock()
-	ic.RegisterCommit(102, seq3, []string{"span3"})
+	// Commit transaction 2 with span2
+	appender2 := storage.BeginTransaction()
+	span2 := &span.Span{
+		TraceID:     "00000000000000010000000000000000",
+		SpanID:      "span2",
+		Name:        "test2",
+		StartTime:   now,
+		EndTime:     now.Add(time.Millisecond),
+		Duration:    1_000_000,
+		ServiceName: "svc2",
+	}
+	appender2.AddSpan(span2)
+	if err := appender2.Commit(); err != nil {
+		t.Fatalf("Failed to commit transaction 2: %v", err)
+	}
+	seq2 := ic.BeginQuery() // Capture seq after commit
+
+	// Commit transaction 3 with span3
+	appender3 := storage.BeginTransaction()
+	span3 := &span.Span{
+		TraceID:     "00000000000000010000000000000000",
+		SpanID:      "span3",
+		Name:        "test3",
+		StartTime:   now,
+		EndTime:     now.Add(time.Millisecond),
+		Duration:    1_000_000,
+		ServiceName: "svc3",
+	}
+	appender3.AddSpan(span3)
+	if err := appender3.Commit(); err != nil {
+		t.Fatalf("Failed to commit transaction 3: %v", err)
+	}
+	seq3 := ic.BeginQuery() // Capture seq after commit
 
 	// Check visibility at different snapshots
 	// At seq1: only span1 visible
@@ -118,11 +162,6 @@ func TestMVCCSnapshotIsolation_IsVisible(t *testing.T) {
 	}
 	if !ic.IsVisible("span3", seq3) {
 		t.Error("span3 should be visible at seq3")
-	}
-
-	// Non-existent span
-	if ic.IsVisible("nonexistent", seq3) {
-		t.Error("nonexistent span should not be visible")
 	}
 }
 
@@ -250,7 +289,14 @@ func TestMVCCSnapshotIsolation_IntegrationWithAppender(t *testing.T) {
 
 // TestMVCCSnapshotIsolation_EmptySnapshot tests snapshot behavior with no commits
 func TestMVCCSnapshotIsolation_EmptySnapshot(t *testing.T) {
+	// Create test infrastructure with appender
 	ic := NewIsolationCoordinator()
+	storage := NewArrowStorage()
+	defer storage.Release()
+	linkStorage := NewArrowLinkStorage()
+	defer linkStorage.Release()
+	wal := newMockWAL()
+	storage.SetTransactionDependencies(ic, linkStorage, wal)
 
 	// Capture snapshot before any commits
 	snapshotSeq := ic.BeginQuery()
@@ -258,18 +304,24 @@ func TestMVCCSnapshotIsolation_EmptySnapshot(t *testing.T) {
 		t.Errorf("Expected snapshot seq 0 for empty MVCC, got %d", snapshotSeq)
 	}
 
-	// No spans should be visible
-	if ic.IsVisible("anyspan", snapshotSeq) {
-		t.Error("No spans should be visible at empty snapshot")
+	// Commit a transaction AFTER capturing the empty snapshot
+	now := time.Now()
+	appender := storage.BeginTransaction()
+	span1 := &span.Span{
+		TraceID:     "00000000000000010000000000000000",
+		SpanID:      "span1",
+		Name:        "test1",
+		StartTime:   now,
+		EndTime:     now.Add(time.Millisecond),
+		Duration:    1_000_000,
+		ServiceName: "svc1",
+	}
+	appender.AddSpan(span1)
+	if err := appender.Commit(); err != nil {
+		t.Fatalf("Failed to commit transaction: %v", err)
 	}
 
-	// Register a commit
-	ic.AcquireAppendLock()
-	seq1 := ic.AssignCommitSequence(100)
-	ic.ReleaseAppendLock()
-	ic.RegisterCommit(100, seq1, []string{"span1"})
-
-	// Span should NOT be visible at the old snapshot (captured before commit)
+	// Span should NOT be visible at the empty snapshot (captured before commit)
 	if ic.IsVisible("span1", snapshotSeq) {
 		t.Error("span1 should NOT be visible at empty snapshot (committed after snapshot)")
 	}

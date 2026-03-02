@@ -18,7 +18,7 @@ import (
 const (
 	parquetAttributesFilename = "attributes.parquet"
 	attrColumnPrefix          = "__attr_"
-	attrIndexColumn           = "__attr_index"
+	attrIndexColumn           = "__attrindex"
 )
 
 // AttributeColumnName converts an attribute key to a column name
@@ -36,9 +36,10 @@ func ColumnToAttributeName(col string) (string, bool) {
 
 // ParquetAttribute represents a row in the attributes table
 // This is a base struct - actual schema is built dynamically with additional columns
+// CRITICAL: __attrindex must NOT match the attribute column prefix to avoid conflicts
 type ParquetAttribute struct {
 	SpanID    uint64 `parquet:"span_id"`
-	AttrIndex []byte `parquet:"__attr_index,optional"`
+	AttrIndex []byte `parquet:"__attrindex,optional"`
 }
 
 // BuildAttributesSchema creates a dynamic Parquet schema based on discovered attribute keys
@@ -181,11 +182,15 @@ func WriteParquetAttributesWithRowMap(dir string, spans []*span.Span) (map[strin
 
 	// Build rows using RowBuilder (Thanos pattern)
 	rows := make([]parquet.Row, 0, len(spansWithAttrs))
-	rowBuilder := parquet.NewRowBuilder(schema)
 
-	// Build column index lookups
-	spanIDColIdx, _ := schema.Lookup("span_id")
-	attrIndexColIdx, _ := schema.Lookup("__attr_index")
+	// CRITICAL FIX: Use schema.Lookup() to get LeafColumn with correct ColumnIndex
+	// Don't use schema.Columns() ordering as it doesn't match RowBuilder's internal ordering
+	spanIDLookup, _ := schema.Lookup("span_id")
+	attrIndexLookup, _ := schema.Lookup("__attrindex")
+
+	spanIDColIdx := spanIDLookup.ColumnIndex
+	attrIndexColIdx := attrIndexLookup.ColumnIndex
+
 	attrColIndices := make(map[string]int)
 	for _, key := range attrKeys {
 		colName := AttributeColumnName(key)
@@ -216,18 +221,20 @@ func WriteParquetAttributesWithRowMap(dir string, spans []*span.Span) (map[strin
 		// Parse span ID
 		spanID, err := span.ParseSpanID(s.SpanID)
 		if err != nil {
-			continue
+			// Don't silently skip - this would cause attributes to be lost
+			return nil, fmt.Errorf("failed to parse span ID %q: %w", s.SpanID, err)
 		}
 
-		rowBuilder.Reset()
+		// Create a fresh RowBuilder for each row to avoid data sharing
+		rowBuilder := parquet.NewRowBuilder(schema)
 
 		// Add span_id (required field)
-		rowBuilder.Add(spanIDColIdx.ColumnIndex, parquet.ValueOf(spanID))
+		rowBuilder.Add(spanIDColIdx, parquet.ValueOf(spanID))
 
-		// Add __attr_index (optional)
+		// Add __attrindex (optional)
 		attrIndex := EncodeAttributeIndex(attrKeys, s.Tags)
 		if attrIndex != nil {
-			rowBuilder.Add(attrIndexColIdx.ColumnIndex, parquet.ValueOf(attrIndex))
+			rowBuilder.Add(attrIndexColIdx, parquet.ValueOf(attrIndex))
 		}
 
 		// Add attribute values (only populated ones!)
@@ -238,8 +245,9 @@ func WriteParquetAttributesWithRowMap(dir string, spans []*span.Span) (map[strin
 		}
 
 		// Append row to buffer
-		var row parquet.Row
-		row = rowBuilder.AppendRow(row[:0])
+		// CRITICAL: Use nil instead of row[:0] to avoid reusing backing arrays
+		// row[:0] keeps the same capacity/backing array, causing data corruption
+		row := rowBuilder.AppendRow(nil)
 
 		// CRITICAL: Make a deep copy of the row to avoid sharing underlying memory
 		// parquet.Row is a slice, and if we don't copy, all rows might share data
@@ -276,6 +284,12 @@ func WriteParquetAttributesWithRowMap(dir string, spans []*span.Span) (map[strin
 	if err != nil {
 		writer.Close()
 		return nil, fmt.Errorf("failed to write rows: %w", err)
+	}
+
+	// CRITICAL: Flush before closing to ensure all rows are written
+	if err := writer.Flush(); err != nil {
+		writer.Close()
+		return nil, fmt.Errorf("failed to flush writer: %w", err)
 	}
 
 	if err := writer.Close(); err != nil {
@@ -362,7 +376,7 @@ func ReadParquetAttributes(dir string) (map[string]map[string]string, error) {
 		attrs := make(map[string]string)
 		for colName, colIdx := range columnNameToIdx {
 			// Skip special columns
-			if colName == "span_id" || colName == "__attr_index" {
+			if colName == "span_id" || colName == "__attrindex" {
 				continue
 			}
 
@@ -452,7 +466,7 @@ func GetAttributesBySpanID(dir string, spanID string) (map[string]string, error)
 			attrs := make(map[string]string)
 			for colName, colIdx := range columnNameToIdx {
 				// Skip special columns
-				if colName == "span_id" || colName == "__attr_index" {
+				if colName == "span_id" || colName == "__attrindex" {
 					continue
 				}
 
@@ -608,7 +622,7 @@ func GetAttributesBatch(dir string, spanIDs []string) (map[string]map[string]str
 					attrs := make(map[string]string)
 					for colName, colIdx := range columnNameToIdx {
 						// Skip special columns
-						if colName == "span_id" || colName == "__attr_index" {
+						if colName == "span_id" || colName == "__attrindex" {
 							continue
 						}
 
@@ -674,7 +688,7 @@ func RemoveNullAttributeColumns(file *parquet.File) *parquet.Schema {
 // This is the PRIMARY optimization for attribute-based queries:
 // 1. Use column projection to read ONLY span_id and the target attribute column
 // 2. Use row group statistics on attribute column to skip non-matching row groups
-// 3. Use __attr_index to skip rows that don't have the attribute at all
+// 3. Use __attrindex to skip rows that don't have the attribute at all
 // 4. Return matching span IDs for fetching from spans.parquet
 func QueryAttributesByKey(dir string, attrKey string, attrValue string) ([]string, error) {
 	attrsPath := filepath.Join(dir, parquetAttributesFilename)
@@ -709,11 +723,14 @@ func QueryAttributesByKey(dir string, attrKey string, attrValue string) ([]strin
 		return nil, nil // Attribute column doesn't exist, no spans have this attribute
 	}
 
-	// Build column name to index mapping
+	// CRITICAL FIX: Use schema.Lookup() to get correct column indices
+	// Build column name to index mapping using Lookup()
 	schemaColumns := schema.Columns()
 	columnNameToIdx := make(map[string]int)
-	for i, col := range schemaColumns {
-		columnNameToIdx[col[0]] = i
+	for _, col := range schemaColumns {
+		if lc, ok := schema.Lookup(col...); ok {
+			columnNameToIdx[col[0]] = lc.ColumnIndex
+		}
 	}
 
 	spanIDColIdx, hasSpanID := columnNameToIdx["span_id"]
@@ -775,25 +792,31 @@ func QueryAttributesByKey(dir string, attrKey string, attrValue string) ([]strin
 			continue // Skip this entire row group
 		}
 
-		// OPTIMIZATION 2: Read with column projection - ONLY span_id, __attr_index, and target attribute
+		// OPTIMIZATION 2: Read with column projection - ONLY span_id, __attrindex, and target attribute
 		// This avoids reading all other attribute columns
 		reader := parquet.NewRowGroupReader(rg)
 
 		for {
 			row := make(parquet.Row, len(schemaColumns))
-			_, err := reader.ReadRows([]parquet.Row{row})
-			if err == io.EOF {
-				break
-			}
-			if err != nil {
-				break
+			n, err := reader.ReadRows([]parquet.Row{row})
+
+			// CRITICAL FIX: Process the row if n > 0, even if err == io.EOF
+			// The last row in a file returns both the row AND io.EOF
+			if n == 0 {
+				if err == io.EOF {
+					break
+				}
+				if err != nil {
+					break
+				}
+				continue
 			}
 
 			if len(row) <= attrColIdx || len(row) <= spanIDColIdx {
 				continue
 			}
 
-			// OPTIMIZATION 3: Use __attr_index to skip rows that don't have this attribute
+			// OPTIMIZATION 3: Use __attrindex to skip rows that don't have this attribute
 			// Decode the attribute index bitmap
 			if attrIndexColIdx < len(row) && !row[attrIndexColIdx].IsNull() {
 				attrIndexBytes := row[attrIndexColIdx].Bytes()
@@ -816,6 +839,14 @@ func QueryAttributesByKey(dir string, attrKey string, attrValue string) ([]strin
 					spanID := fmt.Sprintf("%016x", spanIDVal)
 					result = append(result, spanID)
 				}
+			}
+
+			// Check for EOF after processing the row
+			if err == io.EOF {
+				break
+			}
+			if err != nil {
+				break
 			}
 		}
 	}
@@ -855,12 +886,15 @@ func QueryAttributesByKeyBatch(dir string, attrFilters map[string]string) (map[s
 	}
 
 	schema := file.Schema()
-	schemaColumns := schema.Columns()
 
-	// Build column name to index mapping
+	// CRITICAL FIX: Use schema.Lookup() to get correct column indices
+	// Build column name to index mapping using Lookup()
+	schemaColumns := schema.Columns()
 	columnNameToIdx := make(map[string]int)
-	for i, col := range schemaColumns {
-		columnNameToIdx[col[0]] = i
+	for _, col := range schemaColumns {
+		if lc, ok := schema.Lookup(col...); ok {
+			columnNameToIdx[col[0]] = lc.ColumnIndex
+		}
 	}
 
 	spanIDColIdx, hasSpanID := columnNameToIdx["span_id"]

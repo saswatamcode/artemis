@@ -402,17 +402,22 @@ func (pb *ParquetBlock) GetAttributesByRefs(attrRefs map[string]index.AttrRef) (
 	}
 
 	schema := file.Schema()
-	schemaColumns := schema.Columns()
 
-	// Build column name to index mapping
-	columnNameToIdx := make(map[string]int)
-	for i, col := range schemaColumns {
-		columnNameToIdx[col[0]] = i
-	}
-
-	spanIDColIdx, hasSpanID := columnNameToIdx["span_id"]
+	// CRITICAL FIX: Use schema.Lookup() to get correct column indices
+	// Don't iterate schemaColumns as order doesn't match RowBuilder's internal ordering
+	spanIDLookup, hasSpanID := schema.Lookup("span_id")
 	if !hasSpanID {
 		return nil, fmt.Errorf("attributes file missing span_id column")
+	}
+	spanIDColIdx := spanIDLookup.ColumnIndex
+
+	// Build column name to index mapping using Lookup()
+	schemaColumns := schema.Columns()
+	columnNameToIdx := make(map[string]int)
+	for _, col := range schemaColumns {
+		if lc, ok := schema.Lookup(col...); ok {
+			columnNameToIdx[col[0]] = lc.ColumnIndex
+		}
 	}
 
 	// Group refs by row group for efficient reading
