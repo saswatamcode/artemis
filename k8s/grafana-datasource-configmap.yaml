@@ -1,0 +1,42 @@
+---
+# ConfigMap for Grafana datasource provisioning
+# This configures Grafana to use Artemis as both a Jaeger and Tempo datasource
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: grafana-artemis-datasource
+  labels:
+    grafana_datasource: "1"
+data:
+  artemis-datasources.yaml: |
+    apiVersion: 1
+    datasources:
+    - name: Artemis (Jaeger)
+      type: jaeger
+      access: proxy
+      url: http://artemis:16686
+      isDefault: false
+      editable: true
+      jsonData:
+        tracesToLogs:
+          datasourceUid: 'loki'
+        nodeGraph:
+          enabled: true
+
+    - name: Artemis (Tempo)
+      type: tempo
+      access: proxy
+      url: http://artemis:3200
+      isDefault: true
+      editable: true
+      jsonData:
+        tracesToLogs:
+          datasourceUid: 'loki'
+        nodeGraph:
+          enabled: true
+        serviceMap:
+          datasourceUid: 'prometheus'
+        search:
+          hide: false
+        lokiSearch:
+          datasourceUid: 'loki'

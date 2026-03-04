@@ -1,0 +1,308 @@
+---
+# Complete example: Artemis + OTEL Collector + Sample App + Grafana
+# This manifest deploys a full tracing stack for testing
+
+# 1. Artemis (from artemis-statefulset.yaml)
+apiVersion: v1
+kind: Service
+metadata:
+  name: artemis
+  labels:
+    app: artemis
+spec:
+  ports:
+  - name: otlp-grpc
+    port: 4317
+    targetPort: 4317
+  - name: jaeger-http
+    port: 16686
+    targetPort: 16686
+  - name: tempo-http
+    port: 3200
+    targetPort: 3200
+  - name: sql-api
+    port: 5433
+    targetPort: 5433
+  selector:
+    app: artemis
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: artemis-headless
+  labels:
+    app: artemis
+spec:
+  ports:
+  - name: otlp-grpc
+    port: 4317
+  - name: jaeger-http
+    port: 16686
+  - name: tempo-http
+    port: 3200
+  - name: sql-api
+    port: 5433
+  selector:
+    app: artemis
+  clusterIP: None
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: artemis
+spec:
+  serviceName: artemis-headless
+  replicas: 1
+  selector:
+    matchLabels:
+      app: artemis
+  template:
+    metadata:
+      labels:
+        app: artemis
+    spec:
+      containers:
+      - name: artemis
+        image: artemis:latest
+        imagePullPolicy: IfNotPresent
+        args:
+        - --wal-dir=/data/wal
+        - --blocks-dir=/data/blocks
+        - --log.level=info
+        ports:
+        - name: otlp-grpc
+          containerPort: 4317
+        - name: jaeger-http
+          containerPort: 16686
+        - name: tempo-http
+          containerPort: 3200
+        - name: sql-api
+          containerPort: 5433
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: jaeger-http
+          initialDelaySeconds: 10
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: jaeger-http
+          initialDelaySeconds: 5
+          periodSeconds: 5
+        resources:
+          requests:
+            memory: "512Mi"
+            cpu: "250m"
+          limits:
+            memory: "2Gi"
+            cpu: "1000m"
+        volumeMounts:
+        - name: artemis-data
+          mountPath: /data
+  volumeClaimTemplates:
+  - metadata:
+      name: artemis-data
+    spec:
+      accessModes: ["ReadWriteOnce"]
+      resources:
+        requests:
+          storage: 10Gi
+---
+# 2. OpenTelemetry Collector
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: otel-collector-config
+data:
+  config.yaml: |
+    receivers:
+      otlp:
+        protocols:
+          grpc:
+            endpoint: 0.0.0.0:4317
+          http:
+            endpoint: 0.0.0.0:4318
+
+    processors:
+      batch:
+        timeout: 1s
+        send_batch_size: 1024
+
+    exporters:
+      otlp:
+        endpoint: artemis:4317
+        tls:
+          insecure: true
+      logging:
+        loglevel: debug
+
+    service:
+      pipelines:
+        traces:
+          receivers: [otlp]
+          processors: [batch]
+          exporters: [otlp, logging]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: otel-collector
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: otel-collector
+  template:
+    metadata:
+      labels:
+        app: otel-collector
+    spec:
+      containers:
+      - name: otel-collector
+        image: otel/opentelemetry-collector:0.95.0
+        args: ["--config=/etc/otel-collector.yaml"]
+        ports:
+        - name: otlp-grpc
+          containerPort: 4317
+        - name: otlp-http
+          containerPort: 4318
+        volumeMounts:
+        - name: config
+          mountPath: /etc/otel-collector.yaml
+          subPath: config.yaml
+      volumes:
+      - name: config
+        configMap:
+          name: otel-collector-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: otel-collector
+spec:
+  ports:
+  - name: otlp-grpc
+    port: 4317
+    targetPort: 4317
+  - name: otlp-http
+    port: 4318
+    targetPort: 4318
+  selector:
+    app: otel-collector
+---
+# 3. Telemetrygen - Continuous trace generator
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: telemetrygen
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: telemetrygen
+  template:
+    metadata:
+      labels:
+        app: telemetrygen
+    spec:
+      containers:
+      - name: telemetrygen
+        image: ghcr.io/open-telemetry/opentelemetry-collector-contrib/telemetrygen:latest
+        args:
+        - traces
+        - --otlp-endpoint=otel-collector:4317
+        - --otlp-insecure
+        - --rate=5
+        - --duration=inf
+        - --service=demo-service
+        - --child-spans=5
+        - --status-code=2
+        - --span-duration=123ms
+        resources:
+          requests:
+            memory: "64Mi"
+            cpu: "50m"
+          limits:
+            memory: "128Mi"
+            cpu: "100m"
+---
+# 4. Grafana with Artemis datasource
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: grafana-datasources
+data:
+  artemis.yaml: |
+    apiVersion: 1
+    datasources:
+    - name: Artemis (Jaeger)
+      type: jaeger
+      access: proxy
+      url: http://artemis:16686
+      isDefault: false
+      editable: true
+
+    - name: Artemis (Tempo)
+      type: tempo
+      access: proxy
+      url: http://artemis:3200
+      isDefault: true
+      editable: true
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: grafana
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: grafana
+  template:
+    metadata:
+      labels:
+        app: grafana
+    spec:
+      containers:
+      - name: grafana
+        image: grafana/grafana:10.2.3
+        ports:
+        - name: http
+          containerPort: 3000
+        env:
+        - name: GF_AUTH_ANONYMOUS_ENABLED
+          value: "true"
+        - name: GF_AUTH_ANONYMOUS_ORG_ROLE
+          value: "Admin"
+        - name: GF_AUTH_DISABLE_LOGIN_FORM
+          value: "false"
+        - name: GF_SECURITY_ADMIN_PASSWORD
+          value: "admin"
+        volumeMounts:
+        - name: datasources
+          mountPath: /etc/grafana/provisioning/datasources
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "100m"
+          limits:
+            memory: "512Mi"
+            cpu: "500m"
+      volumes:
+      - name: datasources
+        configMap:
+          name: grafana-datasources
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: grafana
+spec:
+  type: LoadBalancer
+  ports:
+  - name: http
+    port: 3000
+    targetPort: 3000
+  selector:
+    app: grafana

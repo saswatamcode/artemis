@@ -5,10 +5,13 @@ import (
 	"fmt"
 	"log"
 	"log/slog"
+	"net/http"
+	"net/http/pprof"
 	"os"
 	"syscall"
 	"time"
 
+	"github.com/felixge/fgprof"
 	"github.com/oklog/run"
 	"github.com/prometheus/common/promslog"
 	psflag "github.com/prometheus/common/promslog/flag"
@@ -48,10 +51,11 @@ var (
 	minBlocks1   int
 
 	// Server address flags
-	otlpAddr   string
-	jaegerAddr string
-	tempoAddr  string
-	sqlAPIAddr string
+	otlpAddr    string
+	jaegerAddr  string
+	tempoAddr   string
+	sqlAPIAddr  string
+	profileAddr string
 
 	// Logging flags
 	logLevelStr  string
@@ -112,6 +116,7 @@ func init() {
 	rootCmd.Flags().StringVar(&jaegerAddr, "jaeger-addr", ":16686", "HTTP API (Jaeger) address")
 	rootCmd.Flags().StringVar(&tempoAddr, "tempo-addr", ":3200", "Tempo API address")
 	rootCmd.Flags().StringVar(&sqlAPIAddr, "sqlapi-addr", ":5433", "SQL API address")
+	rootCmd.Flags().StringVar(&profileAddr, "profile-addr", ":6060", "pprof profiling server address; empty disables")
 
 	// Logging flags
 	rootCmd.Flags().StringVar(&logLevelStr, "log.level", "info", psflag.LevelFlagHelp)
@@ -242,6 +247,9 @@ func runServer(cmd *cobra.Command, args []string) error {
 		"sqlapi_query", sqlAPIAddr+"/api/query",
 		"sqlapi_health", sqlAPIAddr+"/health",
 	)
+	if profileAddr != "" {
+		logger.Info("profiling enabled", "addr", profileAddr, "pprof", "http://localhost"+profileAddr+"/debug/pprof/")
+	}
 	logger.Info("press ctrl+c to shutdown")
 
 	// Setup run.Group for coordinated startup/shutdown
@@ -285,6 +293,26 @@ func runServer(cmd *cobra.Command, args []string) error {
 			logger.Error("failed to shutdown sql api server", "error", err)
 		}
 	})
+
+	// Pprof server actor
+	if profileAddr != "" {
+		profileMux := http.NewServeMux()
+		profileMux.HandleFunc("/debug/pprof/", pprof.Index)
+		profileMux.HandleFunc("/debug/pprof/cmdline", pprof.Cmdline)
+		profileMux.HandleFunc("/debug/pprof/profile", pprof.Profile)
+		profileMux.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
+		profileMux.HandleFunc("/debug/pprof/trace", pprof.Trace)
+		profileMux.Handle("/debug/fgprof", fgprof.Handler())
+		profileServer := &http.Server{Addr: profileAddr, Handler: profileMux}
+		g.Add(func() error {
+			logger.Info("starting profiling server", "addr", profileAddr)
+			return profileServer.ListenAndServe()
+		}, func(error) {
+			if err := profileServer.Shutdown(context.Background()); err != nil && err != http.ErrServerClosed {
+				logger.Error("failed to shutdown profiling server", "error", err)
+			}
+		})
+	}
 
 	// Signal handler actor
 	g.Add(run.SignalHandler(context.Background(), syscall.SIGINT, syscall.SIGTERM))

@@ -577,7 +577,9 @@ func FlushBlock(dir string, meta *BlockMeta, records []arrow.RecordBatch, schema
 }
 
 // atomicWriteFile writes data to a file with fsync for durability
-func atomicWriteFile(path string, data []byte) error {
+// AtomicWriteFile writes data to a file atomically with fsync
+// Exported for use by compactor
+func AtomicWriteFile(path string, data []byte) error {
 	f, err := os.Create(path)
 	if err != nil {
 		return err
@@ -591,14 +593,25 @@ func atomicWriteFile(path string, data []byte) error {
 	return f.Sync()
 }
 
-// fsyncDir fsyncs a directory
-func fsyncDir(dir string) error {
+// atomicWriteFile is an internal alias for backwards compatibility
+func atomicWriteFile(path string, data []byte) error {
+	return AtomicWriteFile(path, data)
+}
+
+// FsyncDir fsyncs a directory
+// Exported for use by compactor
+func FsyncDir(dir string) error {
 	d, err := os.Open(dir)
 	if err != nil {
 		return err
 	}
 	defer d.Close()
 	return d.Sync()
+}
+
+// fsyncDir is an internal alias for backwards compatibility
+func fsyncDir(dir string) error {
+	return FsyncDir(dir)
 }
 
 // GetEventsBySpanID retrieves all events for a given span ID from this block

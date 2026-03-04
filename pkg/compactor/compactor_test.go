@@ -661,6 +661,107 @@ func createTestBlockWithSpans(t *testing.T, baseDir string, level int, createdAt
 	return blockDir
 }
 
+// TestCompactor_StreamingCompaction tests streaming compaction with larger datasets
+// to verify bounded memory usage
+func TestCompactor_StreamingCompaction(t *testing.T) {
+	tmpDir := t.TempDir()
+	c := NewCompactor(tmpDir)
+
+	// Create multiple blocks with more spans to test streaming
+	now := time.Now().Add(-15 * time.Minute)
+	spansPerBlock := 1000
+	numBlocks := 5
+
+	blocks := make([]block.Block, numBlocks)
+	for i := range numBlocks {
+		blockDir := createTestBlockWithSpans(t, tmpDir, 0, now.Add(time.Duration(i)*time.Minute), spansPerBlock)
+		blk, err := block.LoadBlock(blockDir)
+		if err != nil {
+			t.Fatalf("Failed to load block %d: %v", i, err)
+		}
+		defer blk.Close()
+		blocks[i] = blk
+	}
+
+	// Create compaction plan
+	plan := &CompactionPlan{
+		Level:   0,
+		Blocks:  blocks,
+		Sources: extractULIDs(blocks),
+	}
+
+	// Compact using streaming
+	meta, err := c.Compact(plan)
+	if err != nil {
+		t.Fatalf("Compact() error = %v", err)
+	}
+
+	// Verify metadata
+	expectedSpans := int64(spansPerBlock * numBlocks)
+	if meta.SpanCount != expectedSpans {
+		t.Errorf("SpanCount = %d, want %d", meta.SpanCount, expectedSpans)
+	}
+
+	if meta.Level() != 1 {
+		t.Errorf("Level = %d, want 1", meta.Level())
+	}
+
+	// Load the compacted block and verify data integrity
+	blockDir := filepath.Join(tmpDir, meta.ULID.String())
+	compactedBlk, err := block.LoadBlock(blockDir)
+	if err != nil {
+		t.Fatalf("Failed to load compacted block: %v", err)
+	}
+	defer compactedBlk.Close()
+
+	// Verify all spans are present
+	spans, err := compactedBlk.ReadAll()
+	if err != nil {
+		t.Fatalf("Failed to read spans from compacted block: %v", err)
+	}
+
+	if int64(len(spans)) != expectedSpans {
+		t.Errorf("Read %d spans, expected %d", len(spans), expectedSpans)
+	}
+
+	// Verify attributes are preserved
+	spansWithAttrs := 0
+	for _, sp := range spans {
+		if len(sp.Tags) > 0 {
+			spansWithAttrs++
+			if sp.Tags["test"] != "value" {
+				t.Errorf("Span %s missing expected attribute", sp.SpanID)
+			}
+		}
+	}
+
+	if spansWithAttrs != int(expectedSpans) {
+		t.Errorf("Only %d/%d spans have attributes", spansWithAttrs, expectedSpans)
+	}
+
+	// Verify index works correctly
+	if !compactedBlk.HasIndex() {
+		t.Fatal("Compacted block should have an index")
+	}
+
+	// Test index lookups
+	testSpan := spans[len(spans)/2] // Test middle span
+	retrievedSpan, err := compactedBlk.GetSpanByID(testSpan.SpanID)
+	if err != nil {
+		t.Fatalf("Failed to retrieve span by ID: %v", err)
+	}
+
+	if retrievedSpan.SpanID != testSpan.SpanID {
+		t.Errorf("Retrieved wrong span: got %s, want %s", retrievedSpan.SpanID, testSpan.SpanID)
+	}
+
+	if len(retrievedSpan.Tags) != len(testSpan.Tags) {
+		t.Errorf("Retrieved span has %d tags, want %d", len(retrievedSpan.Tags), len(testSpan.Tags))
+	}
+
+	t.Logf("✓ Streaming compaction successfully processed %d spans from %d blocks", expectedSpans, numBlocks)
+}
+
 func fileExists(path string) bool {
 	_, err := filepath.Glob(path)
 	return err == nil

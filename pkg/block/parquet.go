@@ -707,10 +707,20 @@ func (pb *ParquetBlock) ScanMetadata(filterFunc func(*ParquetSpanMetadata) bool)
 	defer reader.Close()
 
 	var matches []RowReference
-	batch := make([]ParquetSpanMetadata, 1024) // Read in batches of 1024
+	batch := make([]ParquetSpanMetadata, 4096) // Larger batch = fewer I/O calls
 
 	rowGroups := pb.file.RowGroups()
+
+	// OPTIMIZATION: Pre-compute row group boundaries once
+	// This allows O(1) amortized lookups instead of O(m) per match
+	rowGroupBoundaries := make([]int64, len(rowGroups)+1)
+	rowGroupBoundaries[0] = 0
+	for i, rg := range rowGroups {
+		rowGroupBoundaries[i+1] = rowGroupBoundaries[i] + rg.NumRows()
+	}
+
 	globalRowIdx := int64(0)
+	currentRGIdx := 0 // Track current row group for fast path
 
 	for {
 		n, err := reader.Read(batch)
@@ -720,12 +730,26 @@ func (pb *ParquetBlock) ScanMetadata(filterFunc func(*ParquetSpanMetadata) bool)
 
 		for i := range n {
 			if filterFunc(&batch[i]) {
-				// Find which row group this row belongs to
-				rowGroupIdx, localRowIdx := pb.findRowGroup(globalRowIdx+int64(i), rowGroups)
-				matches = append(matches, RowReference{
-					RowGroupIdx: rowGroupIdx,
-					RowIdx:      localRowIdx,
-				})
+				rowIdx := globalRowIdx + int64(i)
+
+				// FAST PATH: Check if still in current row group (common case)
+				// Avoids binary search for sequential matches
+				if currentRGIdx < len(rowGroups) &&
+					rowIdx >= rowGroupBoundaries[currentRGIdx] &&
+					rowIdx < rowGroupBoundaries[currentRGIdx+1] {
+					matches = append(matches, RowReference{
+						RowGroupIdx: currentRGIdx,
+						RowIdx:      int(rowIdx - rowGroupBoundaries[currentRGIdx]),
+					})
+				} else {
+					// SLOW PATH: Row group changed - use binary search
+					rgIdx := pb.findRowGroupFast(rowIdx, rowGroupBoundaries)
+					currentRGIdx = rgIdx
+					matches = append(matches, RowReference{
+						RowGroupIdx: rgIdx,
+						RowIdx:      int(rowIdx - rowGroupBoundaries[rgIdx]),
+					})
+				}
 			}
 		}
 
@@ -737,6 +761,26 @@ func (pb *ParquetBlock) ScanMetadata(filterFunc func(*ParquetSpanMetadata) bool)
 	}
 
 	return matches, nil
+}
+
+// findRowGroupFast uses binary search on pre-computed boundaries - O(log n)
+func (pb *ParquetBlock) findRowGroupFast(globalRowIdx int64, boundaries []int64) int {
+	// Binary search for the row group
+	left, right := 0, len(boundaries)-2
+
+	for left <= right {
+		mid := (left + right) / 2
+		if globalRowIdx < boundaries[mid] {
+			right = mid - 1
+		} else if globalRowIdx >= boundaries[mid+1] {
+			left = mid + 1
+		} else {
+			return mid
+		}
+	}
+
+	// Fallback to last row group
+	return len(boundaries) - 2
 }
 
 // findRowGroup finds the row group index and local row index for a global row index
@@ -996,8 +1040,9 @@ func (pb *ParquetBlock) scanByTag(tagKey, tagValue string) ([]*span.Span, error)
 	return pb.GetSpansBatch(matchingSpanIDs)
 }
 
-// spanToParquetSpan converts a Span to ParquetSpan
-func spanToParquetSpan(s *span.Span) *ParquetSpan {
+// SpanToParquetSpan converts a Span to ParquetSpan
+// Exported for use by compactor
+func SpanToParquetSpan(s *span.Span) *ParquetSpan {
 	// Parse trace ID into hi/lo components
 	traceIDHi, traceIDLo, err := span.ParseTraceID(s.TraceID)
 	if err != nil {
@@ -1136,7 +1181,7 @@ func WriteParquetBlock(dir string, meta *BlockMeta, spans []*span.Span, idx *ind
 	go func() {
 		parquetSpans := make([]ParquetSpan, len(spans))
 		for i, s := range spans {
-			parquetSpans[i] = *spanToParquetSpan(s)
+			parquetSpans[i] = *SpanToParquetSpan(s)
 		}
 
 		dataPath := filepath.Join(tmpDir, parquetDataFilename)

@@ -650,6 +650,55 @@ func GetAttributesBatch(dir string, spanIDs []string) (map[string]map[string]str
 	return result, nil
 }
 
+// ReadAttributeKeysFromParquet reads attribute keys from parquet schema without loading data
+// This is used during compaction to discover all attribute keys across blocks efficiently
+// Returns sorted list of attribute keys for consistent schema generation
+func ReadAttributeKeysFromParquet(dir string) ([]string, error) {
+	attrsPath := filepath.Join(dir, parquetAttributesFilename)
+
+	// Check if attributes file exists
+	if _, err := os.Stat(attrsPath); os.IsNotExist(err) {
+		return nil, nil // No attributes file
+	}
+
+	f, err := os.Open(attrsPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open attributes parquet file: %w", err)
+	}
+	defer f.Close()
+
+	stat, err := f.Stat()
+	if err != nil {
+		return nil, fmt.Errorf("failed to stat attributes parquet file: %w", err)
+	}
+
+	file, err := parquet.OpenFile(f, stat.Size())
+	if err != nil {
+		return nil, fmt.Errorf("failed to open attributes parquet file: %w", err)
+	}
+
+	// Get schema and extract attribute column names
+	schema := file.Schema()
+	schemaColumns := schema.Columns()
+
+	keys := make([]string, 0)
+	for _, col := range schemaColumns {
+		// Skip special columns
+		if col[0] == "span_id" || col[0] == attrIndexColumn {
+			continue
+		}
+
+		// Extract attribute key from column name
+		if attrKey, ok := ColumnToAttributeName(col[0]); ok {
+			keys = append(keys, attrKey)
+		}
+	}
+
+	// Sort for deterministic schema
+	sort.Strings(keys)
+	return keys, nil
+}
+
 func RemoveNullAttributeColumns(file *parquet.File) *parquet.Schema {
 	g := make(parquet.Group)
 	schema := file.Schema()

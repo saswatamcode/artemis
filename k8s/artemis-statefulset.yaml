@@ -1,0 +1,141 @@
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: artemis
+  labels:
+    app: artemis
+spec:
+  ports:
+  - name: otlp-grpc
+    port: 4317
+    targetPort: 4317
+    protocol: TCP
+  - name: jaeger-http
+    port: 16686
+    targetPort: 16686
+    protocol: TCP
+  - name: tempo-http
+    port: 3200
+    targetPort: 3200
+    protocol: TCP
+  - name: sql-api
+    port: 5433
+    targetPort: 5433
+    protocol: TCP
+  selector:
+    app: artemis
+  type: ClusterIP
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: artemis-headless
+  labels:
+    app: artemis
+spec:
+  ports:
+  - name: otlp-grpc
+    port: 4317
+    targetPort: 4317
+    protocol: TCP
+  - name: jaeger-http
+    port: 16686
+    targetPort: 16686
+    protocol: TCP
+  - name: tempo-http
+    port: 3200
+    targetPort: 3200
+    protocol: TCP
+  - name: sql-api
+    port: 5433
+    targetPort: 5433
+    protocol: TCP
+  selector:
+    app: artemis
+  clusterIP: None
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: artemis
+  labels:
+    app: artemis
+spec:
+  serviceName: artemis-headless
+  replicas: 1
+  selector:
+    matchLabels:
+      app: artemis
+  template:
+    metadata:
+      labels:
+        app: artemis
+    spec:
+      containers:
+      - name: artemis
+        image: artemis:latest
+        imagePullPolicy: IfNotPresent
+        args:
+        - --wal-dir=/data/wal
+        - --blocks-dir=/data/blocks
+        - --otlp-addr=:4317
+        - --jaeger-addr=:16686
+        - --tempo-addr=:3200
+        - --sqlapi-addr=:5433
+        - --log.level=info
+        - --log.format=logfmt
+        - --enable-compaction=true
+        - --enable-retention=false
+        - --compact-interval=10s
+        - --checkpoint-interval=60s
+        - --block-compaction-interval=5m
+        - --max-block-duration=2h
+        - --max-block-spans=1000000
+        ports:
+        - name: otlp-grpc
+          containerPort: 4317
+          protocol: TCP
+        - name: jaeger-http
+          containerPort: 16686
+          protocol: TCP
+        - name: tempo-http
+          containerPort: 3200
+          protocol: TCP
+        - name: sql-api
+          containerPort: 5433
+          protocol: TCP
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: jaeger-http
+          initialDelaySeconds: 10
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 3
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: jaeger-http
+          initialDelaySeconds: 5
+          periodSeconds: 5
+          timeoutSeconds: 3
+          failureThreshold: 2
+        resources:
+          requests:
+            memory: "512Mi"
+            cpu: "250m"
+          limits:
+            memory: "2Gi"
+            cpu: "1000m"
+        volumeMounts:
+        - name: artemis-data
+          mountPath: /data
+  volumeClaimTemplates:
+  - metadata:
+      name: artemis-data
+    spec:
+      accessModes: ["ReadWriteOnce"]
+      resources:
+        requests:
+          storage: 10Gi

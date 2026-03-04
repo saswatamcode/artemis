@@ -6,7 +6,8 @@ require (
 	github.com/apache/arrow-go/v18 v18.5.1
 	github.com/duckdb/duckdb-go/v2 v2.5.5
 	github.com/efficientgo/core v1.0.0-rc.3
-	github.com/efficientgo/e2e v0.14.1-0.20251204144843-44570aa52a90
+	github.com/efficientgo/e2e v0.14.1-0.20260204162810-8c75b1e33ef9
+	github.com/felixge/fgprof v0.9.5
 	github.com/oklog/run v1.2.0
 	github.com/oklog/ulid/v2 v2.1.1
 	github.com/parquet-go/parquet-go v0.25.1
@@ -32,6 +33,7 @@ require (
 	github.com/goccy/go-json v0.10.5 // indirect
 	github.com/google/flatbuffers v25.12.19+incompatible // indirect
 	github.com/google/go-cmp v0.7.0 // indirect
+	github.com/google/pprof v0.0.0-20240227163752-401108e1b7e7 // indirect
 	github.com/google/uuid v1.6.0 // indirect
 	github.com/grpc-ecosystem/grpc-gateway/v2 v2.27.3 // indirect
 	github.com/inconshreveable/mousetrap v1.1.0 // indirect
