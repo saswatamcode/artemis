@@ -19,39 +19,91 @@ export function QueryEditor({
   onExecute,
   height = '40px',
 }: QueryEditorProps) {
-  const { keys: attributeKeys } = useAttributeKeys();
+  const { keys: attributeKeys, loading, error } = useAttributeKeys();
 
-  // Autocomplete function
+  // Debug logging
+  useEffect(() => {
+    console.log('[QueryEditor] Attribute keys:', attributeKeys);
+    console.log('[QueryEditor] Loading:', loading);
+    console.log('[QueryEditor] Error:', error);
+  }, [attributeKeys, loading, error]);
+
+  // Context-aware autocomplete function
   const autocompleteFunction = useCallback(
     (context: CompletionContext) => {
-      const word = context.matchBefore(/\w*/);
+      const line = context.state.doc.lineAt(context.pos);
+      const textBefore = line.text.slice(0, context.pos - line.from);
+
+      console.log('[Autocomplete] Triggered at position:', context.pos);
+      console.log('[Autocomplete] Text before cursor:', textBefore);
+      console.log('[Autocomplete] Available keys:', attributeKeys);
+
+      // Check if we're inside braces {...}
+      const openBraces = (textBefore.match(/{/g) || []).length;
+      const closeBraces = (textBefore.match(/}/g) || []).length;
+      const insideBraces = openBraces > closeBraces;
+
+      // Check if we're after an equals sign (for label values)
+      const afterEquals = /(\w+)\s*=\s*["']?\w*$/.test(textBefore);
+
+      console.log('[Autocomplete] Inside braces:', insideBraces);
+      console.log('[Autocomplete] After equals:', afterEquals);
+
+      // Match current word being typed
+      const word = context.matchBefore(/[\w."-]*/);
       if (!word || (word.from === word.to && !context.explicit)) {
+        console.log('[Autocomplete] No word match, returning null');
         return null;
       }
 
-      const options = attributeKeys.map((key) => ({
-        label: key,
-        type: 'variable',
-      }));
+      let options: Array<{ label: string; type: string; apply?: string }> = [];
 
-      // Add common PromQL functions
-      const functions = [
-        'rate',
-        'sum',
-        'avg',
-        'min',
-        'max',
-        'count',
-        'histogram_quantile',
-        'increase',
-      ].map((fn) => ({
-        label: fn,
-        type: 'function',
-      }));
+      if (insideBraces && !afterEquals) {
+        // Inside braces: suggest label names
+        console.log('[Autocomplete] Suggesting attribute keys');
+        options = attributeKeys.map((key) => ({
+          label: key,
+          type: 'variable',
+          apply: key + '="',
+        }));
+      } else if (insideBraces && afterEquals) {
+        // After equals: suggest label values (would need API call per key)
+        // For now, just show placeholder
+        console.log('[Autocomplete] Suggesting label values placeholder');
+        options = [
+          { label: '"value"', type: 'text' },
+        ];
+      } else {
+        // Outside braces: suggest functions
+        console.log('[Autocomplete] Suggesting functions');
+        const functions = [
+          'rate',
+          'heatmap',
+          'sum',
+          'avg',
+          'min',
+          'max',
+          'count',
+          'histogram_quantile',
+          'increase',
+        ].map((fn) => ({
+          label: fn,
+          type: 'function',
+          apply: fn + '(',
+        }));
+
+        options = functions;
+      }
+
+      console.log('[Autocomplete] Options:', options);
+
+      if (options.length === 0) {
+        return null;
+      }
 
       return {
         from: word.from,
-        options: [...functions, ...options],
+        options,
       };
     },
     [attributeKeys]

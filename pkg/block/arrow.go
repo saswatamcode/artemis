@@ -327,6 +327,10 @@ func (ab *ArrowBlock) GetTraceByID(traceID string) ([]*span.Span, error) {
 	}
 
 	spanIDs := ab.index.LookupByTraceID(traceID)
+	// Fallback to scan if trace not found in index
+	if spanIDs == nil || len(spanIDs) == 0 {
+		return ab.scanByTraceID(traceID)
+	}
 	return ab.GetSpansBatch(spanIDs)
 }
 
@@ -338,6 +342,10 @@ func (ab *ArrowBlock) GetSpansByTag(tagKey, tagValue string) ([]*span.Span, erro
 	}
 
 	spanIDs := ab.index.LookupByTag(tagKey, tagValue)
+	// Fallback to scan if tag not found in index (key/value not in symbol table)
+	if spanIDs == nil || len(spanIDs) == 0 {
+		return ab.scanByTag(tagKey, tagValue)
+	}
 	return ab.GetSpansBatch(spanIDs)
 }
 

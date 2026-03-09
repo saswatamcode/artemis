@@ -91,17 +91,14 @@ export function QueryPanel({ onResultsChange }: QueryPanelProps) {
     // Update the time range in context to show "now"
     setTimeRange(adjustedStart, now);
 
-    // Keep exemplar count low for performance
-    const isHeatmapQuery = state.query.trim().startsWith('heatmap(');
-    const exemplarCount = isHeatmapQuery ? 5 : 3;
-
+    // Request exemplars for trace linking
     const params = {
       query: state.query,
       start: toUnixTimestamp(adjustedStart),
       end: toUnixTimestamp(now),
       step: state.step,
-      exemplars: exemplarCount, // Reduced for better query performance
-      exemplar_strategy: 'slowest' as const, // Default to slowest for debugging
+      exemplars: 2, // Keep low for performance (2 per time step)
+      exemplar_strategy: 'slowest' as const,
     };
 
     queryExecution.execute(params, true);

@@ -11,6 +11,10 @@ spec:
     port: 4317
     targetPort: 4317
     protocol: TCP
+  - name: query-ui
+    port: 8080
+    targetPort: 8080
+    protocol: TCP
   - name: jaeger-http
     port: 16686
     targetPort: 16686
@@ -38,6 +42,10 @@ spec:
   - name: otlp-grpc
     port: 4317
     targetPort: 4317
+    protocol: TCP
+  - name: query-ui
+    port: 8080
+    targetPort: 8080
     protocol: TCP
   - name: jaeger-http
     port: 16686
@@ -80,6 +88,7 @@ spec:
         - --wal-dir=/data/wal
         - --blocks-dir=/data/blocks
         - --otlp-addr=:4317
+        - --queryapi-addr=:8080
         - --jaeger-addr=:16686
         - --tempo-addr=:3200
         - --sqlapi-addr=:5433
@@ -96,6 +105,9 @@ spec:
         - name: otlp-grpc
           containerPort: 4317
           protocol: TCP
+        - name: query-ui
+          containerPort: 8080
+          protocol: TCP
         - name: jaeger-http
           containerPort: 16686
           protocol: TCP
@@ -107,16 +119,16 @@ spec:
           protocol: TCP
         livenessProbe:
           httpGet:
-            path: /health
-            port: jaeger-http
+            path: /api/v1/health
+            port: query-ui
           initialDelaySeconds: 10
           periodSeconds: 10
           timeoutSeconds: 5
           failureThreshold: 3
         readinessProbe:
           httpGet:
-            path: /health
-            port: jaeger-http
+            path: /api/v1/health
+            port: query-ui
           initialDelaySeconds: 5
           periodSeconds: 5
           timeoutSeconds: 3

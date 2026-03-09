@@ -116,6 +116,7 @@ func (s *Server) handleQueryRange(w http.ResponseWriter, r *http.Request) {
 	// For span queries (VectorSelector), convert to time series by counting spans per time step
 	// This enables queries like {name="promqlExec"} to show span counts over time (like Prometheus metrics)
 	if result.Type == engine.ResultTypeSpans {
+		conversionStart := time.Now()
 		s.logger.Debug("Converting span query to time series",
 			slog.Int("span_count", len(result.Spans)))
 
@@ -123,6 +124,10 @@ func (s *Server) handleQueryRange(w http.ResponseWriter, r *http.Request) {
 		matrix := convertSpansToTimeSeries(result.Spans, start, end, stepDuration)
 		result.Type = engine.ResultTypeMatrix
 		result.Matrix = matrix
+
+		s.logger.Debug("Span to timeseries conversion complete",
+			slog.Duration("conversion_duration", time.Since(conversionStart)),
+			slog.Int("series_count", len(matrix)))
 	}
 
 	// Convert to Prometheus-compatible JSON format
@@ -216,14 +221,14 @@ func extractSelector(queryStr string) (string, error) {
 func (s *Server) fetchExemplars(ctx context.Context, selector string, start, end time.Time, step time.Duration, count int, strategy string) (map[int64][]Exemplar, error) {
 	// Query spans ONCE for the entire time range
 	// Keep exemplar fetch lightweight - only get what we need
-	// Limit = count * 50 (reasonable buffer for bucketing)
+	// Limit = count * 30 (buffer for bucketing across time steps)
 	// This prevents slow queries while still providing good exemplar coverage
-	limit := count * 50
-	if limit < 100 {
-		limit = 100 // Minimum
+	limit := count * 30
+	if limit < 50 {
+		limit = 50 // Minimum
 	}
-	if limit > 1000 {
-		limit = 1000 // Hard cap for performance
+	if limit > 500 {
+		limit = 500 // Hard cap for performance (down from 1000)
 	}
 
 	queryStr := selector
@@ -387,22 +392,27 @@ func convertSpansToTimeSeries(spans []*span.Span, start, end time.Time, step tim
 		// Create stable label key
 		labelKey := makeStableLabelKey(labels)
 
-		// Find which time bucket this span belongs to
-		for stepTime := start; stepTime.Before(end) || stepTime.Equal(end); stepTime = stepTime.Add(step) {
-			stepEnd := stepTime.Add(step)
-			if (sp.StartTime.Equal(stepTime) || sp.StartTime.After(stepTime)) && sp.StartTime.Before(stepEnd) {
-				key := seriesKey{
-					labels: labelKey,
-					bucket: stepTime.Unix(),
-				}
-				bucketCounts[key]++
+		// Calculate time bucket directly (O(1) instead of O(steps))
+		// CRITICAL PERFORMANCE FIX: This was O(n*m) before!
+		if sp.StartTime.Before(start) || sp.StartTime.After(end) {
+			continue // Skip spans outside query range
+		}
 
-				// Store label set
-				if _, exists := labelSets[labelKey]; !exists {
-					labelSets[labelKey] = labels
-				}
-				break
-			}
+		// Calculate which step bucket this span falls into
+		offsetNanos := sp.StartTime.Sub(start).Nanoseconds()
+		stepNanos := step.Nanoseconds()
+		bucketIndex := offsetNanos / stepNanos
+		bucketTime := start.Add(time.Duration(bucketIndex) * step)
+
+		key := seriesKey{
+			labels: labelKey,
+			bucket: bucketTime.Unix(),
+		}
+		bucketCounts[key]++
+
+		// Store label set
+		if _, exists := labelSets[labelKey]; !exists {
+			labelSets[labelKey] = labels
 		}
 	}
 

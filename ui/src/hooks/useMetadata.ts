@@ -17,10 +17,13 @@ export function useAttributeKeys(params?: MetadataParams) {
       setError(null);
 
       try {
+        console.log('[useAttributeKeys] Fetching attribute keys with params:', params);
         const response = await fetchAttributeKeys(params, getSignal());
+        console.log('[useAttributeKeys] Received keys:', response.data.attributeKeys);
         setKeys(response.data.attributeKeys);
       } catch (err) {
         if (err instanceof Error && err.name !== 'AbortError') {
+          console.error('[useAttributeKeys] Error fetching keys:', err);
           setError(err);
         }
       } finally {

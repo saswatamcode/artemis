@@ -36,6 +36,8 @@ spec:
   ports:
   - name: otlp-grpc
     port: 4317
+  - name: query-ui
+    port: 8080
   - name: jaeger-http
     port: 16686
   - name: tempo-http
@@ -68,10 +70,13 @@ spec:
         args:
         - --wal-dir=/data/wal
         - --blocks-dir=/data/blocks
+        - --queryapi-addr=:8080
         - --log.level=info
         ports:
         - name: otlp-grpc
           containerPort: 4317
+        - name: query-ui
+          containerPort: 8080
         - name: jaeger-http
           containerPort: 16686
         - name: tempo-http
@@ -80,14 +85,14 @@ spec:
           containerPort: 5433
         livenessProbe:
           httpGet:
-            path: /health
-            port: jaeger-http
+            path: /api/v1/health
+            port: query-ui
           initialDelaySeconds: 10
           periodSeconds: 10
         readinessProbe:
           httpGet:
-            path: /health
-            port: jaeger-http
+            path: /api/v1/health
+            port: query-ui
           initialDelaySeconds: 5
           periodSeconds: 5
         resources:

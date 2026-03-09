@@ -992,6 +992,10 @@ func (pb *ParquetBlock) GetTraceByID(traceID string) ([]*span.Span, error) {
 	}
 
 	spanIDs := pb.index.LookupByTraceID(traceID)
+	// Fallback to scan if trace not found in index
+	if spanIDs == nil || len(spanIDs) == 0 {
+		return pb.scanByTraceID(traceID)
+	}
 	return pb.GetSpansBatch(spanIDs)
 }
 
@@ -1004,6 +1008,10 @@ func (pb *ParquetBlock) GetSpansByTag(tagKey, tagValue string) ([]*span.Span, er
 	}
 
 	spanIDs := pb.index.LookupByTag(tagKey, tagValue)
+	// Fallback to scan if tag not found in index (key/value not in symbol table)
+	if spanIDs == nil || len(spanIDs) == 0 {
+		return pb.scanByTag(tagKey, tagValue)
+	}
 	return pb.GetSpansBatch(spanIDs)
 }
 
