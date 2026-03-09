@@ -192,14 +192,14 @@ func SelectFromBlocksWithTimeRange(head block.Block, blocks []block.Block, timeR
 			}
 		}
 
-		blockSpans := queryBlockWithTimeRange(blk, ms, timeRange)
+		blockSpans := QueryBlockWithTimeRange(blk, ms, timeRange)
 		result.Spans = append(result.Spans, blockSpans...)
 	}
 
 	// Query head block last (most recent data)
 	if head != nil {
 		if timeRange == nil || timeRangeOverlapsBlock(head, timeRange) {
-			headSpans := queryBlockWithTimeRange(head, ms, timeRange)
+			headSpans := QueryBlockWithTimeRange(head, ms, timeRange)
 			result.Spans = append(result.Spans, headSpans...)
 		}
 	}
@@ -298,9 +298,10 @@ func createMetadataFilter(ms Matchers, timeRange *TimeRange) func(*block.Parquet
 	}
 }
 
-// queryBlockWithTimeRange queries a single block with matchers and time range
+// QueryBlockWithTimeRange queries a single block with matchers and time range
 // Works with HeadBlock (in-memory), ArrowBlock (L0), and ParquetBlock (L1+)
-func queryBlockWithTimeRange(blk block.Block, ms Matchers, timeRange *TimeRange) []*span.Span {
+// This is exported for use by the reduced PromQL query engine.
+func QueryBlockWithTimeRange(blk block.Block, ms Matchers, timeRange *TimeRange) []*span.Span {
 	spans := make([]*span.Span, 0)
 
 	// Try HeadBlock first (in-memory)

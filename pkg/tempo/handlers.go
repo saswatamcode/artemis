@@ -3,6 +3,7 @@ package tempo
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"runtime"
@@ -11,6 +12,7 @@ import (
 	"time"
 
 	"github.com/saswatamcode/artemis/pkg/query"
+	"github.com/saswatamcode/artemis/pkg/reduced_promql/engine"
 	"github.com/saswatamcode/artemis/pkg/span"
 	"github.com/saswatamcode/artemis/pkg/tracedb"
 
@@ -21,10 +23,11 @@ import (
 
 // Server provides Tempo-compatible HTTP API for trace queries
 type Server struct {
-	db     *tracedb.DB
-	mux    *http.ServeMux
-	logger *slog.Logger
-	srv    *http.Server
+	db          *tracedb.DB
+	queryEngine *engine.Engine
+	mux         *http.ServeMux
+	logger      *slog.Logger
+	srv         *http.Server
 }
 
 // NewServer creates a new Tempo API server
@@ -33,10 +36,16 @@ func NewServer(db *tracedb.DB, logger *slog.Logger) *Server {
 		logger = slog.Default()
 	}
 
+	// Create query engine once for reuse across all queries
+	// Pass a function that gets blocks dynamically (always queries latest blocks)
+	isolation := db.GetIsolation()
+	queryEngine := engine.NewEngine(db.GetBlocks, isolation)
+
 	s := &Server{
-		db:     db,
-		mux:    http.NewServeMux(),
-		logger: logger,
+		db:          db,
+		queryEngine: queryEngine,
+		mux:         http.NewServeMux(),
+		logger:      logger,
 	}
 
 	s.registerRoutes()
@@ -53,6 +62,13 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("/api/echo", s.handleEcho)
 
 	s.mux.HandleFunc("/api/status/buildinfo", s.handleBuildInfo)
+
+	// Metrics endpoints (Prometheus-compatible)
+	s.mux.HandleFunc("/api/metrics/query_range", s.handleMetricsQueryRange)
+
+	// Prometheus-compatible metrics endpoint (for Grafana)
+	s.mux.HandleFunc("/api/v1/query_range", s.handleMetricsQueryRange)
+	s.mux.HandleFunc("/api/v1/query", s.handleMetricsQuery)
 
 	// Tempo API v2 endpoints (used by Grafana)
 	s.mux.HandleFunc("/api/v2/search/tags", s.handleSearchTags)
@@ -74,8 +90,16 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	s.mux.ServeHTTP(w, r)
 }
 
-// handleSearch searches for traces
+// handleSearch searches for traces using reduced PromQL selectors
 // GET /api/search?q={query}&start={start}&end={end}&limit={limit}
+//
+// Query format: Reduced PromQL SELECTORS ONLY (not functions/aggregations)
+// Examples:
+//   - {service_name="api"}
+//   - {service_name="api", status_code="200"}
+//   - {trace_id="abc123"}
+//
+// For metric queries (rate, histogram_quantile, etc), use /api/metrics/query_range
 func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 
@@ -102,59 +126,57 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	s.logger.Info("Processing search query",
+	s.logger.Info("Processing trace search query",
 		slog.String("query", queryStr),
 		slog.Time("start", start),
 		slog.Time("end", end),
 		slog.Int("limit", limit))
 
-	var matchers []*query.Matcher
-	if queryStr != "" {
-		// Try to parse as TraceQL query (e.g., {resource.service.name=prometheus})
-		// If it fails, treat it as a simple service name
-		parsedMatchers := parseTraceQL(queryStr)
-		if len(parsedMatchers) > 0 {
-			matchers = parsedMatchers
-		} else {
-			// Fallback: treat as simple service name
-			m, _ := query.NewMatcher(query.MatchEqual, "service.name", queryStr)
-			matchers = append(matchers, m)
-		}
+	// If no query provided, default to selecting all spans
+	if queryStr == "" {
+		queryStr = "{}"
 	}
 
-	// Query database
-	timeRange := query.NewTimeRange(start, end)
-	querier := s.db.GetQuerier()
-	result, err := querier.SelectWithTimeRange(timeRange, matchers...)
+	// Execute query using reduced PromQL engine
+	// (engine automatically queries latest blocks on each execution)
+	opts := &engine.QueryOptions{
+		StartTime:   start,
+		EndTime:     end,
+		Context:     r.Context(),
+		UseSnapshot: true,        // Enable MVCC snapshot isolation
+		Limit:       limit * 100, // Request more spans to ensure we get enough traces
+	}
+
+	result, err := s.queryEngine.Execute(queryStr, opts)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		s.logger.Error("Query execution failed",
+			slog.String("query", queryStr),
+			slog.String("error", err.Error()))
+		http.Error(w, "query execution failed: "+err.Error(), http.StatusBadRequest)
 		return
 	}
 
-	blockCount := len(s.db.GetBlocks())
+	s.logger.Debug("Query executed successfully",
+		slog.String("query", queryStr),
+		slog.String("result_type", string(result.Type)),
+		slog.Int("result_count", getResultCount(result)),
+		slog.String("stats", result.Stats.String()))
 
-	traceSpans := make(map[string][]*span.Span)
-	for _, sp := range result.Spans {
-		traceSpans[sp.TraceID] = append(traceSpans[sp.TraceID], sp)
+	// Auto-route based on result type
+	// Grafana's Tempo datasource sends all queries to /api/search, so we need to handle both
+	switch result.Type {
+	case engine.ResultTypeSpans:
+		// Traditional trace search
+		s.handleSpansResult(w, result, limit)
+
+	case engine.ResultTypeVector, engine.ResultTypeMatrix, engine.ResultTypeScalar:
+		// Metric query - return Prometheus format
+		// This happens when Grafana sends rate(), histogram_quantile(), etc. to /api/search
+		s.handleMetricResult(w, result)
+
+	default:
+		http.Error(w, "unsupported result type", http.StatusInternalServerError)
 	}
-
-	traces := ConvertSpansToSearchMetadata(traceSpans)
-
-	if len(traces) > limit {
-		traces = traces[:limit]
-	}
-
-	response := SearchResponse{
-		Traces: traces,
-		Metrics: SearchMetrics{
-			InspectedTraces: len(traceSpans),
-			InspectedBlocks: blockCount + 1, // +1 for head
-			TotalBlocks:     blockCount + 1,
-		},
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(response)
 }
 
 // handleGetTrace retrieves a trace by ID in OTLP format
@@ -384,47 +406,319 @@ func normalizeTagName(tagName string) string {
 	return tagName
 }
 
-// parseTraceQL parses a basic TraceQL query and returns matchers
-// Supports queries like: {resource.service.name=prometheus}
-func parseTraceQL(queryStr string) []*query.Matcher {
-	var matchers []*query.Matcher
-
-	// Remove outer braces if present
-	queryStr = strings.TrimSpace(queryStr)
-	if strings.HasPrefix(queryStr, "{") && strings.HasSuffix(queryStr, "}") {
-		queryStr = queryStr[1 : len(queryStr)-1]
+// handleSpansResult handles span-type query results (trace search)
+func (s *Server) handleSpansResult(w http.ResponseWriter, result *engine.QueryResult, limit int) {
+	// Group spans by trace ID
+	traceSpans := make(map[string][]*span.Span)
+	for _, sp := range result.Spans {
+		traceSpans[sp.TraceID] = append(traceSpans[sp.TraceID], sp)
 	}
 
-	// Split by && for multiple conditions (basic support)
-	conditions := strings.SplitSeq(queryStr, "&&")
+	// Convert to search metadata format
+	traces := ConvertSpansToSearchMetadata(traceSpans)
 
-	for condition := range conditions {
-		condition = strings.TrimSpace(condition)
+	// Apply limit to traces (not spans)
+	if len(traces) > limit {
+		traces = traces[:limit]
+	}
 
-		// Parse key=value or key="value"
-		var key, value string
-		if idx := strings.Index(condition, "="); idx > 0 {
-			key = strings.TrimSpace(condition[:idx])
-			value = strings.TrimSpace(condition[idx+1:])
+	response := SearchResponse{
+		Traces: traces,
+		Metrics: SearchMetrics{
+			InspectedTraces: len(traceSpans),
+			InspectedBlocks: int(result.Stats.BlocksScanned),
+			TotalBlocks:     int(result.Stats.BlocksScanned),
+		},
+	}
 
-			// Remove quotes from value
-			value = strings.Trim(value, "\"'")
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(response)
+}
 
-			// Map TraceQL field names to internal tag names
-			// resource.service.name -> service.name
-			// span.http.method -> http.method
-			// .name -> name
-			key = strings.TrimPrefix(key, ".")
-			key = strings.TrimPrefix(key, "resource.")
-			key = strings.TrimPrefix(key, "span.")
+// handleMetricResult handles metric-type query results (Prometheus-compatible)
+func (s *Server) handleMetricResult(w http.ResponseWriter, result *engine.QueryResult) {
+	// Convert to Prometheus-compatible JSON format
+	response := result.ToPrometheusJSON()
 
-			if m, err := query.NewMatcher(query.MatchEqual, key, value); err == nil {
-				matchers = append(matchers, m)
-			}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(response)
+}
+
+// handleMetricsQueryRange executes metric queries and returns Prometheus-compatible time-series
+// GET /api/metrics/query_range?q={query}&start={start}&end={end}&step={step}
+//
+// Query format: Reduced PromQL (metric functions and aggregations)
+// Examples:
+//   - rate({service_name="api"}[5m])
+//   - histogram_quantile(0.95, {service_name="api"})
+//   - heatmap({service_name="api"})
+//   - sum by (service_name) ({job="app"})
+//
+// Parameters:
+//   - q: The reduced PromQL query (required)
+//   - start: Start time (unix epoch seconds/nanos or RFC3339)
+//   - end: End time (unix epoch seconds/nanos or RFC3339)
+//   - since: Relative time range (e.g., "15m", "1h") - alternative to start/end
+//   - step: Time series granularity (e.g., "15s", "1m") - optional
+//   - exemplars: Max number of exemplars (optional)
+func (s *Server) handleMetricsQueryRange(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+
+	queryStr := q.Get("q")
+	if queryStr == "" {
+		http.Error(w, "query parameter 'q' is required", http.StatusBadRequest)
+		return
+	}
+
+	// Parse time range
+	var start, end time.Time
+	var err error
+
+	// Handle 'since' parameter (relative time)
+	if sinceStr := q.Get("since"); sinceStr != "" {
+		duration, err := time.ParseDuration(sinceStr)
+		if err != nil {
+			http.Error(w, "invalid 'since' duration: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+		end = time.Now()
+		start = end.Add(-duration)
+	} else {
+		// Handle absolute start/end times
+		start, end, err = parseTimeRange(q.Get("start"), q.Get("end"))
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
 		}
 	}
 
-	return matchers
+	// Parse optional step parameter
+	// TODO: Use step for downsampling/aggregation
+	step := q.Get("step")
+	if step == "" {
+		// Default step based on time range
+		step = calculateDefaultStep(start, end)
+	}
+
+	// Parse optional exemplars parameter
+	exemplars := 0
+	if exemplarsStr := q.Get("exemplars"); exemplarsStr != "" {
+		if e, err := strconv.Atoi(exemplarsStr); err == nil {
+			exemplars = e
+		}
+	}
+
+	s.logger.Info("Processing metrics query",
+		slog.String("query", queryStr),
+		slog.Time("start", start),
+		slog.Time("end", end),
+		slog.String("step", step),
+		slog.Int("exemplars", exemplars))
+
+	// Execute query using reduced PromQL engine
+	// (engine automatically queries latest blocks on each execution)
+	opts := &engine.QueryOptions{
+		StartTime:   start,
+		EndTime:     end,
+		Context:     r.Context(),
+		UseSnapshot: true, // Enable MVCC snapshot isolation
+		Limit:       0,    // No limit for metrics queries
+	}
+
+	result, err := s.queryEngine.Execute(queryStr, opts)
+	if err != nil {
+		s.logger.Error("Metrics query execution failed",
+			slog.String("query", queryStr),
+			slog.String("error", err.Error()))
+		http.Error(w, "query execution failed: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	s.logger.Debug("Metrics query executed successfully",
+		slog.String("query", queryStr),
+		slog.String("result_type", string(result.Type)),
+		slog.String("stats", result.Stats.String()))
+
+	// Metrics endpoint should only return metrics (not spans)
+	if result.Type == engine.ResultTypeSpans {
+		http.Error(w, "span queries should use /api/search endpoint", http.StatusBadRequest)
+		return
+	}
+
+	s.handleMetricResult(w, result)
+}
+
+// parseTimeRange parses start and end time parameters
+// Supports:
+//   - Unix epoch seconds (10 digits)
+//   - Unix epoch nanoseconds (19 digits)
+//   - RFC3339 strings
+func parseTimeRange(startStr, endStr string) (time.Time, time.Time, error) {
+	var start, end time.Time
+
+	// Default to last hour if not specified
+	if startStr == "" && endStr == "" {
+		end = time.Now()
+		start = end.Add(-1 * time.Hour)
+		return start, end, nil
+	}
+
+	// Parse start time
+	if startStr != "" {
+		var err error
+		start, err = parseTimestamp(startStr)
+		if err != nil {
+			return time.Time{}, time.Time{}, fmt.Errorf("invalid start time: %w", err)
+		}
+	} else {
+		start = time.Now().Add(-1 * time.Hour)
+	}
+
+	// Parse end time
+	if endStr != "" {
+		var err error
+		end, err = parseTimestamp(endStr)
+		if err != nil {
+			return time.Time{}, time.Time{}, fmt.Errorf("invalid end time: %w", err)
+		}
+	} else {
+		end = time.Now()
+	}
+
+	return start, end, nil
+}
+
+// parseTimestamp parses a timestamp in various formats
+func parseTimestamp(s string) (time.Time, error) {
+	// Try parsing as integer (unix timestamp)
+	if ts, err := strconv.ParseInt(s, 10, 64); err == nil {
+		// Determine if seconds or nanoseconds based on magnitude
+		if ts < 10000000000 {
+			// Seconds (10 digits)
+			return time.Unix(ts, 0), nil
+		}
+		// Nanoseconds (19 digits)
+		return time.Unix(0, ts), nil
+	}
+
+	// Try parsing as RFC3339
+	if t, err := time.Parse(time.RFC3339, s); err == nil {
+		return t, nil
+	}
+
+	// Try parsing as RFC3339Nano
+	if t, err := time.Parse(time.RFC3339Nano, s); err == nil {
+		return t, nil
+	}
+
+	return time.Time{}, fmt.Errorf("invalid timestamp format: %s", s)
+}
+
+// calculateDefaultStep calculates a reasonable default step based on time range
+func calculateDefaultStep(start, end time.Time) string {
+	duration := end.Sub(start)
+
+	switch {
+	case duration <= 5*time.Minute:
+		return "5s"
+	case duration <= 30*time.Minute:
+		return "15s"
+	case duration <= 2*time.Hour:
+		return "30s"
+	case duration <= 6*time.Hour:
+		return "1m"
+	case duration <= 24*time.Hour:
+		return "5m"
+	case duration <= 7*24*time.Hour:
+		return "15m"
+	default:
+		return "1h"
+	}
+}
+
+// handleMetricsQuery executes instant metric queries (single point in time)
+// GET/POST /api/v1/query?query={query}&time={time}
+//
+// This is the Prometheus instant query endpoint, used by Grafana for single-value queries.
+// For range queries, use /api/v1/query_range
+func (s *Server) handleMetricsQuery(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+
+	queryStr := q.Get("query")
+	if queryStr == "" {
+		queryStr = q.Get("q") // Also support 'q' parameter
+	}
+	if queryStr == "" {
+		http.Error(w, "query parameter 'query' or 'q' is required", http.StatusBadRequest)
+		return
+	}
+
+	// Parse evaluation time (default to now)
+	evalTime := time.Now()
+	if timeStr := q.Get("time"); timeStr != "" {
+		if t, err := parseTimestamp(timeStr); err == nil {
+			evalTime = t
+		}
+	}
+
+	// For instant queries, use a narrow time range around the evaluation time
+	// This matches Prometheus behavior
+	start := evalTime.Add(-5 * time.Minute)
+	end := evalTime
+
+	s.logger.Info("Processing instant metrics query",
+		slog.String("query", queryStr),
+		slog.Time("time", evalTime))
+
+	// Execute using the same engine as range queries
+	opts := &engine.QueryOptions{
+		StartTime:   start,
+		EndTime:     end,
+		Context:     r.Context(),
+		UseSnapshot: true,
+		Limit:       0,
+	}
+
+	result, err := s.queryEngine.Execute(queryStr, opts)
+	if err != nil {
+		s.logger.Error("Instant query execution failed",
+			slog.String("query", queryStr),
+			slog.String("error", err.Error()))
+		http.Error(w, "query execution failed: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	s.logger.Debug("Instant query executed successfully",
+		slog.String("query", queryStr),
+		slog.String("result_type", string(result.Type)),
+		slog.String("stats", result.Stats.String()))
+
+	// Instant queries should return metrics (not spans)
+	if result.Type == engine.ResultTypeSpans {
+		http.Error(w, "span queries should use /api/search endpoint", http.StatusBadRequest)
+		return
+	}
+
+	s.handleMetricResult(w, result)
+}
+
+// getResultCount returns the count of results based on result type
+func getResultCount(result *engine.QueryResult) int {
+	switch result.Type {
+	case engine.ResultTypeSpans:
+		return len(result.Spans)
+	case engine.ResultTypeVector:
+		return len(result.Vector)
+	case engine.ResultTypeMatrix:
+		return len(result.Matrix)
+	case engine.ResultTypeScalar:
+		if result.Scalar != nil {
+			return 1
+		}
+		return 0
+	default:
+		return 0
+	}
 }
 
 // Start starts the HTTP server

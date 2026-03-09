@@ -699,6 +699,93 @@ func ReadAttributeKeysFromParquet(dir string) ([]string, error) {
 	return keys, nil
 }
 
+// ReadAttributeValuesFromParquet reads unique values for a specific attribute key
+// Uses column projection to read only the requested attribute column (efficient!)
+// Returns up to limit unique values, sorted
+func ReadAttributeValuesFromParquet(dir string, attrKey string, limit int) ([]string, error) {
+	attrsPath := filepath.Join(dir, parquetAttributesFilename)
+
+	// Check if attributes file exists
+	if _, err := os.Stat(attrsPath); os.IsNotExist(err) {
+		return nil, nil // No attributes file
+	}
+
+	f, err := os.Open(attrsPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open attributes parquet file: %w", err)
+	}
+	defer f.Close()
+
+	stat, err := f.Stat()
+	if err != nil {
+		return nil, fmt.Errorf("failed to stat attributes parquet file: %w", err)
+	}
+
+	file, err := parquet.OpenFile(f, stat.Size())
+	if err != nil {
+		return nil, fmt.Errorf("failed to open attributes parquet file: %w", err)
+	}
+
+	schema := file.Schema()
+	attrColumnName := AttributeColumnName(attrKey)
+
+	// Check if this attribute column exists in the schema
+	_, hasAttrColumn := schema.Lookup(attrColumnName)
+	if !hasAttrColumn {
+		return nil, nil // Attribute column doesn't exist
+	}
+
+	// Build column name to index mapping
+	schemaColumns := schema.Columns()
+	columnNameToIdx := make(map[string]int)
+	for _, col := range schemaColumns {
+		if lc, ok := schema.Lookup(col...); ok {
+			columnNameToIdx[col[0]] = lc.ColumnIndex
+		}
+	}
+
+	attrColIdx, hasAttr := columnNameToIdx[attrColumnName]
+	if !hasAttr {
+		return nil, nil
+	}
+
+	// Read values using column projection (only read the attribute column)
+	reader := parquet.NewReader(file)
+	defer reader.Close()
+
+	valuesSet := make(map[string]bool)
+
+	for {
+		if limit > 0 && len(valuesSet) >= limit {
+			break // Early termination
+		}
+
+		row := make(parquet.Row, len(schemaColumns))
+		_, err := reader.ReadRows([]parquet.Row{row})
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return nil, fmt.Errorf("failed to read attributes row: %w", err)
+		}
+
+		// Extract the attribute value
+		if attrColIdx < len(row) && !row[attrColIdx].IsNull() {
+			value := row[attrColIdx].String()
+			valuesSet[value] = true
+		}
+	}
+
+	// Convert to sorted list
+	values := make([]string, 0, len(valuesSet))
+	for value := range valuesSet {
+		values = append(values, value)
+	}
+	sort.Strings(values)
+
+	return values, nil
+}
+
 func RemoveNullAttributeColumns(file *parquet.File) *parquet.Schema {
 	g := make(parquet.Group)
 	schema := file.Schema()

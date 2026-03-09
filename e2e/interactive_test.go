@@ -17,15 +17,15 @@ import (
 )
 
 // TestArtemisTracingStack is an interactive e2e test that demonstrates the complete tracing pipeline:
-// Telemetrygen + Prometheus (with tracing) -> OTEL Collector -> Artemis -> Grafana
+// Telemetrygen + Prometheus (with tracing) -> OTEL Collector -> Artemis
 //
 // Run with: go test -v ./e2e -run TestArtemisTracingStack -timeout 99m
 //
 // The test will:
-// 1. Build and start all services (Artemis, OTEL Collector, Prometheus, Telemetrygen, Grafana)
+// 1. Build and start all services (Artemis, OTEL Collector, Prometheus, Telemetrygen)
 // 2. Generate traces continuously from both telemetrygen and Prometheus queries
 // 3. Validate the pipeline is working
-// 4. Open Grafana in your browser
+// 4. Open Artemis UI, Prometheus, and pprof in your browser
 // 5. Keep running until you hit the endpoint or press Ctrl+C
 func TestArtemisTracingStack(t *testing.T) {
 	// t.Skip("This is an interactive test, comment this line before running")
@@ -46,8 +46,8 @@ func TestArtemisTracingStack(t *testing.T) {
 	fmt.Println("=== Starting Artemis...")
 	artemis := createArtemis(env)
 	testutil.Ok(t, e2e.StartAndWaitReady(artemis))
-	fmt.Printf("✓ Artemis ready - OTLP: %s, Jaeger API: %s, Tempo API: %s\n",
-		artemis.Endpoint("otlp"), artemis.Endpoint("http"), artemis.Endpoint("tempo"))
+	fmt.Printf("✓ Artemis ready - OTLP: %s, Web UI: %s, Jaeger: %s, Tempo: %s\n",
+		artemis.Endpoint("otlp"), artemis.Endpoint("queryapi"), artemis.Endpoint("http"), artemis.Endpoint("tempo"))
 
 	fmt.Println("=== Starting Prometheus with tracing...")
 	prometheus := createPrometheus(env)
@@ -59,10 +59,11 @@ func TestArtemisTracingStack(t *testing.T) {
 	testutil.Ok(t, telemetrygen.Start())
 	fmt.Println("✓ Telemetrygen running - generating traces continuously (5 traces/sec)")
 
-	fmt.Println("=== Starting Grafana with Artemis datasource...")
-	grafana := createGrafana(env)
-	testutil.Ok(t, e2e.StartAndWaitReady(grafana))
-	fmt.Printf("✓ Grafana ready at %s\n", grafana.Endpoint("http"))
+	// Skip Grafana for now
+	// fmt.Println("=== Starting Grafana with Artemis datasource...")
+	// grafana := createGrafana(env)
+	// testutil.Ok(t, e2e.StartAndWaitReady(grafana))
+	// fmt.Printf("✓ Grafana ready at %s\n", grafana.Endpoint("http"))
 
 	fmt.Println("\n=== Starting query load generator...")
 	// Start generating Prometheus queries to create traces
@@ -114,13 +115,13 @@ func TestArtemisTracingStack(t *testing.T) {
 		fmt.Printf("✓ Found %d trace(s) for service '%s'\n", tracesResp.Total, servicesResp.Data[0])
 	}
 
-	// Verify Grafana is accessible
-	grafanaHealth := fmt.Sprintf("http://%s/api/health", grafana.Endpoint("http"))
-	resp, err = http.Get(grafanaHealth)
-	testutil.Ok(t, err)
-	defer resp.Body.Close()
-	testutil.Equals(t, 200, resp.StatusCode)
-	fmt.Println("✓ Grafana health check passed")
+	// Skip Grafana health check
+	// grafanaHealth := fmt.Sprintf("http://%s/api/health", grafana.Endpoint("http"))
+	// resp, err = http.Get(grafanaHealth)
+	// testutil.Ok(t, err)
+	// defer resp.Body.Close()
+	// testutil.Equals(t, 200, resp.StatusCode)
+	// fmt.Println("✓ Grafana health check passed")
 
 	// Test Tempo API endpoints
 	tempoEcho := fmt.Sprintf("http://%s/api/echo", artemis.Endpoint("tempo"))
@@ -158,10 +159,12 @@ func TestArtemisTracingStack(t *testing.T) {
 
 	fmt.Println("\n=== 🎉 Tracing stack is ready! ===")
 	fmt.Println("\nServices:")
-	fmt.Printf("  • Grafana:       http://%s (login: admin/admin)\n", grafana.Endpoint("http"))
-	fmt.Printf("  • Prometheus:    http://%s\n", prometheus.Endpoint("http"))
+	fmt.Printf("  • Artemis Web UI:   http://%s\n", artemis.Endpoint("queryapi"))
+	// fmt.Printf("  • Grafana:          http://%s (login: admin/admin)\n", grafana.Endpoint("http"))
+	fmt.Printf("  • Prometheus:       http://%s\n", prometheus.Endpoint("http"))
 	fmt.Printf("  • Artemis (Jaeger): http://%s\n", artemis.Endpoint("http"))
 	fmt.Printf("  • Artemis (Tempo):  http://%s\n", artemis.Endpoint("tempo"))
+	fmt.Printf("  • Artemis (pprof):  http://%s/debug/pprof/\n", artemis.Endpoint("pprof"))
 
 	// Get the data directory path
 	cwd, _ := os.Getwd()
@@ -177,23 +180,25 @@ func TestArtemisTracingStack(t *testing.T) {
 	fmt.Println("  • Prometheus Query Generator: Complex PromQL range queries every 2s")
 	fmt.Println("    - Queries include: rate(), histogram_quantile(), topk(), subqueries")
 	fmt.Println("    - Generating traces from Prometheus's query engine")
-	fmt.Println("\nIn Grafana:")
-	fmt.Println("  1. Navigate to Explore")
-	fmt.Println("  2. Select 'Artemis (Jaeger)' or 'Artemis (Tempo)' datasource")
-	fmt.Println("  3. Search for traces from 'prometheus' or 'telemetrygen-test-service' services")
-	fmt.Println("  4. Observe query execution traces (Prometheus) vs synthetic traces (telemetrygen)")
-	fmt.Println("  5. Compare Jaeger vs Tempo UI/UX")
+	fmt.Println("\nIn Artemis Web UI:")
+	fmt.Println("  1. Query metrics with PromQL (autocomplete available)")
+	fmt.Println("  2. View time series charts and tables")
+	fmt.Println("  3. Click on traces to explore spans in gantt chart view")
 	fmt.Println()
 
-	// Open Grafana and Prometheus in browser
-	grafanaURL := fmt.Sprintf("http://%s", grafana.Endpoint("http"))
+	// Open Artemis UI, Prometheus, and pprof in browser
+	artemisUIURL := fmt.Sprintf("http://%s", artemis.Endpoint("queryapi"))
 	prometheusURL := fmt.Sprintf("http://%s", prometheus.Endpoint("http"))
+	pprofURL := fmt.Sprintf("http://%s/debug/pprof/", artemis.Endpoint("pprof"))
 
-	fmt.Println("=== Opening Grafana in your browser...")
-	testutil.Ok(t, e2einteractive.OpenInBrowser(grafanaURL))
+	fmt.Println("=== Opening Artemis Web UI in your browser...")
+	testutil.Ok(t, e2einteractive.OpenInBrowser(artemisUIURL))
 
 	fmt.Println("=== Opening Prometheus in your browser...")
 	testutil.Ok(t, e2einteractive.OpenInBrowser(prometheusURL))
+
+	fmt.Println("=== Opening pprof in your browser...")
+	testutil.Ok(t, e2einteractive.OpenInBrowser(pprofURL))
 
 	fmt.Println("\n=== Stack is running! ===")
 	fmt.Println("Visit the endpoint displayed below or press Ctrl+C to stop the test.")

@@ -38,9 +38,11 @@ func buildArtemisImage() error {
 // createArtemis creates the Artemis runnable
 func createArtemis(env e2e.Environment) e2e.Runnable {
 	ports := map[string]int{
-		"otlp":  4317,  // OTLP gRPC
-		"http":  16686, // HTTP API (Jaeger-compatible)
-		"tempo": 3200,  // Tempo API
+		"otlp":     4317,  // OTLP gRPC
+		"http":     16686, // HTTP API (Jaeger-compatible)
+		"tempo":    3200,  // Tempo API
+		"queryapi": 8080,  // Query API and Web UI
+		"pprof":    6060,  // pprof endpoint
 	}
 
 	f := env.Runnable("artemis").WithPorts(ports).Future()

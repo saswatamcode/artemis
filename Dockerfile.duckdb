@@ -6,12 +6,31 @@
 # Features enabled:
 # - DuckDB SQL queries over Arrow IPC and Parquet files
 # - /api/query/sql endpoint for SQL queries
+# - Web UI for querying metrics and exploring traces
 #
 # Requirements:
 # - CGO_ENABLED=1
 # - glibc (Debian-based runtime)
 # - libstdc++6 (C++ standard library)
 
+# Stage 1: Build UI
+FROM node:20-slim AS ui-builder
+
+WORKDIR /build/ui
+
+# Copy package files
+COPY ui/package*.json ./
+
+# Install dependencies
+RUN npm ci
+
+# Copy UI source
+COPY ui/ ./
+
+# Build UI
+RUN npm run build
+
+# Stage 2: Build Go binary
 FROM golang:1.25-bookworm AS builder
 
 ARG TARGETOS
@@ -39,8 +58,12 @@ RUN go mod download
 # Copy source code
 COPY . .
 
+# Copy built UI from ui-builder stage
+COPY --from=ui-builder /build/ui/dist ./pkg/ui/dist
+
+# Build with CGO, DuckDB support, and embedded UI
 RUN CGO_ENABLED=1 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} \
-  go build -a -tags "duckdb duckdb_arrow" -o artemis \
+  go build -a -tags "duckdb duckdb_arrow builtinassets" -o artemis \
   -ldflags="-s -w \
   -X github.com/prometheus/common/version.Version=${VERSION} \
   -X github.com/prometheus/common/version.Revision=${REVISION} \
@@ -67,10 +90,11 @@ RUN mkdir -p /data/wal /data/blocks
 
 # Expose ports
 # 4317 - OTLP gRPC
+# 8080 - Query API and Web UI
 # 16686 - HTTP API (Jaeger-compatible)
 # 3200 - Tempo API
 # 5433 - DuckDB SQL API
-EXPOSE 4317 16686 3200 5433 
+EXPOSE 4317 8080 16686 3200 5433 
 
 # Run server
 # Pass flags as arguments to docker run, e.g.:

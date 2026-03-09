@@ -1,0 +1,39 @@
+# Git
+.git
+.gitignore
+
+# Build artifacts
+artemis
+bin/
+pkg/ui/dist/
+
+# Data directories
+data/
+e2e/e2e-data/
+
+# Documentation
+*.md
+docs/
+
+# CI/CD
+.github/
+
+# IDE
+.idea/
+.vscode/
+.cursor/
+
+# Node modules (will be installed during UI build)
+ui/node_modules/
+
+# Test artifacts
+*.test
+*.out
+coverage.*
+*.coverprofile
+
+# Environment
+.env
+
+# OS
+.DS_Store

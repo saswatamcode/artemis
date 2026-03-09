@@ -22,6 +22,7 @@ import (
 	"github.com/saswatamcode/artemis/pkg/compactor"
 	"github.com/saswatamcode/artemis/pkg/jaeger"
 	"github.com/saswatamcode/artemis/pkg/otlp"
+	"github.com/saswatamcode/artemis/pkg/queryapi"
 	"github.com/saswatamcode/artemis/pkg/sqlapi"
 	"github.com/saswatamcode/artemis/pkg/tempo"
 	"github.com/saswatamcode/artemis/pkg/tracedb"
@@ -51,11 +52,12 @@ var (
 	minBlocks1   int
 
 	// Server address flags
-	otlpAddr    string
-	jaegerAddr  string
-	tempoAddr   string
-	sqlAPIAddr  string
-	profileAddr string
+	otlpAddr     string
+	jaegerAddr   string
+	tempoAddr    string
+	sqlAPIAddr   string
+	queryAPIAddr string
+	profileAddr  string
 
 	// Logging flags
 	logLevelStr  string
@@ -116,6 +118,7 @@ func init() {
 	rootCmd.Flags().StringVar(&jaegerAddr, "jaeger-addr", ":16686", "HTTP API (Jaeger) address")
 	rootCmd.Flags().StringVar(&tempoAddr, "tempo-addr", ":3200", "Tempo API address")
 	rootCmd.Flags().StringVar(&sqlAPIAddr, "sqlapi-addr", ":5433", "SQL API address")
+	rootCmd.Flags().StringVar(&queryAPIAddr, "queryapi-addr", ":8080", "Query API and Web UI address")
 	rootCmd.Flags().StringVar(&profileAddr, "profile-addr", ":6060", "pprof profiling server address; empty disables")
 
 	// Logging flags
@@ -219,6 +222,7 @@ func runServer(cmd *cobra.Command, args []string) error {
 	jaegerServer := jaeger.NewServer(db, logger)
 	tempoServer := tempo.NewServer(db, logger)
 	sqlAPIServer := sqlapi.NewServer(db, logger)
+	queryAPIServer := queryapi.NewServer(db, logger)
 
 	// Print server info
 	logger.Info("artemis server starting",
@@ -226,6 +230,8 @@ func runServer(cmd *cobra.Command, args []string) error {
 		"jaeger_api", "http://localhost"+jaegerAddr,
 		"tempo_api", "http://localhost"+tempoAddr,
 		"sqlapi", "http://localhost"+sqlAPIAddr,
+		"queryapi", "http://localhost"+queryAPIAddr,
+		"web_ui", "http://localhost"+queryAPIAddr,
 	)
 	logger.Info("grafana configuration",
 		"jaeger_type", "Jaeger",
@@ -234,6 +240,7 @@ func runServer(cmd *cobra.Command, args []string) error {
 		"tempo_url", "http://localhost"+tempoAddr,
 	)
 	logger.Info("available endpoints",
+		"web_ui", queryAPIAddr+"/",
 		"jaeger_trace", jaegerAddr+"/api/traces/{traceID}",
 		"jaeger_search", jaegerAddr+"/api/traces?service=...",
 		"jaeger_services", jaegerAddr+"/api/services",
@@ -246,6 +253,11 @@ func runServer(cmd *cobra.Command, args []string) error {
 		"tempo_buildinfo", tempoAddr+"/api/status/buildinfo",
 		"sqlapi_query", sqlAPIAddr+"/api/query",
 		"sqlapi_health", sqlAPIAddr+"/health",
+		"queryapi_attr_keys", queryAPIAddr+"/api/v1/metadata/attribute_keys",
+		"queryapi_attr_values", queryAPIAddr+"/api/v1/metadata/attribute_values?key={key}",
+		"queryapi_query_range", queryAPIAddr+"/api/v1/query_range",
+		"queryapi_trace", queryAPIAddr+"/api/v1/query/trace?traceID={traceID}",
+		"queryapi_health", queryAPIAddr+"/api/v1/health",
 	)
 	if profileAddr != "" {
 		logger.Info("profiling enabled", "addr", profileAddr, "pprof", "http://localhost"+profileAddr+"/debug/pprof/")
@@ -291,6 +303,16 @@ func runServer(cmd *cobra.Command, args []string) error {
 	}, func(error) {
 		if err := sqlAPIServer.Shutdown(); err != nil {
 			logger.Error("failed to shutdown sql api server", "error", err)
+		}
+	})
+
+	// Query API server actor
+	g.Add(func() error {
+		logger.Info("starting query api", "addr", queryAPIAddr)
+		return queryAPIServer.Start(queryAPIAddr)
+	}, func(error) {
+		if err := queryAPIServer.Shutdown(); err != nil {
+			logger.Error("failed to shutdown query api server", "error", err)
 		}
 	})
 

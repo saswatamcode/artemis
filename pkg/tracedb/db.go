@@ -786,6 +786,11 @@ func (db *DB) GetBlockManager() *block.Manager {
 	return db.blockManager
 }
 
+// GetIsolation returns the isolation coordinator for MVCC and buffer pooling
+func (db *DB) GetIsolation() *storage.IsolationCoordinator {
+	return db.isolation
+}
+
 // BlockStats returns block manager statistics
 func (db *DB) BlockStats() *block.ManagerStats {
 	if db.blockManager == nil {
