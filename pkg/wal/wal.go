@@ -10,7 +10,9 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"time"
 
+	"github.com/saswatamcode/artemis/pkg/metrics"
 	"github.com/saswatamcode/artemis/pkg/span"
 )
 
@@ -74,15 +76,16 @@ type WAL struct {
 	mu           sync.Mutex
 	page         *page // Active page buffer
 	logger       *slog.Logger
+	metrics      *metrics.DatabaseMetrics
 }
 
 // NewWAL creates a new WAL instance with default segment size
-func NewWAL(dir string, logger *slog.Logger) (*WAL, error) {
-	return NewWALWithSegmentSize(dir, defaultSegmentSize, logger)
+func NewWAL(dir string, logger *slog.Logger, dbMetrics *metrics.DatabaseMetrics) (*WAL, error) {
+	return NewWALWithSegmentSize(dir, defaultSegmentSize, logger, dbMetrics)
 }
 
 // NewWALWithSegmentSize creates a new WAL instance with custom segment size
-func NewWALWithSegmentSize(dir string, segmentSize int64, logger *slog.Logger) (*WAL, error) {
+func NewWALWithSegmentSize(dir string, segmentSize int64, logger *slog.Logger, dbMetrics *metrics.DatabaseMetrics) (*WAL, error) {
 	if logger == nil {
 		logger = slog.Default()
 	}
@@ -122,6 +125,7 @@ func NewWALWithSegmentSize(dir string, segmentSize int64, logger *slog.Logger) (
 		segmentIndex: startIndex,
 		page:         &page{},
 		logger:       logger,
+		metrics:      dbMetrics,
 	}
 
 	if err := w.createNewSegment(); err != nil {
@@ -133,6 +137,7 @@ func NewWALWithSegmentSize(dir string, segmentSize int64, logger *slog.Logger) (
 
 // WriteSpan writes a span to the WAL and returns the segment index it was written to
 func (w *WAL) WriteSpan(s *span.Span) (int, error) {
+	start := time.Now()
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
@@ -159,6 +164,12 @@ func (w *WAL) WriteSpan(s *span.Span) (int, error) {
 	// Flush the page to ensure durability
 	if err := w.flushPage(false); err != nil {
 		return 0, err
+	}
+
+	// Record metrics
+	if w.metrics != nil {
+		w.metrics.RecordWALWrite()
+		w.metrics.RecordWALWriteDuration(time.Since(start).Seconds())
 	}
 
 	return segmentIndex, nil
@@ -370,6 +381,11 @@ func (w *WAL) rotateSegment() error {
 		return err
 	}
 
+	// Record rotation metric
+	if w.metrics != nil {
+		w.metrics.RecordWALSegmentRotation()
+	}
+
 	return nil
 }
 
@@ -401,6 +417,9 @@ func (w *WAL) Flush() error {
 	defer w.mu.Unlock()
 
 	if w.page.alloc > 0 {
+		if w.metrics != nil {
+			w.metrics.RecordWALFlush()
+		}
 		return w.flushPage(false)
 	}
 	return nil

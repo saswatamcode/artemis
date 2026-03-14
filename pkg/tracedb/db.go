@@ -9,6 +9,7 @@ import (
 
 	"github.com/saswatamcode/artemis/pkg/block"
 	"github.com/saswatamcode/artemis/pkg/compactor"
+	"github.com/saswatamcode/artemis/pkg/metrics"
 	"github.com/saswatamcode/artemis/pkg/query"
 	"github.com/saswatamcode/artemis/pkg/span"
 	"github.com/saswatamcode/artemis/pkg/storage"
@@ -26,6 +27,7 @@ type DB struct {
 	walDir       string
 	blocksDir    string // Base directory for blocks (cached for deleteBlock)
 	logger       *slog.Logger
+	metrics      *metrics.DatabaseMetrics
 
 	// Background compaction and checkpointing
 	compactInterval          time.Duration
@@ -62,6 +64,7 @@ type Config struct {
 	EnableCompaction        bool                           // Enable automatic block compaction
 	EnableRetention         bool                           // Enable automatic retention cleanup
 	Logger                  *slog.Logger                   // Logger for structured logging
+	Metrics                 *metrics.DatabaseMetrics       // Optional metrics registry
 }
 
 // DefaultConfig returns default configuration
@@ -92,9 +95,9 @@ func New(cfg *Config) (*DB, error) {
 	var walLog *wal.WAL
 	var err error
 	if cfg.WALSegmentSize > 0 {
-		walLog, err = wal.NewWALWithSegmentSize(cfg.WALDir, cfg.WALSegmentSize, logger)
+		walLog, err = wal.NewWALWithSegmentSize(cfg.WALDir, cfg.WALSegmentSize, logger, cfg.Metrics)
 	} else {
-		walLog, err = wal.NewWAL(cfg.WALDir, logger)
+		walLog, err = wal.NewWAL(cfg.WALDir, logger, cfg.Metrics)
 	}
 	if err != nil {
 		return nil, fmt.Errorf("failed to create WAL: %w", err)
@@ -133,6 +136,7 @@ func New(cfg *Config) (*DB, error) {
 		walDir:                   cfg.WALDir,
 		blocksDir:                blocksDir,
 		logger:                   logger,
+		metrics:                  cfg.Metrics,
 		compactInterval:          cfg.CompactInterval,
 		checkpointInterval:       cfg.CheckpointInterval,
 		blockCompactionInterval:  cfg.BlockCompactionInterval,
@@ -165,6 +169,8 @@ func New(cfg *Config) (*DB, error) {
 // WriteSpan writes a span to the database
 // First writes to WAL for durability, then adds to in-memory storage
 func (db *DB) WriteSpan(s *span.Span) error {
+	start := time.Now()
+
 	// CRITICAL: Check if closed while holding mu lock, then acquire queryMu
 	// This prevents TOCTOU race where Close() runs between check and queryMu acquisition
 	db.mu.Lock()
@@ -186,6 +192,9 @@ func (db *DB) WriteSpan(s *span.Span) error {
 	// getting the segment index and writing the span
 	actualSegment, err := db.wal.WriteSpan(s)
 	if err != nil {
+		if db.metrics != nil {
+			db.metrics.RecordWriteError("wal")
+		}
 		return fmt.Errorf("failed to write span to WAL: %w", err)
 	}
 
@@ -194,7 +203,16 @@ func (db *DB) WriteSpan(s *span.Span) error {
 	db.storage.UpdateWALSegment(actualSegment)
 
 	if err := db.storage.AddSpan(s); err != nil {
+		if db.metrics != nil {
+			db.metrics.RecordWriteError("storage")
+		}
 		return fmt.Errorf("failed to add span to storage: %w", err)
+	}
+
+	// Record metrics
+	if db.metrics != nil {
+		db.metrics.RecordSpanWrite("single", 1)
+		db.metrics.RecordWriteDuration("write_span", time.Since(start).Seconds())
 	}
 
 	return nil
@@ -207,6 +225,8 @@ func (db *DB) WriteSpans(spans []*span.Span) error {
 	if len(spans) == 0 {
 		return nil
 	}
+
+	start := time.Now()
 
 	// CRITICAL: Check if closed before starting transaction
 	db.mu.Lock()
@@ -235,6 +255,9 @@ func (db *DB) WriteSpans(spans []*span.Span) error {
 	for _, s := range spans {
 		if err := appender.AddSpan(s); err != nil {
 			appender.Rollback()
+			if db.metrics != nil {
+				db.metrics.RecordWriteError("transaction")
+			}
 			return fmt.Errorf("failed to add span to transaction: %w", err)
 		}
 
@@ -243,6 +266,9 @@ func (db *DB) WriteSpans(spans []*span.Span) error {
 			for i := range s.Links {
 				if err := appender.AddLink(&s.Links[i]); err != nil {
 					appender.Rollback()
+					if db.metrics != nil {
+						db.metrics.RecordWriteError("transaction")
+					}
 					return fmt.Errorf("failed to add link to transaction: %w", err)
 				}
 			}
@@ -256,7 +282,17 @@ func (db *DB) WriteSpans(spans []*span.Span) error {
 	// Phase 4: Release buffers and locks
 	if err := appender.Commit(); err != nil {
 		appender.Rollback()
+		if db.metrics != nil {
+			db.metrics.RecordWriteError("transaction")
+		}
 		return fmt.Errorf("failed to commit transaction: %w", err)
+	}
+
+	// Record metrics
+	if db.metrics != nil {
+		db.metrics.RecordSpanWrite("batch", len(spans))
+		db.metrics.RecordBatchWrite()
+		db.metrics.RecordWriteDuration("write_spans", time.Since(start).Seconds())
 	}
 
 	return nil
@@ -373,6 +409,12 @@ func (db *DB) compactionLoop() {
 			// Flush any pending spans to record batches
 			if err := db.Flush(); err != nil {
 				db.logger.Error("compaction flush error", "error", err)
+			}
+
+			// Update head block metrics
+			if db.metrics != nil {
+				db.metrics.SetHeadBlockSpans(db.storage.RowCount())
+				db.metrics.SetHeadBlockRecordBatches(db.storage.RecordCount())
 			}
 
 			// Check if head block should be flushed to disk
@@ -499,6 +541,26 @@ func (db *DB) GetStorage() *storage.ArrowStorage {
 	return db.storage
 }
 
+// updatePersistedBlocksMetrics updates the count of persisted blocks per level
+func (db *DB) updatePersistedBlocksMetrics() {
+	if db.metrics == nil || db.blockManager == nil {
+		return
+	}
+
+	blocks := db.blockManager.GetBlocks()
+	levelCounts := make(map[int]int)
+
+	for _, blk := range blocks {
+		level := blk.Meta().Level()
+		levelCounts[level]++
+	}
+
+	// Update metrics for each level
+	for level := 0; level <= 5; level++ {
+		db.metrics.SetPersistedBlocks(level, levelCounts[level])
+	}
+}
+
 // createCheckpoint deletes WAL segments that have been persisted to blocks
 // and writes checkpoint metadata tracking what was deleted
 func (db *DB) createCheckpoint() error {
@@ -588,6 +650,9 @@ func (db *DB) createCheckpoint() error {
 	// Delete WAL segments (data is safely in blocks now)
 	// If this fails, next checkpoint will retry (metadata already written)
 	if err := wal.DeleteWALSegments(db.walDir, deleteTo); err != nil {
+		if db.metrics != nil {
+			db.metrics.RecordCheckpointError()
+		}
 		return fmt.Errorf("failed to delete old WAL segments: %w", err)
 	}
 
@@ -596,6 +661,12 @@ func (db *DB) createCheckpoint() error {
 		"deleted_to", deleteTo,
 		"segment_count_incremental", deleteCountIncremental,
 		"segment_count_total", deleteCountTotal)
+
+	// Record metrics
+	if db.metrics != nil {
+		db.metrics.RecordCheckpointCreation()
+		db.metrics.RecordWALSegmentsDeleted(deleteCountIncremental)
+	}
 
 	return nil
 }
@@ -688,6 +759,8 @@ func (db *DB) findMaxPersistedWALSegment() int {
 
 // flushHeadBlock flushes the head block to disk and resets the head
 func (db *DB) flushHeadBlock() error {
+	start := time.Now()
+
 	if db.blockManager == nil {
 		return fmt.Errorf("block manager not configured")
 	}
@@ -699,6 +772,9 @@ func (db *DB) flushHeadBlock() error {
 
 	// Flush pending record batches first
 	if err := db.Flush(); err != nil {
+		if db.metrics != nil {
+			db.metrics.RecordCompactionRun("head_flush", "error")
+		}
 		return fmt.Errorf("failed to flush pending batches: %w", err)
 	}
 
@@ -716,6 +792,9 @@ func (db *DB) flushHeadBlock() error {
 	// Flush head block to disk with WAL segment range tracking
 	meta, err := db.blockManager.FlushHead(minWALSegment, maxWALSegment)
 	if err != nil {
+		if db.metrics != nil {
+			db.metrics.RecordCompactionRun("head_flush", "error")
+		}
 		return fmt.Errorf("failed to flush head block: %w", err)
 	}
 
@@ -726,12 +805,18 @@ func (db *DB) flushHeadBlock() error {
 		linkRecords := db.linkStorage.GetRecords()
 		if len(linkRecords) > 0 {
 			if err := block.FlushLinksBlock(blockDir, linkRecords, db.linkStorage.Schema()); err != nil {
+				if db.metrics != nil {
+					db.metrics.RecordCompactionRun("head_flush", "error")
+				}
 				return fmt.Errorf("failed to flush links block: %w", err)
 			}
 		}
 
 		// Now add the block to the manager (this loads it with links)
 		if err := db.blockManager.AddFlushedBlock(blockDir); err != nil {
+			if db.metrics != nil {
+				db.metrics.RecordCompactionRun("head_flush", "error")
+			}
 			return fmt.Errorf("failed to add flushed block: %w", err)
 		}
 
@@ -746,6 +831,14 @@ func (db *DB) flushHeadBlock() error {
 		// Reset the head block and link storage
 		db.storage.Reset()
 		db.linkStorage.Reset()
+
+		// Record success metrics
+		if db.metrics != nil {
+			db.metrics.RecordCompactionRun("head_flush", "success")
+			db.metrics.RecordCompactionDuration("head_flush", time.Since(start).Seconds())
+			// Update persisted blocks count
+			db.updatePersistedBlocksMetrics()
+		}
 	}
 
 	return nil
@@ -823,6 +916,7 @@ func (db *DB) compactBlocks() error {
 	for level := range 5 {
 		plan := db.compactor.Plan(blocks, level)
 		if plan != nil {
+			start := time.Now()
 			db.logger.Info("compacting blocks",
 				"block_count", len(plan.Blocks),
 				"from_level", level,
@@ -831,6 +925,9 @@ func (db *DB) compactBlocks() error {
 			// Perform compaction WITHOUT holding db.mu (expensive I/O)
 			newMeta, err := db.compactor.Compact(plan)
 			if err != nil {
+				if db.metrics != nil {
+					db.metrics.RecordCompactionRun("block_compact", "error")
+				}
 				return fmt.Errorf("L%d→L%d compaction failed: %w", level, level+1, err)
 			}
 
@@ -886,6 +983,14 @@ func (db *DB) compactBlocks() error {
 
 			// Release write lock
 			db.queryMu.Unlock()
+
+			// Record metrics
+			if db.metrics != nil {
+				db.metrics.RecordCompactionRun("block_compact", "success")
+				db.metrics.RecordCompactionDuration("block_compact", time.Since(start).Seconds())
+				db.metrics.RecordBlocksCompacted(level, level+1, len(plan.Blocks))
+				db.updatePersistedBlocksMetrics()
+			}
 
 			// Get updated block list
 			blocks = db.blockManager.GetBlocks()
@@ -944,6 +1049,8 @@ func (db *DB) deleteBlockFiles(blockID string) error {
 
 // cleanupOldBlocks deletes blocks older than the retention period
 func (db *DB) cleanupOldBlocks() error {
+	start := time.Now()
+
 	if db.blockManager == nil || db.retentionPeriod == 0 {
 		return nil
 	}
@@ -976,6 +1083,13 @@ func (db *DB) cleanupOldBlocks() error {
 		db.logger.Info("retention cleanup complete",
 			"deleted_count", deletedCount,
 			"retention_period", db.retentionPeriod)
+
+		// Record metrics
+		if db.metrics != nil {
+			db.metrics.RecordCompactionRun("retention", "success")
+			db.metrics.RecordCompactionDuration("retention", time.Since(start).Seconds())
+			db.updatePersistedBlocksMetrics()
+		}
 	}
 
 	return nil

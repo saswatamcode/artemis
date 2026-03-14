@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/saswatamcode/artemis/pkg/metrics"
 	"github.com/saswatamcode/artemis/pkg/reduced_promql/engine"
 	"github.com/saswatamcode/artemis/pkg/tracedb"
 	"github.com/saswatamcode/artemis/pkg/ui"
@@ -21,10 +22,12 @@ type Server struct {
 	mux         *http.ServeMux
 	logger      *slog.Logger
 	srv         *http.Server
+	dbMetrics   *metrics.DatabaseMetrics
+	apiMetrics  *metrics.APIMetrics
 }
 
 // NewServer creates a new Query API server
-func NewServer(db *tracedb.DB, logger *slog.Logger) *Server {
+func NewServer(db *tracedb.DB, logger *slog.Logger, dbMetrics *metrics.DatabaseMetrics, apiMetrics *metrics.APIMetrics) *Server {
 	if logger == nil {
 		logger = slog.Default()
 	}
@@ -38,6 +41,8 @@ func NewServer(db *tracedb.DB, logger *slog.Logger) *Server {
 		queryEngine: queryEngine,
 		mux:         http.NewServeMux(),
 		logger:      logger,
+		dbMetrics:   dbMetrics,
+		apiMetrics:  apiMetrics,
 	}
 
 	s.registerRoutes()
@@ -200,7 +205,12 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	s.mux.ServeHTTP(w, r)
+	// Wrap with metrics middleware
+	handler := http.Handler(s.mux)
+	if s.apiMetrics != nil {
+		handler = metrics.HTTPMiddleware("queryapi", s.apiMetrics)(handler)
+	}
+	handler.ServeHTTP(w, r)
 }
 
 // Start starts the HTTP server

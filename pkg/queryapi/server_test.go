@@ -33,7 +33,7 @@ func TestHealthEndpoint(t *testing.T) {
 	defer db.Close()
 
 	// Create Query API server
-	server := NewServer(db, nil)
+	server := NewServer(db, nil, nil, nil)
 
 	// Test health endpoint
 	req := httptest.NewRequest("GET", "/api/v1/health", nil)
@@ -77,7 +77,7 @@ func TestMetadataAttributeKeysEndpoint(t *testing.T) {
 	defer db.Close()
 
 	// Create Query API server
-	server := NewServer(db, nil)
+	server := NewServer(db, nil, nil, nil)
 
 	// Test metadata attribute_keys endpoint (should return empty list for empty database)
 	req := httptest.NewRequest("GET", "/api/v1/metadata/attribute_keys", nil)
@@ -126,7 +126,7 @@ func TestMetadataAttributeValuesEndpoint(t *testing.T) {
 	defer db.Close()
 
 	// Create Query API server
-	server := NewServer(db, nil)
+	server := NewServer(db, nil, nil, nil)
 
 	// Test metadata attribute_values endpoint without key parameter (should error)
 	req := httptest.NewRequest("GET", "/api/v1/metadata/attribute_values", nil)
@@ -184,7 +184,7 @@ func TestQueryRangeEndpoint(t *testing.T) {
 	defer db.Close()
 
 	// Create Query API server
-	server := NewServer(db, nil)
+	server := NewServer(db, nil, nil, nil)
 
 	// Test query_range endpoint without query parameter (should error)
 	req := httptest.NewRequest("GET", "/api/v1/query_range", nil)
@@ -219,7 +219,7 @@ func TestQueryTraceEndpoint(t *testing.T) {
 	defer db.Close()
 
 	// Create Query API server
-	server := NewServer(db, nil)
+	server := NewServer(db, nil, nil, nil)
 
 	// Test query/trace endpoint without traceID parameter (should error)
 	req := httptest.NewRequest("GET", "/api/v1/query/trace", nil)
@@ -254,7 +254,7 @@ func TestCORSHeaders(t *testing.T) {
 	defer db.Close()
 
 	// Create Query API server
-	server := NewServer(db, nil)
+	server := NewServer(db, nil, nil, nil)
 
 	// Test OPTIONS request (CORS preflight)
 	req := httptest.NewRequest("OPTIONS", "/api/v1/health", nil)

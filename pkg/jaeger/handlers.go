@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/saswatamcode/artemis/pkg/metrics"
 	"github.com/saswatamcode/artemis/pkg/query"
 	"github.com/saswatamcode/artemis/pkg/span"
 	"github.com/saswatamcode/artemis/pkg/tracedb"
@@ -16,22 +17,26 @@ import (
 
 // Server provides Jaeger-compatible HTTP API for trace queries
 type Server struct {
-	db     *tracedb.DB
-	mux    *http.ServeMux
-	logger *slog.Logger
-	srv    *http.Server
+	db         *tracedb.DB
+	mux        *http.ServeMux
+	logger     *slog.Logger
+	srv        *http.Server
+	dbMetrics  *metrics.DatabaseMetrics
+	apiMetrics *metrics.APIMetrics
 }
 
 // NewServer creates a new API server
-func NewServer(db *tracedb.DB, logger *slog.Logger) *Server {
+func NewServer(db *tracedb.DB, logger *slog.Logger, dbMetrics *metrics.DatabaseMetrics, apiMetrics *metrics.APIMetrics) *Server {
 	if logger == nil {
 		logger = slog.Default()
 	}
 
 	s := &Server{
-		db:     db,
-		mux:    http.NewServeMux(),
-		logger: logger,
+		db:         db,
+		mux:        http.NewServeMux(),
+		logger:     logger,
+		dbMetrics:  dbMetrics,
+		apiMetrics: apiMetrics,
 	}
 
 	s.registerRoutes()
@@ -58,7 +63,12 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	s.mux.ServeHTTP(w, r)
+	// Wrap with metrics middleware
+	handler := http.Handler(s.mux)
+	if s.apiMetrics != nil {
+		handler = metrics.HTTPMiddleware("jaeger", s.apiMetrics)(handler)
+	}
+	handler.ServeHTTP(w, r)
 }
 
 // handleTraces routes between trace lookup and search
@@ -97,8 +107,13 @@ func (s *Server) handleServices(w http.ResponseWriter, r *http.Request) {
 // handleGetTrace retrieves a specific trace by ID
 // GET /api/traces/{traceID}
 func (s *Server) handleGetTrace(w http.ResponseWriter, r *http.Request, traceID string) {
+	start := time.Now()
+
 	if traceID == "" {
 		http.Error(w, "trace ID required", http.StatusBadRequest)
+		if s.dbMetrics != nil {
+			s.dbMetrics.RecordQuery("jaeger", "error")
+		}
 		return
 	}
 
@@ -107,6 +122,9 @@ func (s *Server) handleGetTrace(w http.ResponseWriter, r *http.Request, traceID 
 	matcher, err := query.NewMatcher(query.MatchEqual, "trace_id", traceID)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
+		if s.dbMetrics != nil {
+			s.dbMetrics.RecordQuery("jaeger", "error")
+		}
 		return
 	}
 
@@ -114,12 +132,25 @@ func (s *Server) handleGetTrace(w http.ResponseWriter, r *http.Request, traceID 
 	result, err := querier.Select(matcher)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
+		if s.dbMetrics != nil {
+			s.dbMetrics.RecordQuery("jaeger", "error")
+		}
 		return
 	}
 
 	if len(result.Spans) == 0 {
 		http.Error(w, "trace not found", http.StatusNotFound)
+		if s.dbMetrics != nil {
+			s.dbMetrics.RecordQuery("jaeger", "not_found")
+		}
 		return
+	}
+
+	// Record metrics
+	if s.dbMetrics != nil {
+		s.dbMetrics.RecordQuery("jaeger", "success")
+		s.dbMetrics.RecordQueryDuration("jaeger", "get_trace", time.Since(start).Seconds())
+		s.dbMetrics.RecordQuerySpansReturned("jaeger", len(result.Spans))
 	}
 
 	jaegerTrace := ConvertTraceToJaeger(result.Spans)

@@ -8,11 +8,15 @@ import (
 	"net/http"
 	"net/http/pprof"
 	"os"
+	"regexp"
 	"syscall"
 	"time"
 
 	"github.com/felixge/fgprof"
 	"github.com/oklog/run"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/collectors"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/prometheus/common/promslog"
 	psflag "github.com/prometheus/common/promslog/flag"
 	"github.com/prometheus/common/version"
@@ -21,6 +25,7 @@ import (
 	"github.com/saswatamcode/artemis/pkg/block"
 	"github.com/saswatamcode/artemis/pkg/compactor"
 	"github.com/saswatamcode/artemis/pkg/jaeger"
+	"github.com/saswatamcode/artemis/pkg/metrics"
 	"github.com/saswatamcode/artemis/pkg/otlp"
 	"github.com/saswatamcode/artemis/pkg/queryapi"
 	"github.com/saswatamcode/artemis/pkg/sqlapi"
@@ -58,6 +63,7 @@ var (
 	sqlAPIAddr   string
 	queryAPIAddr string
 	profileAddr  string
+	metricsAddr  string
 
 	// Logging flags
 	logLevelStr  string
@@ -120,6 +126,7 @@ func init() {
 	rootCmd.Flags().StringVar(&sqlAPIAddr, "sqlapi-addr", ":5433", "SQL API address")
 	rootCmd.Flags().StringVar(&queryAPIAddr, "queryapi-addr", ":8080", "Query API and Web UI address")
 	rootCmd.Flags().StringVar(&profileAddr, "profile-addr", ":6060", "pprof profiling server address; empty disables")
+	rootCmd.Flags().StringVar(&metricsAddr, "metrics-addr", ":9090", "Prometheus metrics server address")
 
 	// Logging flags
 	rootCmd.Flags().StringVar(&logLevelStr, "log.level", "info", psflag.LevelFlagHelp)
@@ -148,6 +155,22 @@ func runServer(cmd *cobra.Command, args []string) error {
 
 	logger.Info("starting artemis", "build_info", version.Info(), "build_context", version.BuildContext())
 
+	// Create Prometheus metrics registry
+	metricsRegistry := prometheus.NewRegistry()
+	metricsRegistry.MustRegister(
+		collectors.NewBuildInfoCollector(),
+		collectors.NewGoCollector(
+			collectors.WithGoCollectorRuntimeMetrics(
+				collectors.GoRuntimeMetricsRule{Matcher: regexp.MustCompile("/.*")},
+			),
+		),
+		collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}),
+	)
+
+	// Create custom metrics
+	dbMetrics := metrics.NewDatabaseMetrics(metricsRegistry)
+	apiMetrics := metrics.NewAPIMetrics(metricsRegistry)
+
 	// Build custom compaction level configs
 	levelConfigs := compactor.DefaultLevelConfigs()
 
@@ -174,6 +197,7 @@ func runServer(cmd *cobra.Command, args []string) error {
 		EnableCompaction:        enableCompaction,
 		EnableRetention:         enableRetention,
 		Logger:                  logger,
+		Metrics:                 dbMetrics,
 		BlockConfig: &block.Config{
 			Dir:              blocksDir,
 			MaxBlockDuration: maxBlockDuration,
@@ -214,15 +238,15 @@ func runServer(cmd *cobra.Command, args []string) error {
 	logger.Info("database opened", "wal_replay", "complete")
 
 	// Create servers
-	otlpServer, err := otlp.NewServer(db, otlpAddr, logger)
+	otlpServer, err := otlp.NewServer(db, otlpAddr, logger, dbMetrics, apiMetrics)
 	if err != nil {
 		log.Fatalf("Failed to create OTLP server: %v", err)
 	}
 
-	jaegerServer := jaeger.NewServer(db, logger)
-	tempoServer := tempo.NewServer(db, logger)
-	sqlAPIServer := sqlapi.NewServer(db, logger)
-	queryAPIServer := queryapi.NewServer(db, logger)
+	jaegerServer := jaeger.NewServer(db, logger, dbMetrics, apiMetrics)
+	tempoServer := tempo.NewServer(db, logger, dbMetrics, apiMetrics)
+	sqlAPIServer := sqlapi.NewServer(db, logger, dbMetrics, apiMetrics)
+	queryAPIServer := queryapi.NewServer(db, logger, dbMetrics, apiMetrics)
 
 	// Print server info
 	logger.Info("artemis server starting",
@@ -261,6 +285,9 @@ func runServer(cmd *cobra.Command, args []string) error {
 	)
 	if profileAddr != "" {
 		logger.Info("profiling enabled", "addr", profileAddr, "pprof", "http://localhost"+profileAddr+"/debug/pprof/")
+	}
+	if metricsAddr != "" {
+		logger.Info("metrics enabled", "addr", metricsAddr, "endpoint", "http://localhost"+metricsAddr+"/metrics")
 	}
 	logger.Info("press ctrl+c to shutdown")
 
@@ -332,6 +359,21 @@ func runServer(cmd *cobra.Command, args []string) error {
 		}, func(error) {
 			if err := profileServer.Shutdown(context.Background()); err != nil && err != http.ErrServerClosed {
 				logger.Error("failed to shutdown profiling server", "error", err)
+			}
+		})
+	}
+
+	// Metrics server actor
+	if metricsAddr != "" {
+		metricsMux := http.NewServeMux()
+		metricsMux.Handle("/metrics", promhttp.HandlerFor(metricsRegistry, promhttp.HandlerOpts{}))
+		metricsServer := &http.Server{Addr: metricsAddr, Handler: metricsMux}
+		g.Add(func() error {
+			logger.Info("starting metrics server", "addr", metricsAddr)
+			return metricsServer.ListenAndServe()
+		}, func(error) {
+			if err := metricsServer.Shutdown(context.Background()); err != nil && err != http.ErrServerClosed {
+				logger.Error("failed to shutdown metrics server", "error", err)
 			}
 		})
 	}

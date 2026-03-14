@@ -10,6 +10,7 @@ import (
 	"google.golang.org/grpc"
 	_ "google.golang.org/grpc/encoding/gzip"
 
+	"github.com/saswatamcode/artemis/pkg/metrics"
 	"github.com/saswatamcode/artemis/pkg/tracedb"
 )
 
@@ -20,10 +21,12 @@ type Server struct {
 	grpcServer *grpc.Server
 	listener   net.Listener
 	logger     *slog.Logger
+	dbMetrics  *metrics.DatabaseMetrics
+	apiMetrics *metrics.APIMetrics
 }
 
 // NewServer creates a new OTLP gRPC server
-func NewServer(db *tracedb.DB, addr string, logger *slog.Logger) (*Server, error) {
+func NewServer(db *tracedb.DB, addr string, logger *slog.Logger, dbMetrics *metrics.DatabaseMetrics, apiMetrics *metrics.APIMetrics) (*Server, error) {
 	if logger == nil {
 		logger = slog.Default()
 	}
@@ -38,6 +41,8 @@ func NewServer(db *tracedb.DB, addr string, logger *slog.Logger) (*Server, error
 		grpcServer: grpc.NewServer(),
 		listener:   listener,
 		logger:     logger,
+		dbMetrics:  dbMetrics,
+		apiMetrics: apiMetrics,
 	}
 
 	coltracev1.RegisterTraceServiceServer(s.grpcServer, s)

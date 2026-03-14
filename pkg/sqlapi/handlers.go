@@ -7,28 +7,33 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/saswatamcode/artemis/pkg/metrics"
 	"github.com/saswatamcode/artemis/pkg/query"
 	"github.com/saswatamcode/artemis/pkg/tracedb"
 )
 
 // Server provides SQL query API for trace queries
 type Server struct {
-	db     *tracedb.DB
-	mux    *http.ServeMux
-	logger *slog.Logger
-	srv    *http.Server
+	db         *tracedb.DB
+	mux        *http.ServeMux
+	logger     *slog.Logger
+	srv        *http.Server
+	dbMetrics  *metrics.DatabaseMetrics
+	apiMetrics *metrics.APIMetrics
 }
 
 // NewServer creates a new SQL API server
-func NewServer(db *tracedb.DB, logger *slog.Logger) *Server {
+func NewServer(db *tracedb.DB, logger *slog.Logger, dbMetrics *metrics.DatabaseMetrics, apiMetrics *metrics.APIMetrics) *Server {
 	if logger == nil {
 		logger = slog.Default()
 	}
 
 	s := &Server{
-		db:     db,
-		mux:    http.NewServeMux(),
-		logger: logger,
+		db:         db,
+		mux:        http.NewServeMux(),
+		logger:     logger,
+		dbMetrics:  dbMetrics,
+		apiMetrics: apiMetrics,
 	}
 
 	s.registerRoutes()
@@ -52,7 +57,12 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	s.mux.ServeHTTP(w, r)
+	// Wrap with metrics middleware
+	handler := http.Handler(s.mux)
+	if s.apiMetrics != nil {
+		handler = metrics.HTTPMiddleware("sqlapi", s.apiMetrics)(handler)
+	}
+	handler.ServeHTTP(w, r)
 }
 
 // handleSQLQuery executes a SQL query against the trace database

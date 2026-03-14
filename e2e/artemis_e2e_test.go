@@ -43,6 +43,7 @@ func createArtemis(env e2e.Environment) e2e.Runnable {
 		"tempo":    3200,  // Tempo API
 		"queryapi": 8080,  // Query API and Web UI
 		"pprof":    6060,  // pprof endpoint
+		"metrics":  9090,  // Prometheus metrics
 	}
 
 	f := env.Runnable("artemis").WithPorts(ports).Future()

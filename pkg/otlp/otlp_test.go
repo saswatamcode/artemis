@@ -434,7 +434,7 @@ func TestNewServer(t *testing.T) {
 	defer db.Close()
 
 	// Use port 0 to get a random free port
-	server, err := NewServer(db, "localhost:0", nil)
+	server, err := NewServer(db, "localhost:0", nil, nil, nil)
 	if err != nil {
 		t.Fatalf("NewServer() error = %v", err)
 	}
@@ -479,7 +479,7 @@ func TestServer_Export(t *testing.T) {
 	}
 	defer db.Close()
 
-	server, err := NewServer(db, "localhost:0", nil)
+	server, err := NewServer(db, "localhost:0", nil, nil, nil)
 	if err != nil {
 		t.Fatalf("NewServer() error = %v", err)
 	}

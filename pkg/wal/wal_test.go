@@ -13,7 +13,7 @@ import (
 func TestWAL_WriteAndRead(t *testing.T) {
 	tmpDir := t.TempDir()
 
-	w, err := NewWAL(tmpDir, nil)
+	w, err := NewWAL(tmpDir, nil, nil)
 	if err != nil {
 		t.Fatalf("NewWAL() error = %v", err)
 	}
@@ -62,7 +62,7 @@ func TestWAL_WriteAndRead(t *testing.T) {
 func TestWAL_MultipleSpans(t *testing.T) {
 	tmpDir := t.TempDir()
 
-	w, err := NewWAL(tmpDir, nil)
+	w, err := NewWAL(tmpDir, nil, nil)
 	if err != nil {
 		t.Fatalf("NewWAL() error = %v", err)
 	}
@@ -102,7 +102,7 @@ func TestWAL_MultipleSpans(t *testing.T) {
 func TestWAL_SegmentRotation(t *testing.T) {
 	tmpDir := t.TempDir()
 
-	w, err := NewWAL(tmpDir, nil)
+	w, err := NewWAL(tmpDir, nil, nil)
 	if err != nil {
 		t.Fatalf("NewWAL() error = %v", err)
 	}
@@ -174,7 +174,7 @@ func TestWAL_EmptyDir(t *testing.T) {
 func TestWAL_CorruptionHandling(t *testing.T) {
 	tmpDir := t.TempDir()
 
-	w, err := NewWAL(tmpDir, nil)
+	w, err := NewWAL(tmpDir, nil, nil)
 	if err != nil {
 		t.Fatalf("NewWAL() error = %v", err)
 	}
@@ -340,7 +340,7 @@ func TestReplay_WithCheckpointMetadata(t *testing.T) {
 	tmpDir := t.TempDir()
 
 	// Create WAL and write spans to multiple segments
-	w, err := NewWAL(tmpDir, nil)
+	w, err := NewWAL(tmpDir, nil, nil)
 	if err != nil {
 		t.Fatalf("NewWAL() error = %v", err)
 	}
@@ -444,7 +444,7 @@ func TestReplay_WithCheckpointMetadata(t *testing.T) {
 func BenchmarkWAL_WriteSpan(b *testing.B) {
 	tmpDir := b.TempDir()
 
-	w, err := NewWAL(tmpDir, nil)
+	w, err := NewWAL(tmpDir, nil, nil)
 	if err != nil {
 		b.Fatalf("NewWAL() error = %v", err)
 	}
