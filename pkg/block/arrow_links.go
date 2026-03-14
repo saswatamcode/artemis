@@ -1,12 +1,12 @@
 package block
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
 
 	"github.com/apache/arrow-go/v18/arrow"
-	"github.com/apache/arrow-go/v18/arrow/array"
 	"github.com/apache/arrow-go/v18/arrow/ipc"
 	"github.com/apache/arrow-go/v18/arrow/memory"
 
@@ -17,8 +17,18 @@ const (
 	linksFilename = "links.arrow"
 )
 
-// FlushLinksBlock writes link records to disk as Arrow IPC
+// FlushLinksBlock writes link records to disk as Arrow IPC.
+// For backward compatibility, this delegates to FlushLinksBlockContext with a background context.
 func FlushLinksBlock(dir string, records []arrow.RecordBatch, schema *arrow.Schema) error {
+	return FlushLinksBlockContext(context.Background(), dir, records, schema)
+}
+
+// FlushLinksBlockContext writes link records to disk as Arrow IPC with context support.
+func FlushLinksBlockContext(ctx context.Context, dir string, records []arrow.RecordBatch, schema *arrow.Schema) error {
+	// Check context before starting
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("context cancelled before links flush: %w", err)
+	}
 	if len(records) == 0 {
 		return nil // No links to write
 	}
@@ -35,7 +45,16 @@ func FlushLinksBlock(dir string, records []arrow.RecordBatch, schema *arrow.Sche
 		return fmt.Errorf("failed to create IPC writer: %w", err)
 	}
 
-	for _, rec := range records {
+	// Write records with context checks every 10 records
+	for i, rec := range records {
+		if i%10 == 0 {
+			if err := ctx.Err(); err != nil {
+				writer.Close()
+				f.Close()
+				return fmt.Errorf("context cancelled during link write (wrote %d/%d records): %w", i, len(records), err)
+			}
+		}
+
 		if err := writer.Write(rec); err != nil {
 			writer.Close()
 			f.Close()
@@ -98,58 +117,10 @@ func loadLinkRecords(dir string, mem memory.Allocator) ([]arrow.RecordBatch, *ar
 }
 
 // extractLinkFromArrowRecord extracts a span link from an Arrow record
+// extractLinkFromArrowRecord extracts a link from an Arrow record.
+// DEPRECATED: Use span.ExtractLinkFromRecord instead. This wrapper is kept for backward compatibility.
 func extractLinkFromArrowRecord(record arrow.RecordBatch, rowIndex int) (*span.SpanLink, error) {
-	if rowIndex < 0 || rowIndex >= int(record.NumRows()) {
-		return nil, fmt.Errorf("invalid row index %d (record has %d rows)", rowIndex, record.NumRows())
-	}
-
-	expectedColumns := 5 // span_id, linked_trace_id_hi, linked_trace_id_lo, linked_span_id, attributes
-	if record.NumCols() < int64(expectedColumns) {
-		return nil, fmt.Errorf("invalid schema: expected at least %d columns, got %d", expectedColumns, record.NumCols())
-	}
-
-	l := &span.SpanLink{}
-
-	// Read span_id and format as hex string
-	spanIDVal := record.Column(0).(*array.Uint64).Value(rowIndex)
-	l.SpanID = fmt.Sprintf("%016x", spanIDVal)
-
-	// Read linked_trace_id_hi and linked_trace_id_lo and format as hex string
-	linkedTraceIDHi := record.Column(1).(*array.Uint64).Value(rowIndex)
-	linkedTraceIDLo := record.Column(2).(*array.Uint64).Value(rowIndex)
-	l.LinkedTraceID = fmt.Sprintf("%016x%016x", linkedTraceIDHi, linkedTraceIDLo)
-
-	// Read linked_span_id and format as hex string
-	linkedSpanIDVal := record.Column(3).(*array.Uint64).Value(rowIndex)
-	l.LinkedSpanID = fmt.Sprintf("%016x", linkedSpanIDVal)
-
-	attrsCol := record.Column(4).(*array.Map)
-	if !attrsCol.IsNull(rowIndex) {
-		l.Attributes = make(map[string]string)
-
-		offsets := attrsCol.Offsets()
-		if rowIndex+1 >= len(offsets) {
-			return nil, fmt.Errorf("invalid offset index %d for attributes map (offsets length: %d)", rowIndex+1, len(offsets))
-		}
-
-		offset := offsets[rowIndex]
-		nextOffset := offsets[rowIndex+1]
-
-		keys := attrsCol.Keys().(*array.String)
-		items := attrsCol.Items().(*array.String)
-
-		for i := int(offset); i < int(nextOffset); i++ {
-			if i >= keys.Len() || i >= items.Len() {
-				return nil, fmt.Errorf("corrupted attributes data at row %d: index %d exceeds bounds (keys: %d, items: %d)",
-					rowIndex, i, keys.Len(), items.Len())
-			}
-			key := keys.Value(i)
-			value := items.Value(i)
-			l.Attributes[key] = value
-		}
-	}
-
-	return l, nil
+	return span.ExtractLinkFromRecord(record, rowIndex)
 }
 
 // GetLinksBySpanIDFromArrow retrieves links for a specific span ID from Arrow records

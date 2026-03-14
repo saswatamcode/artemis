@@ -258,18 +258,38 @@ func (pb *ParquetBlock) readSpanAt(rowGroupIdx, rowIdxInGroup int) (*span.Span, 
 
 // ReadAll reads all spans from the Parquet block (for full scans)
 // Memory efficient: Uses streaming reader, doesn't load all spans at once
+// ReadAll reads all spans from the Parquet block and enriches them with attributes and links.
+// Optimized for batch operations with parallel attribute/link loading.
 func (pb *ParquetBlock) ReadAll() ([]*span.Span, error) {
+	// Phase 1: Stream spans from Parquet file
+	spans, spanIDs, err := pb.readSpansFromParquet()
+	if err != nil {
+		return nil, err
+	}
+
+	// Phase 2: Fetch attributes and links in parallel
+	attrsMap, linksMap := pb.fetchMetadataInParallel(spanIDs)
+
+	// Phase 3: Merge metadata into spans
+	pb.mergeMetadataIntoSpans(spans, attrsMap, linksMap)
+
+	return spans, nil
+}
+
+// readSpansFromParquet streams spans from the Parquet file.
+// Returns the spans and their IDs for subsequent metadata loading.
+func (pb *ParquetBlock) readSpansFromParquet() ([]*span.Span, []string, error) {
 	reader := parquet.NewGenericReader[ParquetSpan](pb.file)
 	defer reader.Close()
 
 	totalSpans := make([]*span.Span, 0, pb.file.NumRows())
-	spanIDs := make([]string, 0, pb.file.NumRows()) // Track span IDs for attribute loading
-	batch := make([]ParquetSpan, 1024)              // Read in batches of 1024
+	spanIDs := make([]string, 0, pb.file.NumRows())
+	batch := make([]ParquetSpan, 1024) // Read in batches of 1024
 
 	for {
 		n, err := reader.Read(batch)
 		if err != nil && err != io.EOF {
-			return nil, fmt.Errorf("failed to read spans: %w", err)
+			return nil, nil, fmt.Errorf("failed to read spans: %w", err)
 		}
 
 		for i := range n {
@@ -283,66 +303,91 @@ func (pb *ParquetBlock) ReadAll() ([]*span.Span, error) {
 		}
 	}
 
-	// OPTIMIZATION: Batch fetch attributes and links in parallel
-	type batchResult struct {
+	return totalSpans, spanIDs, nil
+}
+
+// fetchMetadataInParallel fetches attributes and links for spans in parallel.
+// Uses optimized path with attribute references when available.
+func (pb *ParquetBlock) fetchMetadataInParallel(spanIDs []string) (map[string]map[string]string, map[string][]*span.SpanLink) {
+	type result struct {
 		attrsMap map[string]map[string]string
 		linksMap map[string][]*span.SpanLink
 	}
 
-	resultChan := make(chan batchResult, 1)
+	resultChan := make(chan result, 1)
 	go func() {
-		var result batchResult
+		var res result
 		var wg sync.WaitGroup
 
+		// Parallel attribute fetch
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			// OPTIMIZATION: Use direct attr refs if index has them
-			if pb.HasIndex() {
-				attrRefs := pb.index.LookupAttrRefsBatch(spanIDs)
-				if len(attrRefs) == len(spanIDs) {
-					// All spans have attr refs - pure fast path
-					result.attrsMap, _ = pb.GetAttributesByRefs(attrRefs)
-				} else if len(attrRefs) > 0 {
-					// Mixed case - use fast path + scan
-					fastAttrs, _ := pb.GetAttributesByRefs(attrRefs)
-					spansWithoutRefs := make([]string, 0)
-					for _, sid := range spanIDs {
-						if _, hasRef := attrRefs[sid]; !hasRef {
-							spansWithoutRefs = append(spansWithoutRefs, sid)
-						}
-					}
-					slowAttrs, _ := GetAttributesBatch(pb.dir, spansWithoutRefs)
-					result.attrsMap = fastAttrs
-					if slowAttrs != nil {
-						for k, v := range slowAttrs {
-							result.attrsMap[k] = v
-						}
-					}
-				} else {
-					result.attrsMap, _ = GetAttributesBatch(pb.dir, spanIDs)
-				}
-			} else {
-				result.attrsMap, _ = GetAttributesBatch(pb.dir, spanIDs)
-			}
+			res.attrsMap = pb.fetchAttributesOptimized(spanIDs)
 		}()
 
+		// Parallel link fetch
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			result.linksMap, _ = pb.GetLinksBatch(spanIDs)
+			res.linksMap, _ = pb.GetLinksBatch(spanIDs)
 		}()
 
 		wg.Wait()
-		resultChan <- result
+		resultChan <- res
 	}()
 
 	batchRes := <-resultChan
+	return batchRes.attrsMap, batchRes.linksMap
+}
 
+// fetchAttributesOptimized fetches attributes using the most efficient path available.
+// Uses attribute refs from index for fast O(1) lookups when available.
+func (pb *ParquetBlock) fetchAttributesOptimized(spanIDs []string) map[string]map[string]string {
+	// Fast path: Use index attribute refs if available
+	if pb.HasIndex() {
+		attrRefs := pb.index.LookupAttrRefsBatch(spanIDs)
+
+		// All spans have attr refs - pure fast path
+		if len(attrRefs) == len(spanIDs) {
+			attrsMap, _ := pb.GetAttributesByRefs(attrRefs)
+			return attrsMap
+		}
+
+		// Mixed case - use fast path + scan for missing
+		if len(attrRefs) > 0 {
+			fastAttrs, _ := pb.GetAttributesByRefs(attrRefs)
+
+			// Find spans without refs
+			spansWithoutRefs := make([]string, 0)
+			for _, sid := range spanIDs {
+				if _, hasRef := attrRefs[sid]; !hasRef {
+					spansWithoutRefs = append(spansWithoutRefs, sid)
+				}
+			}
+
+			// Merge fast + slow results
+			slowAttrs, _ := GetAttributesBatch(pb.dir, spansWithoutRefs)
+			if slowAttrs != nil {
+				for k, v := range slowAttrs {
+					fastAttrs[k] = v
+				}
+			}
+			return fastAttrs
+		}
+	}
+
+	// Slow path: Scan attributes file
+	attrsMap, _ := GetAttributesBatch(pb.dir, spanIDs)
+	return attrsMap
+}
+
+// mergeMetadataIntoSpans merges attributes and links into the span objects.
+func (pb *ParquetBlock) mergeMetadataIntoSpans(spans []*span.Span, attrsMap map[string]map[string]string, linksMap map[string][]*span.SpanLink) {
 	// Merge attributes
-	if batchRes.attrsMap != nil {
-		for _, sp := range totalSpans {
-			if attrs, found := batchRes.attrsMap[sp.SpanID]; found {
+	if attrsMap != nil {
+		for _, sp := range spans {
+			if attrs, found := attrsMap[sp.SpanID]; found {
 				if sp.Tags == nil {
 					sp.Tags = attrs
 				} else {
@@ -355,9 +400,9 @@ func (pb *ParquetBlock) ReadAll() ([]*span.Span, error) {
 	}
 
 	// Merge links
-	if batchRes.linksMap != nil {
-		for _, sp := range totalSpans {
-			if linkPtrs, found := batchRes.linksMap[sp.SpanID]; found {
+	if linksMap != nil {
+		for _, sp := range spans {
+			if linkPtrs, found := linksMap[sp.SpanID]; found {
 				sp.Links = make([]span.SpanLink, len(linkPtrs))
 				for i, l := range linkPtrs {
 					sp.Links[i] = *l
@@ -365,8 +410,6 @@ func (pb *ParquetBlock) ReadAll() ([]*span.Span, error) {
 			}
 		}
 	}
-
-	return totalSpans, nil
 }
 
 // GetAttributesByRefs efficiently retrieves attributes using direct row references
@@ -504,7 +547,7 @@ func (pb *ParquetBlock) GetAttributesByRefs(attrRefs map[string]index.AttrRef) (
 	return result, nil
 }
 
-// GetSpansBatch efficiently retrieves multiple spans by ID
+// GetSpansBatch efficiently retrieves multiple spans by ID.
 // Optimized PAGE-LEVEL reads:
 // 1. Group spans by row group
 // 2. Create one reader per row group (minimizes memory)
@@ -515,17 +558,37 @@ func (pb *ParquetBlock) GetSpansBatch(spanIDs []string) ([]*span.Span, error) {
 		return nil, fmt.Errorf("block has no index")
 	}
 
-	// Group lookups by row group
-	type rowLookup struct {
-		rowGroupIdx int
-		rowIdx      int
+	// Phase 1: Group spans by row group and fetch them
+	lookupsByRowGroup := pb.buildLookupsByRowGroup(spanIDs)
+	if len(lookupsByRowGroup) == 0 {
+		return nil, nil
 	}
 
+	spans := pb.fetchSpansByLookups(lookupsByRowGroup)
+
+	// Phase 2: Fetch attributes and links in parallel
+	attrsMap, linksMap := pb.fetchMetadataInParallel(spanIDs)
+
+	// Phase 3: Merge metadata into spans
+	pb.mergeMetadataIntoSpans(spans, attrsMap, linksMap)
+
+	return spans, nil
+}
+
+// rowLookup represents a span's location in the Parquet file.
+type rowLookup struct {
+	rowGroupIdx int
+	rowIdx      int
+}
+
+// buildLookupsByRowGroup groups span lookups by their row group for efficient batch reads.
+func (pb *ParquetBlock) buildLookupsByRowGroup(spanIDs []string) map[int][]rowLookup {
 	lookupsByRowGroup := make(map[int][]rowLookup)
+
 	for _, spanID := range spanIDs {
 		ref, ok := pb.index.LookupSpanID(spanID)
 		if !ok {
-			continue // Skip spans not found
+			continue // Skip spans not found in index
 		}
 
 		lookupsByRowGroup[ref.RecordIndex] = append(lookupsByRowGroup[ref.RecordIndex], rowLookup{
@@ -534,11 +597,12 @@ func (pb *ParquetBlock) GetSpansBatch(spanIDs []string) ([]*span.Span, error) {
 		})
 	}
 
-	if len(lookupsByRowGroup) == 0 {
-		return nil, nil
-	}
+	return lookupsByRowGroup
+}
 
-	results := make([]*span.Span, 0, len(spanIDs))
+// fetchSpansByLookups fetches spans from their respective row groups using optimized seeks.
+func (pb *ParquetBlock) fetchSpansByLookups(lookupsByRowGroup map[int][]rowLookup) []*span.Span {
+	results := make([]*span.Span, 0, len(lookupsByRowGroup)*10) // Estimate ~10 spans per row group
 	rowGroups := pb.file.RowGroups()
 
 	// Process each row group separately
@@ -547,7 +611,7 @@ func (pb *ParquetBlock) GetSpansBatch(spanIDs []string) ([]*span.Span, error) {
 			continue
 		}
 
-		// Sort lookups within this row group by row index for sequential reads
+		// Sort lookups by row index for sequential reads (better I/O performance)
 		sort.Slice(lookups, func(i, j int) bool {
 			return lookups[i].rowIdx < lookups[j].rowIdx
 		})
@@ -556,12 +620,11 @@ func (pb *ParquetBlock) GetSpansBatch(spanIDs []string) ([]*span.Span, error) {
 		rowGroup := rowGroups[rgIdx]
 		reader := parquet.NewGenericRowGroupReader[ParquetSpan](rowGroup)
 
-		// Use anonymous function to ensure reader.Close() is called at end of each iteration
-		// defer in a loop doesn't execute until function returns, causing resource leaks
+		// Use anonymous function to ensure reader.Close() is called
+		// (defer in a loop doesn't execute until function returns, causing resource leaks)
 		func() {
 			defer reader.Close()
 
-			// Read each span from this row group
 			currentRow := int64(-1)
 			batch := make([]ParquetSpan, 1)
 
@@ -588,108 +651,7 @@ func (pb *ParquetBlock) GetSpansBatch(spanIDs []string) ([]*span.Span, error) {
 		}()
 	}
 
-	// OPTIMIZATION: Batch fetch attributes and links in parallel
-	// This reduces sequential file I/O overhead by opening and reading files concurrently
-	type batchResult struct {
-		attrsMap map[string]map[string]string
-		linksMap map[string][]*span.SpanLink
-		attrsErr error
-		linksErr error
-	}
-
-	resultChan := make(chan batchResult, 1)
-
-	// Launch parallel goroutines to fetch attributes and links
-	go func() {
-		var result batchResult
-		var wg sync.WaitGroup
-
-		// Fetch attributes in parallel - use optimized path if attrIndex exists
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-
-			// OPTIMIZATION: Use direct attribute refs if index has them
-			// This is 10-15x faster than scanning attributes.parquet
-			attrRefs := pb.index.LookupAttrRefsBatch(spanIDs)
-
-			if len(attrRefs) == len(spanIDs) {
-				// All spans have attr refs - pure fast path
-				result.attrsMap, result.attrsErr = pb.GetAttributesByRefs(attrRefs)
-			} else if len(attrRefs) > 0 {
-				// Mixed case - some spans have attrs in index, some don't
-				// Use fast path for ones with refs, scan for the rest
-				fastAttrs, _ := pb.GetAttributesByRefs(attrRefs)
-
-				// Find spans without attr refs
-				spansWithoutRefs := make([]string, 0, len(spanIDs)-len(attrRefs))
-				for _, sid := range spanIDs {
-					if _, hasRef := attrRefs[sid]; !hasRef {
-						spansWithoutRefs = append(spansWithoutRefs, sid)
-					}
-				}
-
-				// Scan for spans without refs
-				slowAttrs, _ := GetAttributesBatch(pb.dir, spansWithoutRefs)
-
-				// Merge results
-				result.attrsMap = fastAttrs
-				if slowAttrs != nil {
-					for k, v := range slowAttrs {
-						result.attrsMap[k] = v
-					}
-				}
-			} else {
-				// No spans have attr refs - pure fallback (old blocks or spans without attributes)
-				result.attrsMap, result.attrsErr = GetAttributesBatch(pb.dir, spanIDs)
-			}
-		}()
-
-		// Fetch links in parallel
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			result.linksMap, result.linksErr = pb.GetLinksBatch(spanIDs)
-		}()
-
-		wg.Wait()
-		resultChan <- result
-	}()
-
-	// Wait for parallel fetches to complete
-	batchRes := <-resultChan
-
-	// Merge attributes into spans
-	if batchRes.attrsMap != nil {
-		for _, sp := range results {
-			if attrs, found := batchRes.attrsMap[sp.SpanID]; found {
-				// Merge attributes from separate file
-				// Attributes from attributes.parquet take precedence if there's overlap
-				if sp.Tags == nil {
-					sp.Tags = attrs
-				} else {
-					for k, v := range attrs {
-						sp.Tags[k] = v
-					}
-				}
-			}
-		}
-	}
-
-	// Merge links into spans
-	if batchRes.linksMap != nil {
-		for _, sp := range results {
-			if linkPtrs, found := batchRes.linksMap[sp.SpanID]; found {
-				// Convert []*SpanLink to []SpanLink
-				sp.Links = make([]span.SpanLink, len(linkPtrs))
-				for i, l := range linkPtrs {
-					sp.Links[i] = *l
-				}
-			}
-		}
-	}
-
-	return results, nil
+	return results
 }
 
 // RowReference identifies a specific span by row group and row index
@@ -1107,22 +1069,15 @@ func SpanToParquetSpan(s *span.Span) *ParquetSpan {
 // parquetSpanToSpan converts a ParquetSpan to Span
 func parquetSpanToSpan(ps *ParquetSpan) *span.Span {
 	// Convert trace ID from hi/lo to hex string
-	var traceIDBuf [32]byte
-	uint64ToHex(ps.TraceIDHi, traceIDBuf[:16])
-	uint64ToHex(ps.TraceIDLo, traceIDBuf[16:])
-	traceID := string(traceIDBuf[:])
+	traceID := span.FormatTraceID(ps.TraceIDHi, ps.TraceIDLo)
 
 	// Convert span ID to hex string
-	var spanIDBuf [16]byte
-	uint64ToHex(ps.SpanID, spanIDBuf[:])
-	spanID := string(spanIDBuf[:])
+	spanID := span.FormatSpanID(ps.SpanID)
 
 	// Convert parent span ID to hex string (empty if 0)
 	parentSpanID := ""
 	if ps.ParentSpanID != 0 {
-		var parentIDBuf [16]byte
-		uint64ToHex(ps.ParentSpanID, parentIDBuf[:])
-		parentSpanID = string(parentIDBuf[:])
+		parentSpanID = span.FormatSpanID(ps.ParentSpanID)
 	}
 
 	return &span.Span{

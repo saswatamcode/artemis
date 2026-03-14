@@ -844,12 +844,31 @@ func (db *DB) flushHeadBlock() error {
 	return nil
 }
 
-// GetBlocks returns all persisted blocks
+// GetBlocks returns all persisted blocks (excludes head block)
 func (db *DB) GetBlocks() []block.Block {
 	if db.blockManager == nil {
 		return nil
 	}
 	return db.blockManager.GetBlocks()
+}
+
+// GetAllBlocks returns ALL blocks including the head block
+// This is used by the query engine to ensure head block data is queryable
+func (db *DB) GetAllBlocks() []block.Block {
+	// Flush any pending data to ensure queries see all data
+	db.storage.Flush()
+
+	// Get persisted blocks
+	var blocks []block.Block
+	if db.blockManager != nil {
+		blocks = db.blockManager.GetBlocks()
+	}
+
+	// Add head block at the end (queries scan persisted blocks first, then head)
+	headBlock := block.NewHeadBlock(db.storage, db.linkStorage)
+	blocks = append(blocks, headBlock)
+
+	return blocks
 }
 
 // GetQuerier creates a new querier for the current database state

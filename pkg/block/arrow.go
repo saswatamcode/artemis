@@ -1,15 +1,14 @@
 package block
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
-	"time"
 
 	"github.com/apache/arrow-go/v18/arrow"
-	"github.com/apache/arrow-go/v18/arrow/array"
 	"github.com/apache/arrow-go/v18/arrow/ipc"
 	"github.com/apache/arrow-go/v18/arrow/memory"
 
@@ -274,15 +273,31 @@ func (ab *ArrowBlock) GetSpansBatch(spanIDs []string) ([]*span.Span, error) {
 	}
 
 	// Process each record once, extracting all needed spans
+	errorCount := 0
+	const maxErrors = 100 // Fail fast if too many errors
+
 	for recordIdx, rowIndices := range recordGroups {
 		record := ab.records[recordIdx]
 		for _, rowIdx := range rowIndices {
 			sp, err := extractSpanFromArrowRecord(record, rowIdx)
 			if err != nil {
+				errorCount++
+				slog.Warn("failed to extract span from record",
+					"row", rowIdx, "record", recordIdx, "error", err, "block_dir", ab.dir)
+				if errorCount > maxErrors {
+					return nil, fmt.Errorf("too many extraction errors (%d), aborting", errorCount)
+				}
 				continue
 			}
 			result = append(result, sp)
 		}
+	}
+
+	if errorCount > 0 {
+		slog.Warn("span extraction completed with errors",
+			"error_count", errorCount,
+			"success_count", len(result),
+			"block_dir", ab.dir)
 	}
 
 	// Batch fetch links if they exist
@@ -305,15 +320,30 @@ func (ab *ArrowBlock) GetSpansBatch(spanIDs []string) ([]*span.Span, error) {
 // ReadAll reads all spans from the Arrow block
 func (ab *ArrowBlock) ReadAll() ([]*span.Span, error) {
 	result := make([]*span.Span, 0)
+	errorCount := 0
+	const maxErrors = 100 // Fail fast if too many errors
 
-	for _, record := range ab.records {
+	for recordIdx, record := range ab.records {
 		for row := 0; row < int(record.NumRows()); row++ {
 			sp, err := extractSpanFromArrowRecord(record, row)
 			if err != nil {
+				errorCount++
+				slog.Warn("failed to extract span from record",
+					"row", row, "record", recordIdx, "error", err, "block_dir", ab.dir)
+				if errorCount > maxErrors {
+					return nil, fmt.Errorf("too many extraction errors (%d), aborting", errorCount)
+				}
 				continue
 			}
 			result = append(result, sp)
 		}
+	}
+
+	if errorCount > 0 {
+		slog.Warn("ReadAll completed with errors",
+			"error_count", errorCount,
+			"success_count", len(result),
+			"block_dir", ab.dir)
 	}
 
 	return result, nil
@@ -352,11 +382,19 @@ func (ab *ArrowBlock) GetSpansByTag(tagKey, tagValue string) ([]*span.Span, erro
 // scanByTraceID is a fallback full scan when no index is available
 func (ab *ArrowBlock) scanByTraceID(traceID string) ([]*span.Span, error) {
 	result := make([]*span.Span, 0)
+	errorCount := 0
+	const maxErrors = 100 // Fail fast if too many errors
 
-	for _, record := range ab.records {
+	for recordIdx, record := range ab.records {
 		for row := 0; row < int(record.NumRows()); row++ {
 			sp, err := extractSpanFromArrowRecord(record, row)
 			if err != nil {
+				errorCount++
+				slog.Warn("failed to extract span during trace scan",
+					"row", row, "record", recordIdx, "error", err, "block_dir", ab.dir)
+				if errorCount > maxErrors {
+					return nil, fmt.Errorf("too many extraction errors (%d) during trace scan", errorCount)
+				}
 				continue
 			}
 			if sp.TraceID == traceID {
@@ -365,17 +403,33 @@ func (ab *ArrowBlock) scanByTraceID(traceID string) ([]*span.Span, error) {
 		}
 	}
 
+	if errorCount > 0 {
+		slog.Warn("trace scan completed with errors",
+			"error_count", errorCount,
+			"success_count", len(result),
+			"trace_id", traceID,
+			"block_dir", ab.dir)
+	}
+
 	return result, nil
 }
 
 // scanByTag is a fallback full scan when no index is available
 func (ab *ArrowBlock) scanByTag(tagKey, tagValue string) ([]*span.Span, error) {
 	result := make([]*span.Span, 0)
+	errorCount := 0
+	const maxErrors = 100 // Fail fast if too many errors
 
-	for _, record := range ab.records {
+	for recordIdx, record := range ab.records {
 		for row := 0; row < int(record.NumRows()); row++ {
 			sp, err := extractSpanFromArrowRecord(record, row)
 			if err != nil {
+				errorCount++
+				slog.Warn("failed to extract span during tag scan",
+					"row", row, "record", recordIdx, "error", err, "block_dir", ab.dir)
+				if errorCount > maxErrors {
+					return nil, fmt.Errorf("too many extraction errors (%d) during tag scan", errorCount)
+				}
 				continue
 			}
 			if sp.Tags != nil && sp.Tags[tagKey] == tagValue {
@@ -384,109 +438,40 @@ func (ab *ArrowBlock) scanByTag(tagKey, tagValue string) ([]*span.Span, error) {
 		}
 	}
 
+	if errorCount > 0 {
+		slog.Warn("tag scan completed with errors",
+			"error_count", errorCount,
+			"success_count", len(result),
+			"tag_key", tagKey,
+			"tag_value", tagValue,
+			"block_dir", ab.dir)
+	}
+
 	return result, nil
 }
 
-// hexDigits for fast hex encoding
-const hexDigits = "0123456789abcdef"
-
-// uint64ToHex converts a uint64 to a 16-character hex string without allocations
-// Much faster than fmt.Sprintf("%016x", val)
-func uint64ToHex(val uint64, buf []byte) {
-	_ = buf[15] // bounds check hint
-	for i := 15; i >= 0; i-- {
-		buf[i] = hexDigits[val&0xf]
-		val >>= 4
-	}
-}
-
-// extractSpanFromArrowRecord extracts a span from an Arrow record
+// extractSpanFromArrowRecord extracts a span from an Arrow record.
+// DEPRECATED: Use span.ExtractSpanFromRecord instead. This wrapper is kept for backward compatibility.
 func extractSpanFromArrowRecord(record arrow.RecordBatch, rowIndex int) (*span.Span, error) {
-	// Validate row index
-	if rowIndex < 0 || rowIndex >= int(record.NumRows()) {
-		return nil, fmt.Errorf("invalid row index %d (record has %d rows)", rowIndex, record.NumRows())
-	}
-
-	// Validate schema has expected number of columns
-	// Note: We have 12 columns now (10 original + 2 new indexing fields)
-	// but the new fields (bucket1s, duration_bucket) don't need to be extracted
-	// into the Span struct as they're derived for indexing purposes
-	expectedColumns := 12
-	if record.NumCols() < int64(expectedColumns) {
-		return nil, fmt.Errorf("invalid schema: expected at least %d columns, got %d", expectedColumns, record.NumCols())
-	}
-
-	sp := &span.Span{}
-
-	// Extract fields with bounds checking
-	// Read trace_id_hi and trace_id_lo and format as hex string
-	traceIDHi := record.Column(0).(*array.Uint64).Value(rowIndex)
-	traceIDLo := record.Column(1).(*array.Uint64).Value(rowIndex)
-	var traceIDBuf [32]byte
-	uint64ToHex(traceIDHi, traceIDBuf[:16])
-	uint64ToHex(traceIDLo, traceIDBuf[16:])
-	sp.TraceID = string(traceIDBuf[:])
-
-	// Read span_id and format as hex string
-	spanIDVal := record.Column(2).(*array.Uint64).Value(rowIndex)
-	var spanIDBuf [16]byte
-	uint64ToHex(spanIDVal, spanIDBuf[:])
-	sp.SpanID = string(spanIDBuf[:])
-
-	// Read parent_span_id and format as hex string (or empty if null)
-	parentCol := record.Column(3).(*array.Uint64)
-	if !parentCol.IsNull(rowIndex) {
-		parentSpanIDVal := parentCol.Value(rowIndex)
-		var parentIDBuf [16]byte
-		uint64ToHex(parentSpanIDVal, parentIDBuf[:])
-		sp.ParentSpanID = string(parentIDBuf[:])
-	}
-
-	sp.Name = record.Column(4).(*array.String).Value(rowIndex)
-
-	sp.StartTime = time.Unix(0, record.Column(5).(*array.Int64).Value(rowIndex))
-
-	sp.EndTime = time.Unix(0, record.Column(6).(*array.Int64).Value(rowIndex))
-
-	sp.Duration = record.Column(7).(*array.Int64).Value(rowIndex)
-
-	sp.ServiceName = record.Column(8).(*array.String).Value(rowIndex)
-
-	tagsCol := record.Column(9).(*array.Map)
-	if !tagsCol.IsNull(rowIndex) {
-		sp.Tags = make(map[string]string)
-
-		offsets := tagsCol.Offsets()
-		// Validate offset bounds
-		if rowIndex+1 >= len(offsets) {
-			return nil, fmt.Errorf("invalid offset index %d for tags map (offsets length: %d)", rowIndex+1, len(offsets))
-		}
-
-		offset := offsets[rowIndex]
-		nextOffset := offsets[rowIndex+1]
-
-		keys := tagsCol.Keys().(*array.String)
-		items := tagsCol.Items().(*array.String)
-
-		for i := int(offset); i < int(nextOffset); i++ {
-			// Return error on malformed data instead of silently breaking
-			// This ensures callers know the data is corrupted rather than seeing incomplete tags
-			if i >= keys.Len() || i >= items.Len() {
-				return nil, fmt.Errorf("corrupted tags data at row %d: tag index %d exceeds bounds (keys: %d, items: %d)",
-					rowIndex, i, keys.Len(), items.Len())
-			}
-			key := keys.Value(i)
-			value := items.Value(i)
-			sp.Tags[key] = value
-		}
-	}
-
-	return sp, nil
+	return span.ExtractSpanFromRecord(record, rowIndex)
 }
 
-// FlushBlock flushes an in-memory block to disk as Arrow IPC
-// Uses atomic write with temporary directory to prevent corruption
+// FlushBlock flushes an in-memory block to disk as Arrow IPC.
+// For backward compatibility, this delegates to FlushBlockContext with a background context.
+// For production use with timeout/cancellation support, use FlushBlockContext directly.
 func FlushBlock(dir string, meta *BlockMeta, records []arrow.RecordBatch, schema *arrow.Schema, idx *index.Index) error {
+	return FlushBlockContext(context.Background(), dir, meta, records, schema, idx)
+}
+
+// FlushBlockContext flushes an in-memory block to disk as Arrow IPC with context support.
+// Uses atomic write with temporary directory to prevent corruption.
+// Context is checked at key points during file I/O operations.
+func FlushBlockContext(ctx context.Context, dir string, meta *BlockMeta, records []arrow.RecordBatch, schema *arrow.Schema, idx *index.Index) error {
+	// Check context before starting
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("context cancelled before block flush: %w", err)
+	}
+
 	// CRITICAL: Write to temporary directory first for atomicity
 	// This prevents corruption if system crashes during write
 	tmpDir := dir + ".tmp"
@@ -497,6 +482,12 @@ func FlushBlock(dir string, meta *BlockMeta, records []arrow.RecordBatch, schema
 	// Create temporary block directory
 	if err := os.MkdirAll(tmpDir, 0755); err != nil {
 		return fmt.Errorf("failed to create temp block directory: %w", err)
+	}
+
+	// Check context after directory creation
+	if err := ctx.Err(); err != nil {
+		os.RemoveAll(tmpDir)
+		return fmt.Errorf("context cancelled during block flush: %w", err)
 	}
 
 	metaPath := filepath.Join(tmpDir, metaFilename)
@@ -511,6 +502,12 @@ func FlushBlock(dir string, meta *BlockMeta, records []arrow.RecordBatch, schema
 	}
 
 	if idx != nil {
+		// Check context before writing index
+		if err := ctx.Err(); err != nil {
+			os.RemoveAll(tmpDir)
+			return fmt.Errorf("context cancelled before index write: %w", err)
+		}
+
 		indexPath := filepath.Join(tmpDir, indexFilename)
 		serialized := idx.Serialize()
 		indexData, err := json.MarshalIndent(serialized, "", "  ")
@@ -522,6 +519,12 @@ func FlushBlock(dir string, meta *BlockMeta, records []arrow.RecordBatch, schema
 			os.RemoveAll(tmpDir)
 			return fmt.Errorf("failed to write index: %w", err)
 		}
+	}
+
+	// Check context before writing data file
+	if err := ctx.Err(); err != nil {
+		os.RemoveAll(tmpDir)
+		return fmt.Errorf("context cancelled before data file write: %w", err)
 	}
 
 	dataPath := filepath.Join(tmpDir, dataFilename)
@@ -538,7 +541,17 @@ func FlushBlock(dir string, meta *BlockMeta, records []arrow.RecordBatch, schema
 		return fmt.Errorf("failed to create IPC writer: %w", err)
 	}
 
-	for _, rec := range records {
+	// Write records with context checks every 10 records
+	for i, rec := range records {
+		if i%10 == 0 {
+			if err := ctx.Err(); err != nil {
+				writer.Close()
+				f.Close()
+				os.RemoveAll(tmpDir)
+				return fmt.Errorf("context cancelled during record write (wrote %d/%d records): %w", i, len(records), err)
+			}
+		}
+
 		if err := writer.Write(rec); err != nil {
 			writer.Close()
 			f.Close()

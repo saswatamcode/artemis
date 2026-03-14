@@ -1,7 +1,7 @@
 package block
 
 import (
-	"fmt"
+	"log/slog"
 
 	"github.com/saswatamcode/artemis/pkg/index"
 	"github.com/saswatamcode/artemis/pkg/span"
@@ -20,13 +20,23 @@ type HeadBlock struct {
 	storage     *storage.ArrowStorage
 	linkStorage *storage.ArrowLinkStorage
 	meta        *BlockMeta
+	logger      *slog.Logger
 }
 
-// NewHeadBlock creates a new head block wrapper around ArrowStorage
-func NewHeadBlock(storage *storage.ArrowStorage, linkStorage *storage.ArrowLinkStorage) *HeadBlock {
+// NewHeadBlock creates a new head block wrapper around ArrowStorage.
+// Optional logger can be passed as variadic argument for structured logging.
+// If no logger provided, uses slog.Default().
+func NewHeadBlock(storage *storage.ArrowStorage, linkStorage *storage.ArrowLinkStorage, logger ...*slog.Logger) *HeadBlock {
+	var l *slog.Logger
+	if len(logger) > 0 && logger[0] != nil {
+		l = logger[0]
+	} else {
+		l = slog.Default()
+	}
 	return &HeadBlock{
 		storage:     storage,
 		linkStorage: linkStorage,
+		logger:      l,
 	}
 }
 
@@ -103,8 +113,10 @@ func (hb *HeadBlock) GetSpansBatch(spanIDs []string) ([]*span.Span, error) {
 		if ref.RecordIndex >= len(records) {
 			// Log warning for invalid record index to help detect index corruption
 			// This makes debugging easier compared to silently skipping
-			fmt.Printf("WARNING: HeadBlock index corruption - span %s has invalid record index %d (only %d records exist)\n",
-				spanID, ref.RecordIndex, len(records))
+			hb.logger.Warn("index corruption detected",
+				slog.String("span_id", spanID),
+				slog.Int("record_index", ref.RecordIndex),
+				slog.Int("total_records", len(records)))
 			continue
 		}
 
@@ -126,7 +138,7 @@ func (hb *HeadBlock) GetSpansBatch(spanIDs []string) ([]*span.Span, error) {
 	for recordIdx, rowIndices := range recordGroups {
 		record := records[recordIdx]
 		for _, rowIdx := range rowIndices {
-			sp, err := extractSpanFromArrowRecord(record, rowIdx)
+			sp, err := span.ExtractSpanFromRecord(record, rowIdx)
 			if err != nil {
 				continue
 			}
@@ -144,7 +156,7 @@ func (hb *HeadBlock) ReadAll() ([]*span.Span, error) {
 
 	for _, record := range records {
 		for row := 0; row < int(record.NumRows()); row++ {
-			sp, err := extractSpanFromArrowRecord(record, row)
+			sp, err := span.ExtractSpanFromRecord(record, row)
 			if err != nil {
 				continue
 			}

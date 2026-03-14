@@ -33,8 +33,9 @@ func NewServer(db *tracedb.DB, logger *slog.Logger, dbMetrics *metrics.DatabaseM
 	}
 
 	// Create query engine once for reuse across all queries
+	// IMPORTANT: Use GetAllBlocks to include head block in queries
 	isolation := db.GetIsolation()
-	queryEngine := engine.NewEngine(db.GetBlocks, isolation)
+	queryEngine := engine.NewEngine(db.GetAllBlocks, isolation)
 
 	s := &Server{
 		db:          db,

@@ -1,6 +1,7 @@
 package storage
 
 import (
+	"sort"
 	"sync"
 	"sync/atomic"
 
@@ -27,6 +28,8 @@ type IsolationCoordinator struct {
 	commitSeqMap  map[uint64]uint64 // txnID -> commit sequence number
 	committedSeqs []uint64          // Ordered list of committed sequences
 	spanIDToTxn   map[string]uint64 // Reverse index: spanID -> txnID (for lock-free visibility checks)
+	seqToTxn      map[uint64]uint64 // Reverse index: commit sequence -> txnID (for O(1) snapshot lookups)
+	inFlightTxns  map[uint64]uint64 // NEW: Tracks transactions currently committing (txnID -> commitSeq)
 
 	// Buffer pools for efficient memory reuse
 	spanBufferPool sync.Pool
@@ -45,6 +48,8 @@ func NewIsolationCoordinator() *IsolationCoordinator {
 		commitSeqMap:  make(map[uint64]uint64),
 		committedSeqs: make([]uint64, 0, 1024),
 		spanIDToTxn:   make(map[string]uint64),
+		seqToTxn:      make(map[uint64]uint64), // Initialize reverse index
+		inFlightTxns:  make(map[uint64]uint64), // NEW: Initialize in-flight tracking
 	}
 
 	// Initialize buffer pools with pre-allocated slices
@@ -124,32 +129,43 @@ func (ic *IsolationCoordinator) AssignCommitSequence(txnID uint64) uint64 {
 	return commitSeq
 }
 
+// MarkInFlight marks a transaction as in-flight (between commit sequence assignment and full commit).
+// This prevents visibility of spans before they are fully committed.
+// MUST be called while holding appendMu (or immediately after AssignCommitSequence).
+func (ic *IsolationCoordinator) MarkInFlight(txnID uint64, commitSeq uint64) {
+	ic.mvccMu.Lock()
+	defer ic.mvccMu.Unlock()
+	ic.inFlightTxns[txnID] = commitSeq
+}
+
 // RegisterCommit registers a committed transaction with its span IDs.
 // This is used for MVCC snapshot isolation during queries.
 // The commitSeq parameter establishes the actual commit order.
+//
+// NEW: This now completes the commit that was started with MarkInFlight.
+// The two-phase approach (MarkInFlight -> RegisterCommit) prevents the visibility race.
 func (ic *IsolationCoordinator) RegisterCommit(txnID uint64, commitSeq uint64, spanIDs []string) {
 	ic.mvccMu.Lock()
 	defer ic.mvccMu.Unlock()
 
+	// Remove from in-flight (if it was marked)
+	delete(ic.inFlightTxns, txnID)
+
 	// Store span IDs for this transaction
 	ic.mvccMap[txnID] = spanIDs
+
+	// Add reverse mapping from commit sequence to transaction ID
+	ic.seqToTxn[commitSeq] = txnID
 
 	// Build reverse index for lock-free visibility checks
 	for _, spanID := range spanIDs {
 		ic.spanIDToTxn[spanID] = txnID
 	}
 
-	// Insert commit sequence in order (binary search for insertion point)
-	insertIdx := len(ic.committedSeqs)
-	for i := len(ic.committedSeqs) - 1; i >= 0; i-- {
-		if ic.committedSeqs[i] < commitSeq {
-			insertIdx = i + 1
-			break
-		}
-		if i == 0 {
-			insertIdx = 0
-		}
-	}
+	// Insert commit sequence in order using binary search for O(log N) instead of O(N)
+	insertIdx := sort.Search(len(ic.committedSeqs), func(i int) bool {
+		return ic.committedSeqs[i] > commitSeq
+	})
 
 	// Insert at the correct position
 	ic.committedSeqs = append(ic.committedSeqs, 0)
@@ -162,28 +178,63 @@ func (ic *IsolationCoordinator) RegisterCommit(txnID uint64, commitSeq uint64, s
 	// Keep last 10,000 transactions for snapshot isolation
 	if len(ic.committedSeqs) > 10000 {
 		oldSeq := ic.committedSeqs[0]
-		// Find txnID with this sequence
-		for txnID, seq := range ic.commitSeqMap {
-			if seq == oldSeq {
-				// Remove from reverse index
-				if spanIDs, ok := ic.mvccMap[txnID]; ok {
-					for _, spanID := range spanIDs {
-						delete(ic.spanIDToTxn, spanID)
-					}
+		// Use reverse index for O(1) lookup instead of O(M) iteration
+		if txnID, ok := ic.seqToTxn[oldSeq]; ok {
+			// Remove from reverse index
+			if spanIDs, ok := ic.mvccMap[txnID]; ok {
+				for _, spanID := range spanIDs {
+					delete(ic.spanIDToTxn, spanID)
 				}
-				delete(ic.mvccMap, txnID)
-				delete(ic.commitSeqMap, txnID)
-				break
 			}
+			delete(ic.mvccMap, txnID)
+			delete(ic.commitSeqMap, txnID)
+			delete(ic.seqToTxn, oldSeq) // Clean up reverse index
 		}
 		ic.committedSeqs = ic.committedSeqs[1:]
 	}
 }
 
-// RegisterRollback registers a rolled back transaction.
+// RegisterRollback registers a rolled back transaction and cleans up any MVCC state.
+// This handles both explicit rollbacks and commit failures.
+//
+// For explicit rollbacks (before commit sequence assigned):
+//   - Just increments rollback counter
+//
+// For commit failures (after commit sequence assigned and marked in-flight):
+//   - Removes in-flight marker
+//   - Cleans up commit sequence, span mappings, etc.
+//   - Increments rollback counter
 func (ic *IsolationCoordinator) RegisterRollback(txnID uint64) {
+	ic.mvccMu.Lock()
+	defer ic.mvccMu.Unlock()
+
+	// Remove from in-flight (no-op if not in-flight)
+	delete(ic.inFlightTxns, txnID)
+
+	// Remove from commit sequence map
+	if commitSeq, ok := ic.commitSeqMap[txnID]; ok {
+		delete(ic.commitSeqMap, txnID)
+		delete(ic.seqToTxn, commitSeq)
+
+		// Remove from committed sequences
+		for i, seq := range ic.committedSeqs {
+			if seq == commitSeq {
+				ic.committedSeqs = append(ic.committedSeqs[:i], ic.committedSeqs[i+1:]...)
+				break
+			}
+		}
+	}
+
+	// Remove from reverse index
+	if spanIDs, ok := ic.mvccMap[txnID]; ok {
+		for _, spanID := range spanIDs {
+			delete(ic.spanIDToTxn, spanID)
+		}
+		delete(ic.mvccMap, txnID)
+	}
+
+	// Increment rollback counter
 	ic.totalRollbacks.Add(1)
-	// No need to add to MVCC map since transaction was aborted
 }
 
 // BeginQuery returns a snapshot commit sequence for lock-free querying.
@@ -215,6 +266,7 @@ func (ic *IsolationCoordinator) BeginQuery() uint64 {
 //   - Span's transaction was committed at or before the snapshot
 //
 // Returns false if:
+//   - Span's transaction is currently in-flight (not fully committed)
 //   - Span's transaction was not committed
 //   - Span's transaction was committed after the snapshot
 func (ic *IsolationCoordinator) IsVisible(spanID string, snapshotSeq uint64) bool {
@@ -227,6 +279,12 @@ func (ic *IsolationCoordinator) IsVisible(spanID string, snapshotSeq uint64) boo
 		// Span not in MVCC map - written directly via AddSpan (non-transactional)
 		// Such spans are always visible for backwards compatibility
 		return true
+	}
+
+	// NEW: Check if transaction is in-flight (between commit sequence assignment and RegisterCommit)
+	// In-flight transactions should not be visible to any query, even if commitSeq <= snapshotSeq
+	if _, inFlight := ic.inFlightTxns[txnID]; inFlight {
+		return false // Transaction is still committing, not yet visible
 	}
 
 	// Look up commit sequence for this transaction
@@ -242,6 +300,9 @@ func (ic *IsolationCoordinator) IsVisible(spanID string, snapshotSeq uint64) boo
 // GetSnapshot returns all span IDs visible to a transaction at given commit sequence.
 // This returns all transactions committed before or at the given sequence number.
 // This is used by query layer for snapshot isolation.
+//
+// PERFORMANCE: O(N) instead of O(N*M) thanks to seqToTxn reverse index.
+// With 10K transactions, this is 100x faster (10K vs 100M lookups).
 func (ic *IsolationCoordinator) GetSnapshot(snapshotCommitSeq uint64) []string {
 	ic.mvccMu.RLock()
 	defer ic.mvccMu.RUnlock()
@@ -251,12 +312,9 @@ func (ic *IsolationCoordinator) GetSnapshot(snapshotCommitSeq uint64) []string {
 	// Collect all span IDs from transactions with commit sequence <= snapshot
 	for _, seq := range ic.committedSeqs {
 		if seq <= snapshotCommitSeq {
-			// Find txnID for this sequence
-			for txnID, commitSeq := range ic.commitSeqMap {
-				if commitSeq == seq {
-					visibleSpanIDs = append(visibleSpanIDs, ic.mvccMap[txnID]...)
-					break
-				}
+			// O(1) lookup using reverse index instead of O(M) iteration!
+			if txnID, ok := ic.seqToTxn[seq]; ok {
+				visibleSpanIDs = append(visibleSpanIDs, ic.mvccMap[txnID]...)
 			}
 		}
 	}
@@ -265,6 +323,8 @@ func (ic *IsolationCoordinator) GetSnapshot(snapshotCommitSeq uint64) []string {
 }
 
 // GetLatestSnapshot returns all span IDs from all committed transactions.
+//
+// PERFORMANCE: O(N) instead of O(N*M) thanks to seqToTxn reverse index.
 func (ic *IsolationCoordinator) GetLatestSnapshot() (uint64, []string) {
 	ic.mvccMu.RLock()
 	defer ic.mvccMu.RUnlock()
@@ -278,12 +338,9 @@ func (ic *IsolationCoordinator) GetLatestSnapshot() (uint64, []string) {
 
 	// Collect all span IDs from all committed transactions
 	for _, seq := range ic.committedSeqs {
-		// Find txnID for this sequence
-		for txnID, commitSeq := range ic.commitSeqMap {
-			if commitSeq == seq {
-				visibleSpanIDs = append(visibleSpanIDs, ic.mvccMap[txnID]...)
-				break
-			}
+		// O(1) lookup using reverse index instead of O(M) iteration!
+		if txnID, ok := ic.seqToTxn[seq]; ok {
+			visibleSpanIDs = append(visibleSpanIDs, ic.mvccMap[txnID]...)
 		}
 	}
 

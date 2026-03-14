@@ -1,6 +1,7 @@
 package compactor
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"log/slog"
@@ -29,7 +30,7 @@ type Compactor struct {
 	spanPool        *sync.Pool // Reuse []*span.Span buffers
 	parquetSpanPool *sync.Pool // Reuse []block.ParquetSpan buffers
 	rowPool         *sync.Pool // Reuse []parquet.Row buffers
-	rowBuilderPool  *sync.Pool // Reuse parquet.RowBuilder instances
+	rowCopyPool     *sync.Pool // Reuse individual parquet.Row copies
 }
 
 // NewCompactor creates a new compactor with default level configs
@@ -57,10 +58,11 @@ func NewCompactor(baseDir string) *Compactor {
 				return &s
 			},
 		},
-		rowBuilderPool: &sync.Pool{
+		rowCopyPool: &sync.Pool{
 			New: func() interface{} {
-				// RowBuilder will be initialized with schema when used
-				return nil
+				// Pre-allocate typical row size (~20 columns)
+				r := make(parquet.Row, 0, 20)
+				return &r
 			},
 		},
 	}
@@ -78,11 +80,17 @@ func (c *Compactor) GetBaseDir() string {
 	return c.baseDir
 }
 
-// Plan creates a compaction plan for blocks at a given level
-func (c *Compactor) Plan(blocks []block.Block, level int) *CompactionPlan {
+// PlanContext creates a compaction plan for blocks at a given level with context support.
+// Context is checked at the beginning to allow early cancellation.
+func (c *Compactor) PlanContext(ctx context.Context, blocks []block.Block, level int) (*CompactionPlan, error) {
+	// Check context before starting
+	if err := ctx.Err(); err != nil {
+		return nil, fmt.Errorf("context cancelled before planning: %w", err)
+	}
+
 	cfg := c.levelConfigs[level]
 	if cfg == nil {
-		return nil
+		return nil, nil
 	}
 
 	// Filter blocks by level
@@ -94,7 +102,7 @@ func (c *Compactor) Plan(blocks []block.Block, level int) *CompactionPlan {
 	}
 
 	if len(levelBlocks) < cfg.MinBlocks {
-		return nil // Not enough blocks to compact
+		return nil, nil // Not enough blocks to compact
 	}
 
 	// Sort by creation time to find oldest
@@ -105,7 +113,7 @@ func (c *Compactor) Plan(blocks []block.Block, level int) *CompactionPlan {
 	// Check if oldest block is old enough
 	oldestAge := time.Since(levelBlocks[0].Meta().CreatedAt)
 	if !cfg.ShouldCompact(len(levelBlocks), oldestAge) {
-		return nil
+		return nil, nil
 	}
 
 	// Select blocks to compact
@@ -113,7 +121,15 @@ func (c *Compactor) Plan(blocks []block.Block, level int) *CompactionPlan {
 		Level:   level,
 		Blocks:  levelBlocks,
 		Sources: extractULIDs(levelBlocks),
-	}
+	}, nil
+}
+
+// Plan creates a compaction plan for blocks at a given level.
+// For backward compatibility, this delegates to PlanContext with background context.
+// For production use with timeout/cancellation support, use PlanContext directly.
+func (c *Compactor) Plan(blocks []block.Block, level int) *CompactionPlan {
+	plan, _ := c.PlanContext(context.Background(), blocks, level)
+	return plan
 }
 
 // CompactionPlan describes which blocks to compact
@@ -221,9 +237,22 @@ func (c *Compactor) scanMetadata(blocks []block.Block) (*CompactionMetadata, err
 			// Fast path: Read attribute keys from Parquet schema without loading data
 			keys, err := block.ReadAttributeKeysFromParquet(b.Dir())
 			if err != nil {
-				slog.Default().Warn("failed to read attribute keys from parquet",
+				// CRITICAL: Don't skip - this loses attributes in compacted block
+				// Fallback to full scan like Arrow blocks do
+				slog.Default().Warn("failed to read attribute keys from schema, scanning spans",
 					slog.String("block_dir", b.Dir()),
 					slog.String("error", err.Error()))
+
+				spans, scanErr := b.ReadAll()
+				if scanErr != nil {
+					return nil, fmt.Errorf("failed to read block %s for attribute discovery: %w", b.Dir(), scanErr)
+				}
+				for _, sp := range spans {
+					for key := range sp.Tags {
+						attrKeysSet[key] = struct{}{}
+					}
+				}
+				// Continue to next block after fallback
 				continue
 			}
 			for _, key := range keys {
@@ -461,7 +490,19 @@ func (c *Compactor) writeAttributesStreaming(blocks []block.Block, tmpDir string
 
 				// Flush buffer when full
 				if len(spansWithAttrs) >= bufferSize {
-					if err := c.flushAttributeBuffer(writer, spansWithAttrs, schema, spanIDColIdx, attrIndexColIdx, attrColIndices, attrKeys, attrRowMap, &globalAttrRowIdx, rowGroupSize); err != nil {
+					flushCtx := &attributeFlushContext{
+						writer:          writer,
+						spans:           spansWithAttrs,
+						schema:          schema,
+						spanIDColIdx:    spanIDColIdx,
+						attrIndexColIdx: attrIndexColIdx,
+						attrColIndices:  attrColIndices,
+						attrKeys:        attrKeys,
+						attrRowMap:      attrRowMap,
+						globalRowIdx:    &globalAttrRowIdx,
+						rowGroupSize:    rowGroupSize,
+					}
+					if err := c.flushAttributeBuffer(flushCtx); err != nil {
 						writer.Close()
 						attrsFile.Close()
 						return nil, err
@@ -474,7 +515,19 @@ func (c *Compactor) writeAttributesStreaming(blocks []block.Block, tmpDir string
 
 	// Flush remaining attributes
 	if len(spansWithAttrs) > 0 {
-		if err := c.flushAttributeBuffer(writer, spansWithAttrs, schema, spanIDColIdx, attrIndexColIdx, attrColIndices, attrKeys, attrRowMap, &globalAttrRowIdx, rowGroupSize); err != nil {
+		flushCtx := &attributeFlushContext{
+			writer:          writer,
+			spans:           spansWithAttrs,
+			schema:          schema,
+			spanIDColIdx:    spanIDColIdx,
+			attrIndexColIdx: attrIndexColIdx,
+			attrColIndices:  attrColIndices,
+			attrKeys:        attrKeys,
+			attrRowMap:      attrRowMap,
+			globalRowIdx:    &globalAttrRowIdx,
+			rowGroupSize:    rowGroupSize,
+		}
+		if err := c.flushAttributeBuffer(flushCtx); err != nil {
 			writer.Close()
 			attrsFile.Close()
 			return nil, err
@@ -502,28 +555,61 @@ func (c *Compactor) writeAttributesStreaming(blocks []block.Block, tmpDir string
 	return attrRowMap, nil
 }
 
+// attributeFlushContext encapsulates parameters for flushing attribute buffers
+// This reduces parameter explosion and makes the code more maintainable
+type attributeFlushContext struct {
+	writer          *parquet.Writer
+	spans           []*span.Span
+	schema          *parquet.Schema
+	spanIDColIdx    int
+	attrIndexColIdx int
+	attrColIndices  map[string]int
+	attrKeys        []string
+	attrRowMap      map[string]block.AttrRowInfo
+	globalRowIdx    *int
+	rowGroupSize    int
+}
+
 // flushAttributeBuffer writes a batch of attributes to the writer
 // Uses pool to reduce allocations and writes in smaller chunks
-func (c *Compactor) flushAttributeBuffer(
-	writer *parquet.Writer,
-	spansWithAttrs []*span.Span,
-	schema *parquet.Schema,
-	spanIDColIdx, attrIndexColIdx int,
-	attrColIndices map[string]int,
-	attrKeys []string,
-	attrRowMap map[string]block.AttrRowInfo,
-	globalAttrRowIdx *int,
-	rowGroupSize int,
-) error {
-	// Sort spans by span_id for row group statistics
-	sort.Slice(spansWithAttrs, func(i, j int) bool {
-		idI, errI := span.ParseSpanID(spansWithAttrs[i].SpanID)
-		idJ, errJ := span.ParseSpanID(spansWithAttrs[j].SpanID)
-		if errI != nil || errJ != nil {
-			return spansWithAttrs[i].SpanID < spansWithAttrs[j].SpanID
+func (c *Compactor) flushAttributeBuffer(ctx *attributeFlushContext) error {
+	// Extract fields from context for readability
+	writer := ctx.writer
+	spansWithAttrs := ctx.spans
+	schema := ctx.schema
+	spanIDColIdx := ctx.spanIDColIdx
+	attrIndexColIdx := ctx.attrIndexColIdx
+	attrColIndices := ctx.attrColIndices
+	attrKeys := ctx.attrKeys
+	attrRowMap := ctx.attrRowMap
+	globalAttrRowIdx := ctx.globalRowIdx
+	rowGroupSize := ctx.rowGroupSize
+	// OPTIMIZATION: Pre-parse all span IDs before sorting to avoid O(n log n) parses
+	// Each span ID is parsed once instead of being parsed multiple times during comparisons
+	type spanWithParsedID struct {
+		span     *span.Span
+		parsedID uint64
+		parseErr error
+	}
+
+	parsed := make([]spanWithParsedID, len(spansWithAttrs))
+	for i, sp := range spansWithAttrs {
+		id, err := span.ParseSpanID(sp.SpanID)
+		parsed[i] = spanWithParsedID{span: sp, parsedID: id, parseErr: err}
+	}
+
+	// Sort using pre-parsed IDs
+	sort.Slice(parsed, func(i, j int) bool {
+		if parsed[i].parseErr != nil || parsed[j].parseErr != nil {
+			return parsed[i].span.SpanID < parsed[j].span.SpanID
 		}
-		return idI < idJ
+		return parsed[i].parsedID < parsed[j].parsedID
 	})
+
+	// Extract sorted spans back into original slice
+	for i := range parsed {
+		spansWithAttrs[i] = parsed[i].span
+	}
 
 	// Get rows buffer from pool
 	rowsPtr := c.rowPool.Get().(*[]parquet.Row)
@@ -577,9 +663,12 @@ func (c *Compactor) flushAttributeBuffer(
 			}
 
 			row := rowBuilder.AppendRow(nil)
-			rowCopy := make(parquet.Row, len(row))
-			copy(rowCopy, row)
-			rows = append(rows, rowCopy)
+
+			// OPTIMIZATION: Get row copy from pool instead of allocating
+			rowCopyPtr := c.rowCopyPool.Get().(*parquet.Row)
+			*rowCopyPtr = (*rowCopyPtr)[:0] // Reset length but keep capacity
+			*rowCopyPtr = append(*rowCopyPtr, row...)
+			rows = append(rows, *rowCopyPtr)
 
 			// Track row position
 			attrRowMap[sp.SpanID] = block.AttrRowInfo{
@@ -595,6 +684,11 @@ func (c *Compactor) flushAttributeBuffer(
 			_, err := writer.WriteRows(rows)
 			if err != nil {
 				return fmt.Errorf("failed to write attribute rows: %w", err)
+			}
+
+			// OPTIMIZATION: Return row copies to pool after write
+			for i := range rows {
+				c.rowCopyPool.Put(&rows[i])
 			}
 		}
 	}
@@ -646,11 +740,17 @@ func (c *Compactor) buildIndexStreaming(blocks []block.Block, attrRowMap map[str
 	return idx, nil
 }
 
-// Compact compacts blocks from one level to the next using streaming to minimize memory usage
+// CompactContext compacts blocks from one level to the next using streaming to minimize memory usage
+// with context support for cancellation and timeout.
 // For L0, reads Arrow IPC and writes Parquet
 // For L1+, reads Parquet and writes larger Parquet blocks
 // Memory-efficient: processes data in bounded-memory batches (default 50K spans = ~50MB)
-func (c *Compactor) Compact(plan *CompactionPlan) (*block.BlockMeta, error) {
+// Context is checked at key points during compaction for graceful cancellation.
+func (c *Compactor) CompactContext(ctx context.Context, plan *CompactionPlan) (*block.BlockMeta, error) {
+	// Check context before starting
+	if err := ctx.Err(); err != nil {
+		return nil, fmt.Errorf("context cancelled before compaction: %w", err)
+	}
 	// PASS 1: Scan metadata (minimal memory)
 	metadata, err := c.scanMetadata(plan.Blocks)
 	if err != nil {
@@ -676,6 +776,11 @@ func (c *Compactor) Compact(plan *CompactionPlan) (*block.BlockMeta, error) {
 		}
 	}
 
+	// Check context after metadata scan
+	if err := ctx.Err(); err != nil {
+		return nil, fmt.Errorf("context cancelled after metadata scan: %w", err)
+	}
+
 	// Generate block ID and create temp directory
 	entropy := ulid.Monotonic(rand.New(rand.NewSource(time.Now().UnixNano())), 0)
 	blockID := ulid.MustNew(ulid.Timestamp(time.Now()), entropy)
@@ -684,6 +789,12 @@ func (c *Compactor) Compact(plan *CompactionPlan) (*block.BlockMeta, error) {
 	os.RemoveAll(tmpDir) // Clean up any existing temp directory
 	if err := os.MkdirAll(tmpDir, 0755); err != nil {
 		return nil, fmt.Errorf("failed to create temp directory: %w", err)
+	}
+
+	// Check context before streaming
+	if err := ctx.Err(); err != nil {
+		os.RemoveAll(tmpDir)
+		return nil, fmt.Errorf("context cancelled before streaming: %w", err)
 	}
 
 	// PASS 2 & 3: Stream spans and attributes (bounded memory)
@@ -712,6 +823,12 @@ func (c *Compactor) Compact(plan *CompactionPlan) (*block.BlockMeta, error) {
 			return nil, fmt.Errorf("failed to write parquet links: %w", err)
 		}
 		slog.Default().Info("successfully wrote parquet links file")
+	}
+
+	// Check context before index building
+	if err := ctx.Err(); err != nil {
+		os.RemoveAll(tmpDir)
+		return nil, fmt.Errorf("context cancelled before index building: %w", err)
 	}
 
 	// PASS 4: Build index incrementally
@@ -788,31 +905,11 @@ func (c *Compactor) Compact(plan *CompactionPlan) (*block.BlockMeta, error) {
 	return meta, nil
 }
 
-// collectSpans collects all spans from a list of blocks (Arrow or Parquet)
-func (c *Compactor) collectSpans(blocks []block.Block) ([]*span.Span, int64, int64, error) {
-	var allSpans []*span.Span
-	var minTime int64 = -1
-	var maxTime int64
-
-	for _, blk := range blocks {
-		meta := blk.Meta()
-
-		if minTime == -1 || meta.MinTime < minTime {
-			minTime = meta.MinTime
-		}
-		if meta.MaxTime > maxTime {
-			maxTime = meta.MaxTime
-		}
-
-		// Use the unified ReadAll() method - works for both Arrow and Parquet blocks
-		spans, err := blk.ReadAll()
-		if err != nil {
-			return nil, 0, 0, fmt.Errorf("failed to read block %s: %w", blk.Dir(), err)
-		}
-		allSpans = append(allSpans, spans...)
-	}
-
-	return allSpans, minTime, maxTime, nil
+// Compact compacts blocks from one level to the next using streaming to minimize memory usage.
+// For backward compatibility, this delegates to CompactContext with background context.
+// For production use with timeout/cancellation support, use CompactContext directly.
+func (c *Compactor) Compact(plan *CompactionPlan) (*block.BlockMeta, error) {
+	return c.CompactContext(context.Background(), plan)
 }
 
 // collectLinks collects all links from a list of blocks (Arrow or Parquet)

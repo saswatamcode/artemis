@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"math/bits"
 	"sync"
-	"time"
 
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
@@ -461,67 +460,10 @@ func (s *ArrowStorage) GetSpanByID(spanID string) (*span.Span, error) {
 }
 
 // extractSpan extracts a span from an Arrow record at the given row
+// extractSpan extracts a span from an Arrow record.
+// DEPRECATED: Use span.ExtractSpanFromRecord instead. This wrapper is kept for backward compatibility.
 func (s *ArrowStorage) extractSpan(record arrow.RecordBatch, rowIndex int) (*span.Span, error) {
-	if rowIndex >= int(record.NumRows()) {
-		return nil, fmt.Errorf("invalid row index %d", rowIndex)
-	}
-
-	// Validate schema has expected number of columns
-	// Note: We have 12 columns now (10 original + 2 new indexing fields)
-	// but the new fields (bucket1s, duration_bucket) don't need to be extracted
-	// into the Span struct as they're derived for indexing purposes
-	expectedColumns := 12
-	if record.NumCols() < int64(expectedColumns) {
-		return nil, fmt.Errorf("invalid schema: expected at least %d columns, got %d", expectedColumns, record.NumCols())
-	}
-
-	sp := &span.Span{}
-
-	// Read trace_id_hi and trace_id_lo and format as hex string
-	traceIDHi := record.Column(0).(*array.Uint64).Value(rowIndex)
-	traceIDLo := record.Column(1).(*array.Uint64).Value(rowIndex)
-	sp.TraceID = fmt.Sprintf("%016x%016x", traceIDHi, traceIDLo)
-
-	// Read span_id and format as hex string
-	spanIDVal := record.Column(2).(*array.Uint64).Value(rowIndex)
-	sp.SpanID = fmt.Sprintf("%016x", spanIDVal)
-
-	// Read parent_span_id and format as hex string (or empty if null)
-	parentCol := record.Column(3).(*array.Uint64)
-	if !parentCol.IsNull(rowIndex) {
-		parentSpanIDVal := parentCol.Value(rowIndex)
-		sp.ParentSpanID = fmt.Sprintf("%016x", parentSpanIDVal)
-	}
-
-	sp.Name = record.Column(4).(*array.String).Value(rowIndex)
-
-	sp.StartTime = time.Unix(0, record.Column(5).(*array.Int64).Value(rowIndex))
-
-	sp.EndTime = time.Unix(0, record.Column(6).(*array.Int64).Value(rowIndex))
-
-	sp.Duration = record.Column(7).(*array.Int64).Value(rowIndex)
-
-	sp.ServiceName = record.Column(8).(*array.String).Value(rowIndex)
-
-	tagsCol := record.Column(9).(*array.Map)
-	if !tagsCol.IsNull(rowIndex) {
-		sp.Tags = make(map[string]string)
-
-		// Get the offset for this map entry
-		offset := tagsCol.Offsets()[rowIndex]
-		nextOffset := tagsCol.Offsets()[rowIndex+1]
-
-		keys := tagsCol.Keys().(*array.String)
-		items := tagsCol.Items().(*array.String)
-
-		for i := int(offset); i < int(nextOffset); i++ {
-			key := keys.Value(i)
-			value := items.Value(i)
-			sp.Tags[key] = value
-		}
-	}
-
-	return sp, nil
+	return span.ExtractSpanFromRecord(record, rowIndex)
 }
 
 // GetIndex returns the index for querying

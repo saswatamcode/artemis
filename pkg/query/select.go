@@ -2,6 +2,7 @@ package query
 
 import (
 	"fmt"
+	"log/slog"
 	"time"
 
 	"github.com/apache/arrow-go/v18/arrow"
@@ -323,10 +324,11 @@ func QueryBlockWithTimeRange(blk block.Block, ms Matchers, timeRange *TimeRange)
 	// Log warning to help with debugging
 	meta := blk.Meta()
 	if meta != nil {
-		// Use fmt.Printf as a simple warning mechanism since we don't have logger context here
 		// In production, this should be rare and indicates a code issue
-		fmt.Printf("WARNING: Unknown block type encountered in query: ULID=%s, Level=%d, Dir=%s\n",
-			meta.ULID, meta.Level(), blk.Dir())
+		slog.Warn("unknown block type encountered in query",
+			slog.String("ulid", meta.ULID.String()),
+			slog.Int("level", meta.Level()),
+			slog.String("dir", blk.Dir()))
 	}
 	return spans
 }

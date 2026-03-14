@@ -59,6 +59,20 @@ func TestArtemisTracingStack(t *testing.T) {
 	testutil.Ok(t, telemetrygen.Start())
 	fmt.Println("✓ Telemetrygen running - generating traces continuously (5 traces/sec)")
 
+	// Optionally start k6 load test if ARTEMIS_K6_LOAD_TEST=1
+	if os.Getenv("ARTEMIS_K6_LOAD_TEST") == "1" {
+		fmt.Println("\n=== Starting k6 load test (ARTEMIS_K6_LOAD_TEST=1)...")
+		k6 := createK6LoadTest(env)
+		testutil.Ok(t, k6.Start())
+		fmt.Println("✓ k6 load test running - ramping up to 20 VUs over 4 minutes")
+		fmt.Println("  Stages:")
+		fmt.Println("    • 0-30s:  Ramp to 10 VUs")
+		fmt.Println("    • 30s-90s: Sustained 10 VUs")
+		fmt.Println("    • 90s-120s: Ramp to 20 VUs")
+		fmt.Println("    • 120s-240s: Sustained 20 VUs")
+		fmt.Println("    • 240s-270s: Ramp down to 0")
+	}
+
 	// Skip Grafana for now
 	// fmt.Println("=== Starting Grafana with Artemis datasource...")
 	// grafana := createGrafana(env)
@@ -437,5 +451,36 @@ func createTelemetryGen(env e2e.Environment) e2e.Runnable {
 		),
 		// No readiness probe needed since this is a trace generator
 		// It doesn't expose any ports, it just sends traces
+	})
+}
+
+// createK6LoadTest creates a k6 load test runnable for write performance testing
+func createK6LoadTest(env e2e.Environment) e2e.Runnable {
+	f := env.Runnable("k6-load-test").Future()
+
+	// Copy k6 script to shared directory
+	k6ScriptPath := filepath.Join(f.Dir(), "k6-load-test.js")
+	scriptContent, err := os.ReadFile("configs/k6-load-test.js")
+	if err != nil {
+		return e2e.NewFailedRunnable("k6-load-test", fmt.Errorf("failed to read k6 script: %w", err))
+	}
+	if err := os.WriteFile(k6ScriptPath, scriptContent, 0644); err != nil {
+		return e2e.NewFailedRunnable("k6-load-test", fmt.Errorf("failed to write k6 script: %w", err))
+	}
+
+	return f.Init(e2e.StartOptions{
+		Image: "grafana/k6:latest",
+		Command: e2e.NewCommand(
+			"run",
+			"/k6/k6-load-test.js",
+		),
+		EnvVars: map[string]string{
+			// Route through OTEL Collector's HTTP endpoint, which forwards to Artemis via gRPC
+			"OTLP_ENDPOINT": "http://otel-collector:4318",
+		},
+		Volumes: []string{
+			k6ScriptPath + ":/k6/k6-load-test.js:ro",
+		},
+		// No readiness probe needed - k6 runs the test and exits
 	})
 }

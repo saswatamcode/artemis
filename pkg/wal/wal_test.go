@@ -2,6 +2,7 @@ package wal
 
 import (
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"testing"
@@ -13,7 +14,7 @@ import (
 func TestWAL_WriteAndRead(t *testing.T) {
 	tmpDir := t.TempDir()
 
-	w, err := NewWAL(tmpDir, nil, nil)
+	w, err := NewWAL(tmpDir, slog.Default(), nil)
 	if err != nil {
 		t.Fatalf("NewWAL() error = %v", err)
 	}
@@ -62,7 +63,7 @@ func TestWAL_WriteAndRead(t *testing.T) {
 func TestWAL_MultipleSpans(t *testing.T) {
 	tmpDir := t.TempDir()
 
-	w, err := NewWAL(tmpDir, nil, nil)
+	w, err := NewWAL(tmpDir, slog.Default(), nil)
 	if err != nil {
 		t.Fatalf("NewWAL() error = %v", err)
 	}
@@ -102,7 +103,7 @@ func TestWAL_MultipleSpans(t *testing.T) {
 func TestWAL_SegmentRotation(t *testing.T) {
 	tmpDir := t.TempDir()
 
-	w, err := NewWAL(tmpDir, nil, nil)
+	w, err := NewWAL(tmpDir, slog.Default(), nil)
 	if err != nil {
 		t.Fatalf("NewWAL() error = %v", err)
 	}
@@ -174,7 +175,7 @@ func TestWAL_EmptyDir(t *testing.T) {
 func TestWAL_CorruptionHandling(t *testing.T) {
 	tmpDir := t.TempDir()
 
-	w, err := NewWAL(tmpDir, nil, nil)
+	w, err := NewWAL(tmpDir, slog.Default(), nil)
 	if err != nil {
 		t.Fatalf("NewWAL() error = %v", err)
 	}
@@ -238,7 +239,7 @@ func TestWAL_SegmentIndexContinuesAfterRestart(t *testing.T) {
 	tmpDir := t.TempDir()
 
 	// First WAL instance - creates segment 000000.wal
-	w1, err := NewWAL(tmpDir, nil)
+	w1, err := NewWAL(tmpDir, slog.Default(), nil)
 	if err != nil {
 		t.Fatalf("NewWAL() error = %v", err)
 	}
@@ -267,7 +268,7 @@ func TestWAL_SegmentIndexContinuesAfterRestart(t *testing.T) {
 	}
 
 	// Second WAL instance - should continue from next index
-	w2, err := NewWAL(tmpDir, nil)
+	w2, err := NewWAL(tmpDir, slog.Default(), nil)
 	if err != nil {
 		t.Fatalf("NewWAL() after restart error = %v", err)
 	}
@@ -295,7 +296,7 @@ func TestWAL_SegmentIndexAfterDeletion(t *testing.T) {
 	tmpDir := t.TempDir()
 
 	// Create initial WAL
-	w1, err := NewWAL(tmpDir, nil)
+	w1, err := NewWAL(tmpDir, slog.Default(), nil)
 	if err != nil {
 		t.Fatalf("NewWAL() error = %v", err)
 	}
@@ -314,7 +315,7 @@ func TestWAL_SegmentIndexAfterDeletion(t *testing.T) {
 
 	// Now we have: 000001.wal, 000002.wal
 	// New WAL should start from 000003.wal
-	w2, err := NewWAL(tmpDir, nil)
+	w2, err := NewWAL(tmpDir, slog.Default(), nil)
 	if err != nil {
 		t.Fatalf("NewWAL() after deletion error = %v", err)
 	}
@@ -340,7 +341,7 @@ func TestReplay_WithCheckpointMetadata(t *testing.T) {
 	tmpDir := t.TempDir()
 
 	// Create WAL and write spans to multiple segments
-	w, err := NewWAL(tmpDir, nil, nil)
+	w, err := NewWAL(tmpDir, slog.Default(), nil)
 	if err != nil {
 		t.Fatalf("NewWAL() error = %v", err)
 	}
@@ -362,7 +363,7 @@ func TestReplay_WithCheckpointMetadata(t *testing.T) {
 
 	// Create more segments manually
 	for seg := 1; seg <= 3; seg++ {
-		w, _ = NewWAL(tmpDir, nil)
+		w, _ = NewWAL(tmpDir, slog.Default(), nil)
 		for i := range 10 {
 			sp := &span.Span{
 				TraceID:     "0123456789abcdef0123456789abcdef",
@@ -444,7 +445,7 @@ func TestReplay_WithCheckpointMetadata(t *testing.T) {
 func BenchmarkWAL_WriteSpan(b *testing.B) {
 	tmpDir := b.TempDir()
 
-	w, err := NewWAL(tmpDir, nil, nil)
+	w, err := NewWAL(tmpDir, slog.Default(), nil)
 	if err != nil {
 		b.Fatalf("NewWAL() error = %v", err)
 	}

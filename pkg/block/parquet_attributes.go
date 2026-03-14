@@ -352,9 +352,11 @@ func ReadParquetAttributes(dir string) (map[string]map[string]string, error) {
 
 	result := make(map[string]map[string]string)
 
+	// OPTIMIZATION: Allocate row buffer once outside loop to reduce allocations
+	row := make(parquet.Row, len(schemaColumns))
+
 	rowCount := 0
 	for {
-		row := make(parquet.Row, len(schemaColumns))
 		_, err := reader.ReadRows([]parquet.Row{row})
 		if err == io.EOF {
 			break
@@ -446,8 +448,10 @@ func GetAttributesBySpanID(dir string, spanID string) (map[string]string, error)
 	reader := parquet.NewReader(file)
 	defer reader.Close()
 
+	// OPTIMIZATION: Allocate row buffer once outside loop to reduce allocations
+	row := make(parquet.Row, len(schemaColumns))
+
 	for {
-		row := make(parquet.Row, len(schemaColumns))
 		_, err := reader.ReadRows([]parquet.Row{row})
 		if err == io.EOF {
 			break
@@ -755,12 +759,14 @@ func ReadAttributeValuesFromParquet(dir string, attrKey string, limit int) ([]st
 
 	valuesSet := make(map[string]bool)
 
+	// OPTIMIZATION: Allocate row buffer once outside loop to reduce allocations
+	row := make(parquet.Row, len(schemaColumns))
+
 	for {
 		if limit > 0 && len(valuesSet) >= limit {
 			break // Early termination
 		}
 
-		row := make(parquet.Row, len(schemaColumns))
 		_, err := reader.ReadRows([]parquet.Row{row})
 		if err == io.EOF {
 			break
@@ -932,8 +938,10 @@ func QueryAttributesByKey(dir string, attrKey string, attrValue string) ([]strin
 		// This avoids reading all other attribute columns
 		reader := parquet.NewRowGroupReader(rg)
 
+		// OPTIMIZATION: Allocate row buffer once outside loop to reduce allocations
+		row := make(parquet.Row, len(schemaColumns))
+
 		for {
-			row := make(parquet.Row, len(schemaColumns))
 			n, err := reader.ReadRows([]parquet.Row{row})
 
 			// CRITICAL FIX: Process the row if n > 0, even if err == io.EOF
@@ -1074,8 +1082,10 @@ func QueryAttributesByKeyBatch(dir string, attrFilters map[string]string) (map[s
 	for _, rg := range rowGroups {
 		reader := parquet.NewRowGroupReader(rg)
 
+		// OPTIMIZATION: Allocate row buffer once outside loop to reduce allocations
+		row := make(parquet.Row, len(schemaColumns))
+
 		for {
-			row := make(parquet.Row, len(schemaColumns))
 			_, err := reader.ReadRows([]parquet.Row{row})
 			if err == io.EOF {
 				break

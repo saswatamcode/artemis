@@ -2,6 +2,7 @@ package storage
 
 import (
 	"fmt"
+	"log/slog"
 	"sync"
 
 	"github.com/apache/arrow-go/v18/arrow"
@@ -280,44 +281,10 @@ func (s *ArrowLinkStorage) Reset() {
 }
 
 // extractLink extracts a span link from an Arrow record at the given row
+// extractLink extracts a link from an Arrow record.
+// DEPRECATED: Use span.ExtractLinkFromRecord instead. This wrapper is kept for backward compatibility.
 func (s *ArrowLinkStorage) extractLink(record arrow.RecordBatch, rowIndex int) (*span.SpanLink, error) {
-	if rowIndex >= int(record.NumRows()) {
-		return nil, fmt.Errorf("invalid row index %d", rowIndex)
-	}
-
-	l := &span.SpanLink{}
-
-	// Read span_id and format as hex string
-	spanIDVal := record.Column(0).(*array.Uint64).Value(rowIndex)
-	l.SpanID = fmt.Sprintf("%016x", spanIDVal)
-
-	// Read linked_trace_id_hi and linked_trace_id_lo and format as hex string
-	linkedTraceIDHi := record.Column(1).(*array.Uint64).Value(rowIndex)
-	linkedTraceIDLo := record.Column(2).(*array.Uint64).Value(rowIndex)
-	l.LinkedTraceID = fmt.Sprintf("%016x%016x", linkedTraceIDHi, linkedTraceIDLo)
-
-	// Read linked_span_id and format as hex string
-	linkedSpanIDVal := record.Column(3).(*array.Uint64).Value(rowIndex)
-	l.LinkedSpanID = fmt.Sprintf("%016x", linkedSpanIDVal)
-
-	attrsCol := record.Column(4).(*array.Map)
-	if !attrsCol.IsNull(rowIndex) {
-		l.Attributes = make(map[string]string)
-
-		offset := attrsCol.Offsets()[rowIndex]
-		nextOffset := attrsCol.Offsets()[rowIndex+1]
-
-		keys := attrsCol.Keys().(*array.String)
-		items := attrsCol.Items().(*array.String)
-
-		for i := int(offset); i < int(nextOffset); i++ {
-			key := keys.Value(i)
-			value := items.Value(i)
-			l.Attributes[key] = value
-		}
-	}
-
-	return l, nil
+	return span.ExtractLinkFromRecord(record, rowIndex)
 }
 
 // GetLinksBySpanID retrieves all links for a given span ID
@@ -326,17 +293,31 @@ func (s *ArrowLinkStorage) GetLinksBySpanID(spanID string) ([]*span.SpanLink, er
 	defer s.mu.RUnlock()
 
 	result := make([]*span.SpanLink, 0)
+	extractErrors := 0
+	const maxErrors = 50 // Threshold for link extraction errors
 
-	for _, record := range s.records {
+	for recordIdx, record := range s.records {
 		for row := 0; row < int(record.NumRows()); row++ {
 			l, err := s.extractLink(record, row)
 			if err != nil {
+				extractErrors++
+				slog.Warn("failed to extract link from record",
+					"row", row, "record", recordIdx, "error", err, "span_id", spanID)
+				if extractErrors > maxErrors {
+					return nil, fmt.Errorf("too many link extraction errors (%d)", extractErrors)
+				}
 				continue
 			}
 			if l.SpanID == spanID {
 				result = append(result, l)
 			}
 		}
+	}
+
+	if extractErrors > 0 {
+		slog.Warn("link extraction had errors",
+			"error_count", extractErrors,
+			"span_id", spanID)
 	}
 
 	return result, nil
@@ -361,11 +342,19 @@ func (s *ArrowLinkStorage) GetLinksBatch(spanIDs []string) (map[string][]*span.S
 
 	// Single pass through all link records
 	result := make(map[string][]*span.SpanLink)
+	extractErrors := 0
+	const maxErrors = 50 // Threshold for link extraction errors
 
-	for _, record := range s.records {
+	for recordIdx, record := range s.records {
 		for row := 0; row < int(record.NumRows()); row++ {
 			l, err := s.extractLink(record, row)
 			if err != nil {
+				extractErrors++
+				slog.Warn("failed to extract link from record in batch",
+					"row", row, "record", recordIdx, "error", err)
+				if extractErrors > maxErrors {
+					return nil, fmt.Errorf("too many link extraction errors (%d) in batch", extractErrors)
+				}
 				continue
 			}
 			// Only collect links for span IDs we care about
@@ -373,6 +362,12 @@ func (s *ArrowLinkStorage) GetLinksBatch(spanIDs []string) (map[string][]*span.S
 				result[l.SpanID] = append(result[l.SpanID], l)
 			}
 		}
+	}
+
+	if extractErrors > 0 {
+		slog.Warn("batch link extraction had errors",
+			"error_count", extractErrors,
+			"span_id_count", len(spanIDs))
 	}
 
 	return result, nil
