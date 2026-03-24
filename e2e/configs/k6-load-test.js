@@ -8,10 +8,10 @@ const errorRate = new Rate('errors');
 // Test configuration
 export const options = {
   stages: [
-    { duration: '30s', target: 10 },  // Ramp up to 10 VUs over 30s
-    { duration: '1m', target: 10 },   // Stay at 10 VUs for 1 minute
-    { duration: '30s', target: 20 },  // Ramp up to 20 VUs
-    { duration: '2m', target: 20 },   // Stay at 20 VUs for 2 minutes
+    { duration: '30s', target: 50 },  // Ramp up to 10 VUs over 30s
+    { duration: '1m', target: 50 },   // Stay at 10 VUs for 1 minute
+    { duration: '30s', target: 150 },  // Ramp up to 20 VUs
+    { duration: '2m', target: 150 },   // Stay at 20 VUs for 2 minutes
     { duration: '30s', target: 0 },   // Ramp down to 0
   ],
   thresholds: {

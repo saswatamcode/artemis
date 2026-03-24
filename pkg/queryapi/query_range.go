@@ -148,15 +148,15 @@ func (s *Server) handleQueryRange(w http.ResponseWriter, r *http.Request) {
 			slog.Int("count", exemplars),
 			slog.String("strategy", exemplarStrategy))
 
-		// Extract selector from the query
-		selector, err := extractSelector(queryStr)
+		// Extract selector and range from the query
+		selector, rangeDuration, hasRange, err := extractSelectorAndRange(queryStr)
 		if err != nil {
 			s.logger.Warn("Failed to extract selector for exemplars",
 				slog.String("query", queryStr),
 				slog.String("error", err.Error()))
 		} else {
 			// Fetch exemplars for each time step
-			exemplarMap, err := s.fetchExemplars(r.Context(), selector, start, end, stepDuration, exemplars, exemplarStrategy)
+			exemplarMap, err := s.fetchExemplars(r.Context(), selector, start, end, stepDuration, rangeDuration, hasRange, exemplars, exemplarStrategy)
 			if err != nil {
 				s.logger.Warn("Failed to fetch exemplars",
 					slog.String("error", err.Error()))
@@ -165,7 +165,9 @@ func (s *Server) handleQueryRange(w http.ResponseWriter, r *http.Request) {
 				s.attachExemplarsToResponse(data, exemplarMap)
 				s.logger.Debug("Exemplars fetched",
 					slog.Duration("exemplar_duration", time.Since(exemplarStart)),
-					slog.Int("exemplar_count", len(exemplarMap)))
+					slog.Int("exemplar_count", len(exemplarMap)),
+					slog.Bool("has_range", hasRange),
+					slog.Duration("range", rangeDuration))
 			}
 		}
 	}
@@ -179,25 +181,39 @@ func (s *Server) handleQueryRange(w http.ResponseWriter, r *http.Request) {
 	respondJSON(w, prometheusJSON)
 }
 
-// extractSelector extracts the base selector from a query expression.
-// For example, from "rate({name="promqlExec"}[5m])" it extracts "{name="promqlExec"}"
-func extractSelector(queryStr string) (string, error) {
-	expr, err := parser.Parse(queryStr)
-	if err != nil {
-		return "", fmt.Errorf("failed to parse query: %w", err)
+// extractSelectorAndRange extracts the base selector and range duration from a query expression.
+// For example, from "rate({name="promqlExec"}[5m])" it extracts:
+//   - selector: "{name="promqlExec"}"
+//   - rangeDuration: 5m
+//   - hasRange: true
+// For "{name="foo"}" it extracts:
+//   - selector: "{name="foo"}"
+//   - rangeDuration: 0
+//   - hasRange: false
+func extractSelectorAndRange(queryStr string) (selector string, rangeDuration time.Duration, hasRange bool, err error) {
+	expr, parseErr := parser.Parse(queryStr)
+	if parseErr != nil {
+		return "", 0, false, fmt.Errorf("failed to parse query: %w", parseErr)
 	}
 
 	// Walk the AST to find the first VectorSelector or MatrixSelector
-	var selector string
 	var findSelector func(parser.Expr) bool
 	findSelector = func(e parser.Expr) bool {
 		switch n := e.(type) {
 		case *parser.VectorSelector:
 			selector = n.String()
+			hasRange = false
 			return true
 		case *parser.MatrixSelector:
 			// MatrixSelector has a Vector field which is a VectorSelector
 			selector = n.Vector.String()
+			// Parse range duration from RangeStr (e.g., "5m")
+			rangeDuration, err = time.ParseDuration(n.RangeStr)
+			if err != nil {
+				err = fmt.Errorf("failed to parse range duration %q: %w", n.RangeStr, err)
+				return false
+			}
+			hasRange = true
 			return true
 		case *parser.Call:
 			// Check function arguments
@@ -206,20 +222,39 @@ func extractSelector(queryStr string) (string, error) {
 					return true
 				}
 			}
+		case *parser.Aggregation:
+			// Check aggregation expression
+			return findSelector(n.Expr)
 		}
 		return false
 	}
 
 	if !findSelector(expr) {
-		return "", fmt.Errorf("no selector found in query")
+		return "", 0, false, fmt.Errorf("no selector found in query")
 	}
 
-	return selector, nil
+	if err != nil {
+		return "", 0, false, err
+	}
+
+	return selector, rangeDuration, hasRange, nil
 }
 
-// fetchExemplars queries actual spans ONCE for the entire range and buckets them by time step
-func (s *Server) fetchExemplars(ctx context.Context, selector string, start, end time.Time, step time.Duration, count int, strategy string) (map[int64][]Exemplar, error) {
+// fetchExemplars queries actual spans and assigns exemplars to time steps.
+//
+// Two strategies:
+//  1. Lookback window (hasRange=true): For rate({...}[5m]), each step gets exemplars from
+//     its lookback window [step-range, step], matching the rate operator's evaluation logic.
+//  2. Direct bucketing (hasRange=false): For {name="foo"}, heatmap(), etc., each step gets
+//     exemplars from spans that fall in that time bucket.
+func (s *Server) fetchExemplars(ctx context.Context, selector string, start, end time.Time, step time.Duration, rangeDuration time.Duration, hasRange bool, count int, strategy string) (map[int64][]Exemplar, error) {
 	// Query spans ONCE for the entire time range
+	// For lookback queries, extend start time to capture spans in first step's lookback window
+	queryStart := start
+	if hasRange && rangeDuration > 0 {
+		queryStart = start.Add(-rangeDuration)
+	}
+
 	// Keep exemplar fetch lightweight - only get what we need
 	// Limit = count * 30 (buffer for bucketing across time steps)
 	// This prevents slow queries while still providing good exemplar coverage
@@ -228,12 +263,12 @@ func (s *Server) fetchExemplars(ctx context.Context, selector string, start, end
 		limit = 50 // Minimum
 	}
 	if limit > 500 {
-		limit = 500 // Hard cap for performance (down from 1000)
+		limit = 500 // Hard cap for performance
 	}
 
 	queryStr := selector
 	opts := &engine.QueryOptions{
-		StartTime:   start,
+		StartTime:   queryStart,
 		EndTime:     end,
 		Context:     ctx,
 		UseSnapshot: true,
@@ -258,20 +293,79 @@ func (s *Server) fetchExemplars(ctx context.Context, selector string, start, end
 		return result.Spans[i].SpanID < result.Spans[j].SpanID
 	})
 
+	// Choose strategy based on query type
+	if hasRange {
+		// Strategy 1: Lookback window (for rate(), etc.)
+		// Each step gets exemplars from spans in [step-range, step]
+		return s.fetchExemplarsWithLookback(result.Spans, start, end, step, rangeDuration, count, strategy)
+	}
+
+	// Strategy 2: Direct bucketing (for selectors, heatmap, etc.)
+	// Each step gets exemplars from spans that fall in that time bucket
+	return s.fetchExemplarsWithBucketing(result.Spans, start, end, step, count, strategy)
+}
+
+// fetchExemplarsWithLookback implements lookback window strategy for range queries like rate().
+// For each step, it selects exemplars from the sliding lookback window [step-range, step).
+// This matches the exact evaluation logic of the rate operator.
+//
+// Boundary semantics: [windowStart, windowEnd) - inclusive start, exclusive end.
+// This prevents double-counting spans that fall exactly on step boundaries.
+func (s *Server) fetchExemplarsWithLookback(spans []*span.Span, start, end time.Time, step time.Duration, rangeDuration time.Duration, count int, strategy string) (map[int64][]Exemplar, error) {
+	exemplarMap := make(map[int64][]Exemplar)
+
+	// Iterate over each step in the evaluation range
+	for stepTime := start; stepTime.Before(end) || stepTime.Equal(end); stepTime = stepTime.Add(step) {
+		// Calculate lookback window for this step: [windowStart, windowEnd)
+		windowStart := stepTime.Add(-rangeDuration)
+		windowEnd := stepTime
+
+		// Filter spans that fall within this lookback window
+		var windowSpans []*span.Span
+		for _, sp := range spans {
+			// Use [windowStart, windowEnd) semantics (inclusive start, exclusive end)
+			// This matches Prometheus convention and prevents double-counting
+			if !sp.StartTime.Before(windowStart) && sp.StartTime.Before(windowEnd) {
+				windowSpans = append(windowSpans, sp)
+			}
+		}
+
+		// Select exemplars from this window
+		if len(windowSpans) > 0 {
+			exemplars := selectExemplars(windowSpans, count, strategy)
+			if len(exemplars) > 0 {
+				exemplarMap[stepTime.Unix()] = exemplars
+			}
+		}
+	}
+
+	return exemplarMap, nil
+}
+
+// fetchExemplarsWithBucketing implements direct bucketing strategy for non-range queries.
+// Spans are assigned to buckets based on where their timestamp falls.
+// This is used for selector queries {name="foo"}, heatmap(), etc.
+//
+// Boundary semantics: Spans in [start, end) are assigned to buckets.
+// Each bucket covers [bucketTime, bucketTime+step).
+func (s *Server) fetchExemplarsWithBucketing(spans []*span.Span, start, end time.Time, step time.Duration, count int, strategy string) (map[int64][]Exemplar, error) {
 	// Group spans by time step bucket - OPTIMIZED with direct bucket calculation
 	bucketMap := make(map[int64][]*span.Span)
 	stepNanos := step.Nanoseconds()
 	startNanos := start.UnixNano()
+	endNanos := end.UnixNano()
 
-	for _, sp := range result.Spans {
-		// Calculate bucket directly instead of iterating through all steps
-		// This is O(n) instead of O(n*m) - HUGE performance improvement!
+	for _, sp := range spans {
 		spanNanos := sp.StartTime.UnixNano()
-		if spanNanos >= startNanos {
+
+		// Use [start, end) range semantics (inclusive start, exclusive end)
+		if spanNanos >= startNanos && spanNanos < endNanos {
+			// Calculate bucket directly instead of iterating through all steps
+			// This is O(n) instead of O(n*m) - HUGE performance improvement!
 			bucketOffset := (spanNanos - startNanos) / stepNanos
 			bucketTime := start.Add(time.Duration(bucketOffset) * step)
 
-			// Only include if within range
+			// Double-check bucket is within range (should always be true due to above check)
 			if !bucketTime.After(end) {
 				bucket := bucketTime.Unix()
 				bucketMap[bucket] = append(bucketMap[bucket], sp)
@@ -281,9 +375,9 @@ func (s *Server) fetchExemplars(ctx context.Context, selector string, start, end
 
 	// Select exemplars from each bucket
 	exemplarMap := make(map[int64][]Exemplar)
-	for bucket, spans := range bucketMap {
-		if len(spans) > 0 {
-			exemplars := selectExemplars(spans, count, strategy)
+	for bucket, bucketSpans := range bucketMap {
+		if len(bucketSpans) > 0 {
+			exemplars := selectExemplars(bucketSpans, count, strategy)
 			if len(exemplars) > 0 {
 				exemplarMap[bucket] = exemplars
 			}
@@ -326,6 +420,17 @@ func (s *Server) attachExemplarsToResponse(data map[string]interface{}, exemplar
 			continue
 		}
 
+		// Check if this is a heatmap series (has duration_bucket metric)
+		metric, _ := series["metric"].(map[string]interface{})
+		durationBucketStr, isHeatmap := metric["duration_bucket"].(string)
+		var minDuration, maxDuration int64
+		if isHeatmap {
+			// Parse bucket index and calculate duration range
+			var bucketIdx int64
+			fmt.Sscanf(durationBucketStr, "%d", &bucketIdx)
+			minDuration, maxDuration = getDurationRangeForBucket(int32(bucketIdx))
+		}
+
 		// Collect all exemplars for this series' time range
 		var allExemplars []map[string]interface{}
 		for _, v := range values {
@@ -340,6 +445,13 @@ func (s *Server) attachExemplarsToResponse(data map[string]interface{}, exemplar
 			// Find exemplars for this timestamp
 			if exemplars, exists := exemplarMap[timestamp]; exists {
 				for _, ex := range exemplars {
+					// For heatmap series, only include exemplars with durations in this bucket's range
+					if isHeatmap {
+						if ex.Duration < minDuration || ex.Duration >= maxDuration {
+							continue // Skip exemplars outside this duration bucket
+						}
+					}
+
 					allExemplars = append(allExemplars, map[string]interface{}{
 						"timestamp": timestamp, // Use step bucket timestamp for alignment
 						"duration":  ex.Duration,
@@ -356,9 +468,31 @@ func (s *Server) attachExemplarsToResponse(data map[string]interface{}, exemplar
 	}
 }
 
+// getDurationRangeForBucket returns the min (inclusive) and max (exclusive) duration
+// in nanoseconds for a given duration bucket index.
+// Bucket N contains durations in range [2^N, 2^(N+1)).
+// For example, bucket 20 = [2^20, 2^21) = [1048576, 2097152) nanoseconds ≈ [1ms, 2ms).
+func getDurationRangeForBucket(bucket int32) (minDuration int64, maxDuration int64) {
+	if bucket < 0 {
+		return 0, 0
+	}
+	if bucket >= 62 {
+		// Bucket 62 and above - use max int64 as upper bound
+		minDuration = int64(1) << uint(bucket)
+		maxDuration = 9223372036854775807 // math.MaxInt64
+		return minDuration, maxDuration
+	}
+	minDuration = int64(1) << uint(bucket)
+	maxDuration = int64(1) << uint(bucket+1)
+	return minDuration, maxDuration
+}
+
 // convertSpansToTimeSeries converts raw spans to a time series by counting spans per time bucket.
 // This enables selector queries like {name="promqlExec"} to return count-over-time metrics,
 // similar to how Prometheus handles metric selectors.
+//
+// Boundary semantics: Spans in [start, end) are assigned to buckets.
+// Each bucket covers [bucketTime, bucketTime+step).
 func convertSpansToTimeSeries(spans []*span.Span, start, end time.Time, step time.Duration) engine.Matrix {
 	if len(spans) == 0 {
 		return engine.Matrix{}
@@ -373,7 +507,19 @@ func convertSpansToTimeSeries(spans []*span.Span, start, end time.Time, step tim
 	bucketCounts := make(map[seriesKey]int)
 	labelSets := make(map[string]map[string]string)
 
+	startNanos := start.UnixNano()
+	endNanos := end.UnixNano()
+	stepNanos := step.Nanoseconds()
+
 	for _, sp := range spans {
+		spanNanos := sp.StartTime.UnixNano()
+
+		// Use [start, end) range semantics (inclusive start, exclusive end)
+		// This prevents double-counting spans at exact boundaries
+		if spanNanos < startNanos || spanNanos >= endNanos {
+			continue // Skip spans outside query range
+		}
+
 		// Build label set from span (excluding internal fields)
 		labels := make(map[string]string)
 
@@ -392,16 +538,9 @@ func convertSpansToTimeSeries(spans []*span.Span, start, end time.Time, step tim
 		// Create stable label key
 		labelKey := makeStableLabelKey(labels)
 
-		// Calculate time bucket directly (O(1) instead of O(steps))
+		// Calculate which step bucket this span falls into (O(1) instead of O(steps))
 		// CRITICAL PERFORMANCE FIX: This was O(n*m) before!
-		if sp.StartTime.Before(start) || sp.StartTime.After(end) {
-			continue // Skip spans outside query range
-		}
-
-		// Calculate which step bucket this span falls into
-		offsetNanos := sp.StartTime.Sub(start).Nanoseconds()
-		stepNanos := step.Nanoseconds()
-		bucketIndex := offsetNanos / stepNanos
+		bucketIndex := (spanNanos - startNanos) / stepNanos
 		bucketTime := start.Add(time.Duration(bucketIndex) * step)
 
 		key := seriesKey{

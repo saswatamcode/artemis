@@ -113,7 +113,9 @@ func (r *RateOperator) consumeAndCalculate() error {
 	r.resultBatch = make([]*span.Span, 0)
 
 	for stepTime := r.ctx.StartTime; stepTime.Before(r.ctx.EndTime) || stepTime.Equal(r.ctx.EndTime); stepTime = stepTime.Add(step) {
-		// Calculate lookback window: [stepTime - lookback, stepTime]
+		// Calculate lookback window: [stepTime - lookback, stepTime)
+		// Boundary semantics: inclusive start, exclusive end
+		// This prevents double-counting spans at exact step boundaries
 		windowStart := stepTime.Add(-r.lookback)
 		windowEnd := stepTime
 
@@ -122,8 +124,9 @@ func (r *RateOperator) consumeAndCalculate() error {
 		seriesLabels := make(map[string]map[string]string)
 
 		for _, sp := range r.allSpans {
-			// Check if span falls within the lookback window
-			if sp.StartTime.Before(windowStart) || sp.StartTime.After(windowEnd) {
+			// Check if span falls within the lookback window [windowStart, windowEnd)
+			// Inclusive start, exclusive end - matches Prometheus convention
+			if sp.StartTime.Before(windowStart) || !sp.StartTime.Before(windowEnd) {
 				continue
 			}
 

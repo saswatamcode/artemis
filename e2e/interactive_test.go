@@ -38,16 +38,16 @@ func TestArtemisTracingStack(t *testing.T) {
 	testutil.Ok(t, err)
 	t.Cleanup(env.Close)
 
-	fmt.Println("=== Starting OTEL Collector...")
-	otelCollector := createOtelCollector(env)
-	testutil.Ok(t, e2e.StartAndWaitReady(otelCollector))
-	fmt.Printf("✓ OTEL Collector ready at %s\n", otelCollector.Endpoint("otlp-grpc"))
-
 	fmt.Println("=== Starting Artemis...")
 	artemis := createArtemis(env)
 	testutil.Ok(t, e2e.StartAndWaitReady(artemis))
 	fmt.Printf("✓ Artemis ready - OTLP: %s, Web UI: %s, Jaeger: %s, Tempo: %s\n",
 		artemis.Endpoint("otlp"), artemis.Endpoint("queryapi"), artemis.Endpoint("http"), artemis.Endpoint("tempo"))
+
+	fmt.Println("=== Starting OTEL Collector...")
+	otelCollector := createOtelCollector(env)
+	testutil.Ok(t, e2e.StartAndWaitReady(otelCollector))
+	fmt.Printf("✓ OTEL Collector ready at %s\n", otelCollector.Endpoint("otlp-grpc"))
 
 	fmt.Println("=== Starting Prometheus with tracing...")
 	prometheus := createPrometheus(env)
