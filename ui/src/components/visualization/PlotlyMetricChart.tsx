@@ -12,6 +12,7 @@ interface PlotlyMetricChartProps {
 
 export function PlotlyMetricChart({ data, onExemplarClick, startTime, endTime }: PlotlyMetricChartProps) {
   const [selectedSeries, setSelectedSeries] = useState<Set<number>>(new Set());
+  const [isHovering, setIsHovering] = useState(false);
 
   // Transform data to Plotly format
   const { traces, exemplarTraces, seriesLabels } = useMemo(() => {
@@ -153,14 +154,18 @@ export function PlotlyMetricChart({ data, onExemplarClick, startTime, endTime }:
       visible: (allVisible || selectedSeries.has(i)) as any,
     }));
 
-    // Update exemplar visibility based on their parent series
+    // Update exemplar visibility and opacity based on their parent series and hover state
     const exemplarTracesWithVisibility = exemplarTraces.map((trace) => ({
       ...trace,
       visible: (allVisible || selectedSeries.has(trace.seriesIndex)) as any,
+      marker: {
+        ...trace.marker,
+        opacity: isHovering ? 1 : 0,
+      },
     }));
 
     return [...seriesTraces, ...exemplarTracesWithVisibility];
-  }, [traces, exemplarTraces, selectedSeries, allVisible]);
+  }, [traces, exemplarTraces, selectedSeries, allVisible, isHovering]);
 
   if (traces.length === 0) {
     return (
@@ -236,6 +241,8 @@ export function PlotlyMetricChart({ data, onExemplarClick, startTime, endTime }:
               }
             }
           }}
+          onHover={() => setIsHovering(true)}
+          onUnhover={() => setIsHovering(false)}
         />
       </Paper>
 

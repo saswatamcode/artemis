@@ -1,4 +1,4 @@
-import { useMemo } from 'react';
+import { useMemo, useState } from 'react';
 import Plot from 'react-plotly.js';
 import { Box, Text, Paper } from '@mantine/core';
 import type { QueryRangeData } from '../../api/types';
@@ -19,6 +19,7 @@ interface Exemplar {
   duration: number;
   traceID: string;
   spanID: string;
+  bucket: number; // The actual bucket from the series
 }
 
 // Calculate which bucket a duration falls into (matches backend)
@@ -43,6 +44,8 @@ const getDurationRange = (bucket: number): string => {
 };
 
 export function PlotlyHeatmapChart({ data, onExemplarClick }: PlotlyHeatmapChartProps) {
+  const [isHovering, setIsHovering] = useState(false);
+
   // Extract heatmap cells from data
   // Each series represents one duration bucket with values over time
   const cells = useMemo(() => {
@@ -75,6 +78,8 @@ export function PlotlyHeatmapChart({ data, onExemplarClick }: PlotlyHeatmapChart
     const exs: Exemplar[] = [];
 
     for (const series of data.result || []) {
+      const durationBucket = parseInt(series.metric.duration_bucket || '0', 10);
+
       if (series.exemplars) {
         for (const ex of series.exemplars) {
           exs.push({
@@ -82,6 +87,7 @@ export function PlotlyHeatmapChart({ data, onExemplarClick }: PlotlyHeatmapChart
             duration: ex.duration,
             traceID: ex.traceID,
             spanID: ex.spanID,
+            bucket: durationBucket, // Use the bucket from the series metric
           });
         }
       }
@@ -155,21 +161,20 @@ export function PlotlyHeatmapChart({ data, onExemplarClick }: PlotlyHeatmapChart
   // Map exemplars to their actual time labels and bucket labels
   const exemplarTrace = exemplars.length > 0 ? {
     x: exemplars.map((ex) => {
-      // Find the closest time in our time buckets
-      const closestTimeIdx = times.findIndex((t, idx) => {
-        if (idx === times.length - 1) return true;
-        const nextT = times[idx + 1];
-        return ex.time >= t && ex.time < nextT;
-      });
+      // Find the exact matching time in our time buckets
+      const timeIdx = times.indexOf(ex.time);
+      if (timeIdx === -1) {
+        console.warn('[PlotlyHeatmap] Exemplar time not found in heatmap:', ex.time);
+        return xLabels[0]; // Fallback to first time
+      }
       // Return the x label (time string)
-      return xLabels[closestTimeIdx >= 0 ? closestTimeIdx : 0];
+      return xLabels[timeIdx];
     }),
     y: exemplars.map((ex) => {
-      const bucket = calculateDurationBucket(ex.duration);
-      // Find this bucket in our sorted buckets array
-      const bucketIdx = buckets.indexOf(bucket);
+      // Use the bucket from the series metric (already stored in exemplar)
+      const bucketIdx = buckets.indexOf(ex.bucket);
       if (bucketIdx === -1) {
-        console.warn('[PlotlyHeatmap] Exemplar bucket not found:', bucket, 'for duration:', ex.duration);
+        console.warn('[PlotlyHeatmap] Exemplar bucket not found:', ex.bucket, 'for duration:', ex.duration);
         return yLabels[0]; // Fallback to first bucket
       }
       // Return the y label (duration range string) - reversed
@@ -186,6 +191,7 @@ export function PlotlyHeatmapChart({ data, onExemplarClick }: PlotlyHeatmapChart
         color: '#fff',
         width: 2,
       },
+      opacity: isHovering ? 1 : 0,
     },
     text: exemplars.map((ex) =>
       `Duration: ${formatDuration(ex.duration)}<br>` +
@@ -265,6 +271,8 @@ export function PlotlyHeatmapChart({ data, onExemplarClick }: PlotlyHeatmapChart
             }
           }
         }}
+        onHover={() => setIsHovering(true)}
+        onUnhover={() => setIsHovering(false)}
       />
 
       <Box mt="md">

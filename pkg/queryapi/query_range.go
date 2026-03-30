@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"math/bits"
 	"net/http"
 	"sort"
 	"strconv"
@@ -149,14 +150,14 @@ func (s *Server) handleQueryRange(w http.ResponseWriter, r *http.Request) {
 			slog.String("strategy", exemplarStrategy))
 
 		// Extract selector and range from the query
-		selector, rangeDuration, hasRange, err := extractSelectorAndRange(queryStr)
+		selector, rangeDuration, hasRange, isHeatmap, err := extractSelectorAndRange(queryStr)
 		if err != nil {
 			s.logger.Warn("Failed to extract selector for exemplars",
 				slog.String("query", queryStr),
 				slog.String("error", err.Error()))
 		} else {
 			// Fetch exemplars for each time step
-			exemplarMap, err := s.fetchExemplars(r.Context(), selector, start, end, stepDuration, rangeDuration, hasRange, exemplars, exemplarStrategy)
+			exemplarMap, err := s.fetchExemplars(r.Context(), selector, start, end, stepDuration, rangeDuration, hasRange, isHeatmap, exemplars, exemplarStrategy)
 			if err != nil {
 				s.logger.Warn("Failed to fetch exemplars",
 					slog.String("error", err.Error()))
@@ -186,14 +187,16 @@ func (s *Server) handleQueryRange(w http.ResponseWriter, r *http.Request) {
 //   - selector: "{name="promqlExec"}"
 //   - rangeDuration: 5m
 //   - hasRange: true
-// For "{name="foo"}" it extracts:
+//   - isHeatmap: false
+// For "heatmap({name="foo"})" it extracts:
 //   - selector: "{name="foo"}"
 //   - rangeDuration: 0
 //   - hasRange: false
-func extractSelectorAndRange(queryStr string) (selector string, rangeDuration time.Duration, hasRange bool, err error) {
+//   - isHeatmap: true
+func extractSelectorAndRange(queryStr string) (selector string, rangeDuration time.Duration, hasRange bool, isHeatmap bool, err error) {
 	expr, parseErr := parser.Parse(queryStr)
 	if parseErr != nil {
-		return "", 0, false, fmt.Errorf("failed to parse query: %w", parseErr)
+		return "", 0, false, false, fmt.Errorf("failed to parse query: %w", parseErr)
 	}
 
 	// Walk the AST to find the first VectorSelector or MatrixSelector
@@ -216,6 +219,10 @@ func extractSelectorAndRange(queryStr string) (selector string, rangeDuration ti
 			hasRange = true
 			return true
 		case *parser.Call:
+			// Detect heatmap function
+			if n.Func == "heatmap" {
+				isHeatmap = true
+			}
 			// Check function arguments
 			for _, arg := range n.Args {
 				if findSelector(arg) {
@@ -230,24 +237,25 @@ func extractSelectorAndRange(queryStr string) (selector string, rangeDuration ti
 	}
 
 	if !findSelector(expr) {
-		return "", 0, false, fmt.Errorf("no selector found in query")
+		return "", 0, false, false, fmt.Errorf("no selector found in query")
 	}
 
 	if err != nil {
-		return "", 0, false, err
+		return "", 0, false, false, err
 	}
 
-	return selector, rangeDuration, hasRange, nil
+	return selector, rangeDuration, hasRange, isHeatmap, nil
 }
 
 // fetchExemplars queries actual spans and assigns exemplars to time steps.
 //
-// Two strategies:
+// Three strategies based on query type:
 //  1. Lookback window (hasRange=true): For rate({...}[5m]), each step gets exemplars from
 //     its lookback window [step-range, step], matching the rate operator's evaluation logic.
-//  2. Direct bucketing (hasRange=false): For {name="foo"}, heatmap(), etc., each step gets
-//     exemplars from spans that fall in that time bucket.
-func (s *Server) fetchExemplars(ctx context.Context, selector string, start, end time.Time, step time.Duration, rangeDuration time.Duration, hasRange bool, count int, strategy string) (map[int64][]Exemplar, error) {
+//  2. 2D bucketing (isHeatmap=true): For heatmap({...}), spans are bucketed by BOTH time
+//     and duration to ensure coverage across the 2D heatmap space.
+//  3. Direct bucketing (default): For {name="foo"}, selectors, etc., spans bucketed by time only.
+func (s *Server) fetchExemplars(ctx context.Context, selector string, start, end time.Time, step time.Duration, rangeDuration time.Duration, hasRange bool, isHeatmap bool, count int, strategy string) (map[int64][]Exemplar, error) {
 	// Query spans ONCE for the entire time range
 	// For lookback queries, extend start time to capture spans in first step's lookback window
 	queryStart := start
@@ -256,14 +264,19 @@ func (s *Server) fetchExemplars(ctx context.Context, selector string, start, end
 	}
 
 	// Keep exemplar fetch lightweight - only get what we need
-	// Limit = count * 30 (buffer for bucketing across time steps)
-	// This prevents slow queries while still providing good exemplar coverage
-	limit := count * 30
+	// For heatmap queries, we need more spans to cover 2D space (time × duration)
+	multiplier := 30
+	if isHeatmap {
+		// Heatmap needs more exemplars to cover ~20-30 duration buckets
+		multiplier = 300 // ~10 exemplars per duration bucket
+	}
+
+	limit := count * multiplier
 	if limit < 50 {
 		limit = 50 // Minimum
 	}
-	if limit > 500 {
-		limit = 500 // Hard cap for performance
+	if limit > 1000 {
+		limit = 1000 // Hard cap for performance (increased from 500 for heatmap)
 	}
 
 	queryStr := selector
@@ -300,7 +313,13 @@ func (s *Server) fetchExemplars(ctx context.Context, selector string, start, end
 		return s.fetchExemplarsWithLookback(result.Spans, start, end, step, rangeDuration, count, strategy)
 	}
 
-	// Strategy 2: Direct bucketing (for selectors, heatmap, etc.)
+	if isHeatmap {
+		// Strategy 2: 2D bucketing (for heatmap)
+		// Bucket by (time, duration) to ensure coverage across heatmap cells
+		return s.fetchExemplarsWithHeatmapBucketing(result.Spans, start, end, step, count, strategy)
+	}
+
+	// Strategy 3: Direct bucketing (for selectors, etc.)
 	// Each step gets exemplars from spans that fall in that time bucket
 	return s.fetchExemplarsWithBucketing(result.Spans, start, end, step, count, strategy)
 }
@@ -385,6 +404,74 @@ func (s *Server) fetchExemplarsWithBucketing(spans []*span.Span, start, end time
 	}
 
 	return exemplarMap, nil
+}
+
+// fetchExemplarsWithHeatmapBucketing implements 2D bucketing for heatmap queries.
+// Spans are bucketed by BOTH time and duration, ensuring each heatmap cell gets exemplars.
+//
+// For heatmap, we need exemplars distributed across:
+//   - Time dimension: bucketed by time steps
+//   - Duration dimension: bucketed by exponential duration buckets (0-63)
+//
+// This ensures the UI shows exemplars across the entire 2D heatmap space.
+func (s *Server) fetchExemplarsWithHeatmapBucketing(spans []*span.Span, start, end time.Time, step time.Duration, count int, strategy string) (map[int64][]Exemplar, error) {
+	// Bucket spans by (time, duration_bucket) pairs
+	type cellKey struct {
+		timeBucket     int64
+		durationBucket int32
+	}
+	cellMap := make(map[cellKey][]*span.Span)
+
+	stepNanos := step.Nanoseconds()
+	startNanos := start.UnixNano()
+	endNanos := end.UnixNano()
+
+	for _, sp := range spans {
+		spanNanos := sp.StartTime.UnixNano()
+
+		if spanNanos >= startNanos && spanNanos < endNanos {
+			// Calculate time bucket
+			bucketOffset := (spanNanos - startNanos) / stepNanos
+			bucketTime := start.Add(time.Duration(bucketOffset) * step)
+
+			// Calculate duration bucket (using same algorithm as heatmap operator)
+			durationBucket := calculateDurationBucket(sp.GetDuration())
+
+			key := cellKey{
+				timeBucket:     bucketTime.Unix(),
+				durationBucket: durationBucket,
+			}
+			cellMap[key] = append(cellMap[key], sp)
+		}
+	}
+
+	// Select exemplars from each (time, duration) cell
+	// For heatmap, we want broader coverage, so select fewer per cell but cover more cells
+	exemplarsPerCell := count
+	if exemplarsPerCell < 1 {
+		exemplarsPerCell = 1
+	}
+
+	// Flatten back to time-based map for compatibility with attachExemplarsToResponse
+	exemplarMap := make(map[int64][]Exemplar)
+
+	for key, cellSpans := range cellMap {
+		if len(cellSpans) > 0 {
+			exemplars := selectExemplars(cellSpans, exemplarsPerCell, strategy)
+			exemplarMap[key.timeBucket] = append(exemplarMap[key.timeBucket], exemplars...)
+		}
+	}
+
+	return exemplarMap, nil
+}
+
+// calculateDurationBucket calculates duration bucket index using the same algorithm
+// as the heatmap operator (bits.Len64(duration) - 1)
+func calculateDurationBucket(durationNs int64) int32 {
+	if durationNs <= 0 {
+		return 0
+	}
+	return int32(bits.Len64(uint64(durationNs)) - 1)
 }
 
 // attachExemplarsToResponse attaches exemplars to the Prometheus JSON response

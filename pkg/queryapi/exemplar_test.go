@@ -213,41 +213,67 @@ func TestExemplarStrategySelection(t *testing.T) {
 // TestExtractSelectorAndRange verifies query parsing for exemplar support.
 func TestExtractSelectorAndRange(t *testing.T) {
 	tests := []struct {
-		query             string
-		expectedSelector  string
-		expectedRange     time.Duration
-		expectedHasRange  bool
-		expectError       bool
+		query              string
+		expectedSelector   string
+		expectedRange      time.Duration
+		expectedHasRange   bool
+		expectedIsHeatmap  bool
+		expectError        bool
 	}{
 		{
-			query:             `rate({name="foo"}[5m])`,
-			expectedSelector:  `{name="foo"}`,
-			expectedRange:     5 * time.Minute,
-			expectedHasRange:  true,
+			query:              `rate({name="foo"}[5m])`,
+			expectedSelector:   `{name="foo"}`,
+			expectedRange:      5 * time.Minute,
+			expectedHasRange:   true,
+			expectedIsHeatmap:  false,
 		},
 		{
-			query:             `{name="bar"}`,
-			expectedSelector:  `{name="bar"}`,
-			expectedRange:     0,
-			expectedHasRange:  false,
+			query:              `{name="bar"}`,
+			expectedSelector:   `{name="bar"}`,
+			expectedRange:      0,
+			expectedHasRange:   false,
+			expectedIsHeatmap:  false,
 		},
 		{
-			query:             `sum by (service_name) (rate({env="prod"}[1h]))`,
-			expectedSelector:  `{env="prod"}`,
-			expectedRange:     1 * time.Hour,
-			expectedHasRange:  true,
+			query:              `sum by (service_name) (rate({env="prod"}[1h]))`,
+			expectedSelector:   `{env="prod"}`,
+			expectedRange:      1 * time.Hour,
+			expectedHasRange:   true,
+			expectedIsHeatmap:  false,
 		},
 		{
-			query:             `heatmap({status="ok"})`,
-			expectedSelector:  `{status="ok"}`,
-			expectedRange:     0,
-			expectedHasRange:  false,
+			query:              `heatmap({status="ok"})`,
+			expectedSelector:   `{status="ok"}`,
+			expectedRange:      0,
+			expectedHasRange:   false,
+			expectedIsHeatmap:  true,
+		},
+		{
+			query:              `sum(rate({name="api"}[5m]))`,
+			expectedSelector:   `{name="api"}`,
+			expectedRange:      5 * time.Minute,
+			expectedHasRange:   true,
+			expectedIsHeatmap:  false,
+		},
+		{
+			query:              `avg by (handler) (rate({service="web"}[1m]))`,
+			expectedSelector:   `{service="web"}`,
+			expectedRange:      1 * time.Minute,
+			expectedHasRange:   true,
+			expectedIsHeatmap:  false,
+		},
+		{
+			query:              `sum(heatmap({env="prod"}))`,
+			expectedSelector:   `{env="prod"}`,
+			expectedRange:      0,
+			expectedHasRange:   false,
+			expectedIsHeatmap:  true,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.query, func(t *testing.T) {
-			selector, rangeDur, hasRange, err := extractSelectorAndRange(tt.query)
+			selector, rangeDur, hasRange, isHeatmap, err := extractSelectorAndRange(tt.query)
 
 			if tt.expectError {
 				if err == nil {
@@ -270,6 +296,10 @@ func TestExtractSelectorAndRange(t *testing.T) {
 
 			if hasRange != tt.expectedHasRange {
 				t.Errorf("HasRange: expected %v, got %v", tt.expectedHasRange, hasRange)
+			}
+
+			if isHeatmap != tt.expectedIsHeatmap {
+				t.Errorf("IsHeatmap: expected %v, got %v", tt.expectedIsHeatmap, isHeatmap)
 			}
 		})
 	}
@@ -436,6 +466,71 @@ func TestHeatmapExemplarFiltering(t *testing.T) {
 	}
 	if exemplars30[0]["spanID"] != "span3" {
 		t.Errorf("Bucket 30: expected span3, got %s", exemplars30[0]["spanID"])
+	}
+}
+
+// TestHeatmapExemplar2DBucketing verifies that heatmap queries use 2D bucketing
+// to distribute exemplars across time and duration dimensions
+func TestHeatmapExemplar2DBucketing(t *testing.T) {
+	// Create spans with different times and durations
+	spans := []*span.Span{
+		// Time bucket 1000, duration bucket 20 (1-2ms)
+		{TraceID: "t1", SpanID: "s1", StartTime: time.Unix(1000, 0)},
+		{TraceID: "t2", SpanID: "s2", StartTime: time.Unix(1000, 0)},
+
+		// Time bucket 1000, duration bucket 26 (67-134ms)
+		{TraceID: "t3", SpanID: "s3", StartTime: time.Unix(1000, 0)},
+
+		// Time bucket 1015, duration bucket 20
+		{TraceID: "t4", SpanID: "s4", StartTime: time.Unix(1015, 0)},
+
+		// Time bucket 1015, duration bucket 30 (1-2s)
+		{TraceID: "t5", SpanID: "s5", StartTime: time.Unix(1015, 0)},
+	}
+
+	// Set span durations
+	spans[0].Duration = 1_500_000       // 1.5ms → bucket 20
+	spans[1].Duration = 1_800_000       // 1.8ms → bucket 20
+	spans[2].Duration = 100_000_000     // 100ms → bucket 26
+	spans[3].Duration = 1_600_000       // 1.6ms → bucket 20
+	spans[4].Duration = 1_500_000_000   // 1.5s → bucket 30
+
+	server := &Server{}
+	start := time.Unix(1000, 0)
+	end := time.Unix(1030, 0)
+	step := 15 * time.Second
+
+	exemplarMap, err := server.fetchExemplarsWithHeatmapBucketing(spans, start, end, step, 2, "slowest")
+	if err != nil {
+		t.Fatalf("fetchExemplarsWithHeatmapBucketing failed: %v", err)
+	}
+
+	// Verify we got exemplars for both time buckets
+	if len(exemplarMap) != 2 {
+		t.Errorf("Expected 2 time buckets, got %d", len(exemplarMap))
+	}
+
+	// Verify bucket 1000 has exemplars from multiple duration buckets
+	bucket1000 := exemplarMap[1000]
+	if len(bucket1000) < 2 {
+		t.Errorf("Bucket 1000: expected at least 2 exemplars, got %d", len(bucket1000))
+	}
+
+	// Check that we have exemplars from different duration ranges
+	hasBucket20 := false
+	hasBucket26 := false
+	for _, ex := range bucket1000 {
+		bucket := calculateDurationBucket(ex.Duration)
+		if bucket == 20 {
+			hasBucket20 = true
+		}
+		if bucket == 26 {
+			hasBucket26 = true
+		}
+	}
+
+	if !hasBucket20 || !hasBucket26 {
+		t.Errorf("Bucket 1000: expected exemplars from multiple duration buckets (bucket20=%v, bucket26=%v)", hasBucket20, hasBucket26)
 	}
 }
 
